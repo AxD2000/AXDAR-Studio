@@ -1,0 +1,1 @@
+{"manifest_version":1,"host_api":1,"id":"demo.echo","version":"2.0.0","label":"Echo fixture","adapter":{"kind":"cli","entry":"action.py"},"permissions":["execute:local"],"timeout_seconds":2,"dependencies":[],"actions":[{"id":"echo","label":"Echo text","execution":"local","input":"text","result":"text"}]}

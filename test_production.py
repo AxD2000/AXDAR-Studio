@@ -1,0 +1,221 @@
+import io
+import sys
+import tarfile
+import types
+import json
+import runpy
+import struct
+import tempfile
+import time
+import unittest
+import uuid
+from pathlib import Path
+from unittest.mock import patch
+
+import production as p
+import vast_deploy as vd
+import vast_worker as vw
+
+ROOT=Path(__file__).resolve().parent
+
+def box(k,v):
+    return struct.pack(">I4s",len(v)+8,k)+v
+
+def movie(seconds,audio=True):
+    header=bytes(12)+struct.pack(">II",1000,seconds*1000)
+    track=box(b"trak",box(b"mdia",box(b"hdlr",bytes(8)+b"vide")))
+    if audio:track+=box(b"trak",box(b"mdia",box(b"hdlr",bytes(8)+b"soun")))
+    return box(b"ftyp",b"isom")+box(b"mdat",b"sample")+box(b"moov",box(b"mvhd",header)+track)
+
+
+class QueueTests(unittest.TestCase):
+    def setUp(self):
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
+        self.dir=Path(tmp.name); self.status=self.dir/"status.json"; self.control=self.dir/"control.json"
+        self.eid=str(uuid.uuid4());self.requests=[];self.fail=set();self.lose=False;self.network=0
+        self.workflow={"name":"fixture","output":"141"}
+        self.ctx={"DATA":self.dir,"prompt":lambda s,r:s["prompt"],"prepare_shot":lambda url,folder,eid,s,w,j:{"id":s["id"]},"json_api":self.api,"download_output":lambda u,f,h,j:(f/"video.part").write_bytes(movie(j["settings"]["seconds"]))}
+        self.spec=dict(id="test",started=time.time(),url="http://fixture",budget=0,expectedSeconds=30,rate=1,end=time.time()+600,retries=2)
+        self.sleep=patch("production.time.sleep");self.sleep.start();self.addCleanup(self.sleep.stop)
+
+    def jobs(self,n):
+        return [(self.eid,dict(id=str(uuid.uuid4()),revision="rev",seconds=5,prompt="Tom"),[]) for _ in range(n)]
+
+    def api(self,url,path,obj=None):
+        if path=="/prompt":
+            self.requests.append(obj)
+            if self.lose:
+                self.lose=False
+                raise ConnectionError("lost acknowledgement")
+            return {"prompt_id":str(len(self.requests))}
+        if path=="/queue":
+            return dict(queue_running=[[i,str(i),x["prompt"],x["extra_data"]] for i,x in enumerate(self.requests,1)],queue_pending=[])
+        if path=="/history":return {}
+        if self.network:
+            self.network-=1;raise ConnectionError("reset")
+        ticket=path.split("/")[-1];shot=self.requests[int(ticket)-1]["prompt"]["id"]
+        return {ticket:{"status":{"status_str":"error" if shot in self.fail else "success"}}}
+
+    def drive(self,jobs,retry=None):
+        p.drive(self.ctx,self.spec,jobs,self.workflow,self.status,self.control,retry)
+        return p.read(self.status)
+
+    def test_200_shots_and_repeat_no_duplicate(self):
+        jobs=self.jobs(200); state=self.drive(jobs)
+        self.assertEqual(state["status"],"finished"); self.assertEqual(len(self.requests),200)
+        self.assertEqual([x["prompt"]["id"] for x in self.requests],[s["id"] for _,s,_ in jobs])
+        self.status.unlink();self.drive(jobs);self.assertEqual(len(self.requests),200)
+
+    def test_failure_continues_and_manual_retry(self):
+        jobs=self.jobs(3);bad=jobs[1][1]["id"];self.fail.add(bad)
+        state=self.drive(jobs);self.assertEqual(list(state["shots"].values()),["done","error","done"])
+        self.fail.clear();self.assertEqual(self.drive(jobs,bad)["status"],"finished")
+        self.assertEqual(len(self.requests),4)
+
+    def test_ambiguous_submit_and_transient_poll(self):
+        self.lose=True;self.network=1
+        self.assertEqual(self.drive(self.jobs(2))["status"],"finished")
+        self.assertEqual(len(self.requests),2)
+
+    def test_restart_poll_same_ticket(self):
+        jobs=self.jobs(2);self.network=4
+        self.assertEqual(self.drive(jobs)["status"],"waiting")
+        self.assertEqual(self.drive(jobs)["status"],"finished");self.assertEqual(len(self.requests),2)
+
+    def test_missing_ack_no_evidence_never_resubmits(self):
+        def no_ack(url,path,obj=None):
+            if path=="/prompt":
+                self.requests.append(obj);raise ConnectionError("lost")
+            if path=="/queue":return dict(queue_running=[],queue_pending=[])
+            return {}
+        self.ctx["json_api"]=no_ack
+        state=self.drive(self.jobs(1));self.assertIn("uncertain",state["shots"].values())
+        self.assertEqual(len(self.requests),1)
+
+    def test_budget_pause_stop(self):
+        jobs=self.jobs(2);self.spec["budget"]=.0001
+        self.assertEqual(self.drive(jobs)["status"],"limit reached");self.assertFalse(self.requests)
+        self.spec["budget"]=0
+        for action,status in [("pause","paused"),("stop","stopped")]:
+            p.atomic(self.control,dict(action=action));self.assertEqual(self.drive(jobs)["status"],status)
+        self.control.unlink();self.assertEqual(self.drive(jobs)["status"],"finished")
+
+    def test_bad_video_fails_without_blocking_next(self):
+        jobs=self.jobs(2)
+        def download(url,folder,h,j):
+            v=movie(5)
+            (folder/"video.part").write_bytes(v[:-9] if j["shot"]==jobs[0][1]["id"] else v)
+        self.ctx["download_output"]=download
+        self.assertEqual(list(self.drive(jobs)["shots"].values()),["error","done"])
+        file=self.dir/"wrong.mp4";file.write_bytes(movie(25))
+        with self.assertRaises(ValueError):p.inspect_video(file,5)
+
+    def test_missing_audio_track(self):
+        path=self.dir/"video.mp4";path.write_bytes(movie(5,False))
+        with self.assertRaisesRegex(ValueError,"audio track"):p.inspect_video(path,5,True)
+
+    def test_repeat_deployment_sends_only_missing_files(self):
+        target={};spec={"id":uuid.uuid4().hex,"release":"a"*64,"assets":{"test.png":"d"*64}}
+        asset=self.dir/"asset";asset.write_bytes(b"image")
+        spec["assets"]["test.png"]=p.digest(asset)
+        inventory={}
+        def fake_ssh(target,cmd,**kw):
+            if cmd.startswith("while "):
+                pairs=[line.split("  ",1) for line in kw["data"].decode().splitlines()]
+                return "\n".join(dst for sha,dst in pairs if inventory.get(dst)!=sha).encode()
+            return b""
+        def fake_put(t,dst,src):inventory[dst]=p.digest(src)
+        with patch.object(vd,"ssh",side_effect=fake_ssh),patch.object(vd,"put",side_effect=fake_put) as send:
+            vd.deploy(ROOT,target,spec,{"test.png":asset})
+            count=send.call_count;self.assertGreater(count,1)
+            vd.deploy(ROOT,target,spec,{"test.png":asset})
+            self.assertEqual(send.call_count,count)
+
+    def test_remote_worker_to_local_editor_artifacts(self):
+        # Exercise the deployed entry point's run manifest, real Studio graph builder
+        # and downloader, then the desktop tar importer. No provider or GPU calls.
+        import contextlib, threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        movie_bytes=movie(5)
+        graph=json.loads((ROOT/"workflow.json").read_text(encoding="utf8"))
+        graphs=[]
+        class FakeComfy(BaseHTTPRequestHandler):
+            def reply(inner,obj):
+                body=obj if isinstance(obj,bytes) else json.dumps(obj).encode()
+                inner.send_response(200);inner.send_header("Content-Length",str(len(body)));inner.end_headers();inner.wfile.write(body)
+            def do_GET(inner):
+                if inner.path.startswith("/history/"):
+                    t=inner.path.rsplit("/",1)[1]
+                    inner.reply({t:{"status":{"status_str":"success"},"outputs":{"141":{"gifs":[{"filename":"video.mp4","type":"output"}]}}}})
+                elif inner.path.startswith("/view?"):inner.reply(movie_bytes)
+                else:inner.send_error(404)
+            def do_POST(inner):
+                body=inner.rfile.read(int(inner.headers["Content-Length"]))
+                if inner.path=="/prompt":
+                    graphs.append(json.loads(body));inner.reply({"prompt_id":str(len(graphs))})
+                elif inner.path=="/upload/image":inner.reply({"name":"uploaded.png"})
+                else:inner.send_error(404)
+            def log_message(inner,*args):pass
+        server=ThreadingHTTPServer(("127.0.0.1",0),FakeComfy)
+        threading.Thread(target=server.serve_forever,daemon=True).start()
+        self.addCleanup(server.server_close);self.addCleanup(server.shutdown)
+        spec=dict(self.spec,id=uuid.uuid4().hex,episode=self.eid,workflow={"name":"test","graph":graph},assets={})
+        base=self.dir/"remote";run=base/"runs"/spec["id"];run.mkdir(parents=True)
+        blobs=base/"blobs";blobs.mkdir(); pic=blobs/"pic";pic.write_bytes(b"test")
+        sha=p.digest(pic);pic.rename(blobs/sha);spec["assets"]["tom.png"]=sha
+        jobs=self.jobs(2)
+        for _,shot,_ in jobs:shot.update(image="tom.png",refs=[],dialog=False,change="",approved=True)
+        spec["jobs"]=jobs;p.atomic(run/"spec.json",spec)
+        lock=types.SimpleNamespace(LOCK_EX=2,LOCK_NB=4,flock=lambda *a:None)
+        with patch.dict(sys.modules,{"fcntl":lock}),patch.object(vw,"ready",return_value="http://127.0.0.1:"+str(server.server_port)):
+            vw.execute(run)
+        self.assertEqual(p.read(run/"status.json")["status"],"finished")
+        self.assertEqual(len(graphs),2)
+        local=self.dir/"desktop"
+        for job in (run/"episodes").rglob("job.json"):
+            rel=job.parent.relative_to(run/"episodes").as_posix();j=p.read(job)
+            def transfer(target,cmd,out,timeout):
+                with tarfile.open(fileobj=out,mode="w") as tar:
+                    tar.add(job.parent,arcname=".")
+            with patch.object(vd,"ssh",side_effect=transfer):
+                vd.fetch_take({},dict(spec,release="a"*64),local,rel,j)
+            dest=local/rel
+            self.assertEqual(p.read(dest/"job.json")["status"],"done")
+            self.assertEqual(p.digest(dest/"video.mp4"),j["sha256"])
+            self.assertTrue((dest/"graph.json").is_file());self.assertTrue((dest/"tom.png").is_file())
+
+    def test_missing_dependency_preflight_and_existing_template(self):
+        wf={"graph":{"1":{"class_type":"X","inputs":{"model":"a.safetensors"}}}}
+        def healthy(url,path):
+            if path=="/system_stats":return {"system":{}}
+            return {"X":{"input":{"required":{"model":[["a.safetensors"]]}}}}
+        with patch("vast_worker.provision.install_nodes") as install:
+            self.assertTrue(vw.ready({"json_api":healthy},wf).endswith("18188"))
+            install.assert_not_called()
+        with self.assertRaisesRegex(ValueError,"Still unavailable"):
+            vw.ready({"json_api":lambda u,path: {"system":{}} if path=="/system_stats" else {}},wf,False)
+
+    def test_provider_stop_is_stop_only(self):
+        import os
+        with patch.dict(os.environ,{"VAST_API_KEY":"test-secret"}),patch("vast_deploy.urlopen",return_value=io.BytesIO(b'{"success":true}')) as api:
+            vd.request_instance_stop({"id":42})
+            req=api.call_args.args[0]
+            self.assertEqual(req.get_method(),"PUT")
+            self.assertEqual(json.loads(req.data),{"state":"stopped"})
+            self.assertNotIn("test-secret",req.full_url)
+
+    def test_real_studio_builds_graph_with_selected_assets(self):
+        ctx=runpy.run_path(str(ROOT/"studio.pyw"))["prepare_shot"].__globals__
+        wf=ctx["active_workflow"];shot=dict(image="tom.png",refs=["emma.webp","tom.mp3"],prompt="Tom speaks to Emma",seconds=5,dialog=True,change="",id=str(uuid.uuid4()))
+        for name in [shot["image"],*shot["refs"]]:
+            path=self.dir/(name+".source");path.write_bytes(b"x");ctx["files"][name]=path
+        ctx["upload"]=lambda url,f,name:f.name
+        graph=ctx["prepare_shot"]("",self.dir,self.eid,shot,wf,dict(prompt=ctx["prompt"](shot,[])))
+        refs=graph[wf["reference"]]["inputs"]
+        self.assertEqual(graph[refs["ref_audios.ref_audio_0"][0]]["inputs"]["audio"],"tom.mp3")
+        self.assertIn("<Audio 1>",graph[wf["prompt"]]["inputs"]["value"])
+        self.assertIn("ref_images.ref_image_1",refs);self.assertEqual(graph[wf["duration"]]["inputs"]["value"],5)
+
+if __name__=="__main__":
+    unittest.main()
+
