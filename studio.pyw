@@ -361,8 +361,9 @@ class Handler(BaseHTTPRequestHandler):
                     from vast_connection import hf_token
                     hf_token(obj.get("token"))
                     return self.send({"ok":True})
-                if action=="instances": return self.send(controller.list_instances())
+                if action=="instances": return self.send(connection.discover_instances())
                 if action=="connect": return self.send(connection.connect(obj.get("instance"),obj.get("auto",False)))
+                if action=="connect-ssh": return self.send(connection.connect_ssh(obj.get("ssh"),obj.get("auto",False)))
                 if action=="disconnect": return self.send(connection.disconnect())
                 if action=="command": return self.send({"output":connection.command(obj.get("command"))})
                 raise ValueError("Unknown connection action")

@@ -35,7 +35,7 @@ See [Episode editor](EDITOR.md) for first-cut assembly, subtitle timing, approva
 
 ## Vast connection
 
-In Production, save the Vast API key, discover your instance, then connect. Credentials use the explicit Windows Credential Locker backend of `keyring`. SSH private keys remain local and host-key verification stays enabled. Register your SSH public key with Vast and independently verify each new server's fingerprint during initial setup.
+Production separates **SSH connection** from **Vast API**. For a direct connection, paste the SSH command from the rented instance's Connect menu and select **Connect using SSH**. To discover instances through your account, save the API key in **Vast API**, select **Discover instances**, select the instance and choose **Connect / Retry**. Windows Credential Locker stores the API key. AXDAR uses the existing OpenSSH key and host verification for either route.
 
 The shared manager supplies Production, ComfyUI forwarding and remote command execution. It discovers direct SSH mappings, re-fetches endpoint details on reconnect, binds tunnels to localhost, and uses bounded retries. Stopped instances are not started automatically.
 

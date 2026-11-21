@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
-from vast_connection import Connection
+from vast_connection import Connection,ssh_address
 
 class ConnectionTests(unittest.TestCase):
     def setUp(self):
@@ -26,6 +26,34 @@ class ConnectionTests(unittest.TestCase):
             self.discover.return_value=[dict(id=12,host='ssh1.vast.ai',port=22,status='running',**{})|changes]
             with self.assertRaises(ValueError):self.c.resolve(12)
         self.remote.assert_not_called()
+
+    def test_pasted_vast_ssh_command_extracts_only_the_endpoint(self):
+        for value in ("ssh -p 1234 root@ssh1.vast.ai -L 8080:localhost:8080\n",
+                      "ssh root@ssh1.vast.ai -p 1234", "ssh://root@ssh1.vast.ai:1234"):
+            self.assertEqual(ssh_address(value),{"host":"ssh1.vast.ai","port":1234})
+        for value in ("ssh -o ProxyCommand=cmd root@ssh1.vast.ai","ssh root@ssh1.vast.ai whoami",
+                      "ssh -p 0 root@ssh1.vast.ai","ssh://root@ssh1.vast.ai:0","ssh root@ssh1.vast.ai; test",
+                      "ssh -p 22 root@ssh1.vast.ai\nwhoami","-----BEGIN OPENSSH PRIVATE KEY-----"):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                ssh_address(value)
+
+    def test_manual_ssh_connects_without_vast_api(self):
+        address={"host":"ssh1.vast.ai","port":1234}
+        with patch("vast_connection.threading.Thread"):
+            self.c.connect_ssh("ssh -p 1234 root@ssh1.vast.ai",True)
+        self.assertEqual(json.loads(self.c.path.read_text()),{"ssh":address,"auto":True})
+        self.c._open=Mock()
+        self.c._probe=Mock(return_value=True)
+        def wait(seconds):
+            if seconds==5:
+                self.assertEqual(self.c.ssh_target(),address)
+                self.c.stop.set()
+                return True
+            return False
+        self.c.stop.wait=wait
+        self.c._run()
+        self.c._open.assert_called_once_with(address,8188)
+        self.discover.assert_not_called()
 
     def test_bounded_retries_cleanup_and_rediscovery(self):
         self.c._open=Mock()

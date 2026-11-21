@@ -1,4 +1,4 @@
-const productionDefaults = {instance:'',host:'',port:22,rate:0,budget:0,retries:2,minutes:60,shot:'',policy:'pause',shotRetries:1,episodeBudget:0,monthBudget:0,expectedWidth:"",expectedHeight:"",backupDrive:false,webhook:false,visual:false,lifecycle:'manual'};
+const productionDefaults = {rate:0,budget:0,retries:2,minutes:60,shot:'',policy:'pause',shotRetries:1,episodeBudget:0,monthBudget:0,expectedWidth:"",expectedHeight:"",backupDrive:false,webhook:false,visual:false,lifecycle:'manual'};
 let productionForm = {...productionDefaults,...JSON.parse(localStorage.getItem('axdar.production')||'{}')};
 let rentals = [], confirmedCharges=null, driveConnected=null;
 
@@ -66,14 +66,14 @@ function productionPanel(){
     const pending=Math.max(0,(p.total||0)-done-failed);
     const field=(k,label,type='number',step='1')=>'<label>'+label+'<input data-prod-field="'+k+'" type="'+type+'" step="'+step+'" value="'+esc(String(productionForm[k]))+'"></label>';
     const action=(k,label)=>'<button data-production="'+k+'">'+label+'</button>';
-    const options=rentals.map(r=>option(String(r.id),'#'+r.id+' Â· '+r.gpu+' Â· $'+(r.rate??'?')+'/h',productionForm.instance)).join('');
     const title=p.episode?db.episodes.find(e=>e.id===p.episode)?.title:'';
-    return connectionPanel()+'<section class="panel"><h2>Vast production</h2><div class="row"><label>Rented instance<select data-prod-field="instance">'+option('','Verified SSH host',productionForm.instance)+options+'</select></label>'+action('instances','Refresh instances')+'</div>'+
-      (!productionForm.instance?'<div class="row">'+field('host','SSH host','text')+field('port','SSH port')+'</div>':'')+
+    const current=state.connection||{};
+    const target=current.ssh?current.ssh.host+':'+current.ssh.port:current.instance?'Instance #'+current.instance:'No server connected';
+    return '<section class="panel"><h2>Vast production</h2><p>'+esc(target)+'</p>'+
       '<div class="row">'+field('rate','GPU rate ($/hour)','number','0.001')+field('budget','Session budget ($, 0 = unlimited)','number','0.01')+field('episodeBudget','Episode budget ($)','number','0.01')+field('monthBudget','Monthly budget ($)','number','0.01')+'</div>'+
       '<div class="row">'+field('minutes','Session minutes')+field('retries','Network retries (0–5)')+field('shotRetries','End-of-batch retries (0–5)')+'</div>'+
       '<div class="row">'+field('expectedWidth','Expected video width (optional)')+field('expectedHeight','Expected video height (optional)')+'</div>'+
-      '<label>At time or budget limit<select data-prod-field="policy">'+option('pause','Pause worker',productionForm.policy)+option('stop-instance','Stop selected Vast instance after output sync',productionForm.policy)+'</select></label>'+
+      '<label>At time or budget limit<select data-prod-field="policy">'+option('pause','Pause worker',productionForm.policy)+ (current.instance?option('stop-instance','Stop selected Vast instance after output sync',productionForm.policy):'')+'</select></label>'+
       '<div class="actions row">'+action('start','Start Production')+action('pause','Pause after shot')+action('resume','Resume Production')+action('stop','Stop after shot')+(p.healthy===false&&p.status!=='stopped'?action('sync','Reconnect status')+action('archive','Archive disconnected session'):'')+'</div>'+
       '<small>Pause and stop finish the current shot. Vast billing continues until you stop the instance on Vast.</small>'+
       (p.status?'<p role="status">'+esc(title||'Production')+' Â· '+esc(p.status)+' Â· '+(p.healthy===false?'Disconnected':'Worker status')+'</p>'+
@@ -86,14 +86,9 @@ function rememberProduction(target){
     const key=target.dataset.prodField;
     if(!key)return;
     productionForm[key]=target.type==='checkbox'?target.checked:target.value;
-    if(key==='instance'){
-        const row=rentals.find(r=>String(r.id)===target.value);
-        if(row){productionForm.rate=row.rate||0;productionForm.host=row.host||'';productionForm.port=row.port||22}
-    }
     localStorage.setItem('axdar.production',JSON.stringify(productionForm));
 }
 document.addEventListener('input',e=>rememberProduction(e.target));
-document.addEventListener('change',e=>{if(e.target.dataset.prodField==='instance'){rememberProduction(e.target);render()}});
 function reportSubmission(result){
     reportStatus(result.submitted+' shot(s) submitted.');
     const skipped=Object.entries(result.blocked||{});
@@ -105,7 +100,7 @@ function reportSubmission(result){
 async function productionAction(action,archive=null){
     let result;
     if(action==='charges'){
-        confirmedCharges=await post('/production',{action,instance:productionForm.instance});
+        confirmedCharges=await post('/production',{action,instance:state.connection?.instance});
         render();return;
     }
     if(action==='drive-status'){
@@ -116,14 +111,15 @@ async function productionAction(action,archive=null){
         await post('/production',{action,webhook:$('#notificationWebhook').value,visual:$('#visualEndpoint').value});
         render();reportStatus('Endpoint settings saved.');return;
     }
-    if(action==='instances'){
-        rentals=await post('/production',{action});
-        if(!rentals.some(x=>String(x.id)===productionForm.instance))productionForm.instance='';
-    }else{
-        if(action==='start'){await flushEdits();if(productionForm.instance && state.connection?.indicators?.ssh!=='green')throw Error('Connect to Vast and verify SSH first')}
-        result=await post('/production',{...productionForm,action,episode:ep.id,archive});
-        state=await(await fetch('/status')).json();
+    const connection=state.connection||{};
+    if(action==='start'){
+        await flushEdits();
+        if(connection.indicators?.ssh!=='green')throw Error('Connect to Vast and verify SSH first.');
     }
+    const policy=!connection.instance&&productionForm.policy==='stop-instance'?'pause':productionForm.policy;
+    result=await post('/production',{...productionForm,action,episode:ep.id,archive,
+        instance:connection.instance||'',useConnection:true,policy});
+    state=await(await fetch('/status')).json();
     render();
     if(action==='start'&&result)reportSubmission(result);
 }

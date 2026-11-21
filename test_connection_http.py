@@ -35,6 +35,13 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(self.post({'action':'disconnect'})['state'],'Disconnected')
             connection.connect.assert_called_once_with(12,False)
             connection.command.assert_called_once_with('echo done')
+    def test_manual_ssh_dispatches_to_the_shared_controller(self):
+        connection=Mock()
+        connection.connect_ssh.return_value={"state":"Connecting"}
+        with patch.object(self.g["controller"],"connection",connection):
+            self.assertEqual(self.post({"action":"connect-ssh","ssh":"ssh -p 1234 root@ssh1.vast.ai"})["state"],"Connecting")
+        connection.connect_ssh.assert_called_once_with("ssh -p 1234 root@ssh1.vast.ai",False)
+
     def test_unknown_action_rejected(self):
         with self.assertRaises(HTTPError) as error:self.post({'action':'unexpected'})
         self.assertEqual(error.exception.code,400);error.exception.close()

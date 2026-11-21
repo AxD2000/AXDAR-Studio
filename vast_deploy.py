@@ -415,8 +415,11 @@ class Controller:
             if act=="start":
                 if self.thread and self.thread.is_alive() or old and self.view.get("status") not in ("finished","stopped","needs attention","deployment failed"):
                     raise ValueError("Finish or stop the current production first")
-                target=self.connection.ssh_target() if obj.get("instance") else {"host":obj.get("host",""),"port":int(obj.get("port",22))}
-                if obj.get("instance") and (not target or str(target["id"])!=str(obj["instance"])):raise ValueError("Connect the selected instance first")
+                if obj.get("instance") or obj.get("useConnection"):
+                    target=self.connection.ssh_target()
+                else:
+                    target={"host":obj.get("host",""),"port":int(obj.get("port",22))}
+                if obj.get("instance") and (not target or str(target.get("id"))!=str(obj["instance"])):raise ValueError("Connect the selected instance first")
                 if not target:raise ValueError("Connect the selected instance first")
                 db=self.ctx["project"]()
                 ep=next(e for e in db["episodes"] if e["id"]==obj["episode"])

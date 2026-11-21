@@ -2,10 +2,12 @@
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import threading
 from pathlib import Path
+from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 SERVICE = 'AXDAR Studio Vast'
@@ -48,6 +50,54 @@ def hf_token(value=None):
             raise ValueError('Enter a Hugging Face token beginning with hf_')
         vault.set_password(SERVICE, 'huggingface', value.strip())
     return vault.get_password(SERVICE, 'huggingface')
+
+def ssh_address(value):
+    """Extract the endpoint from a Vast SSH command without executing pasted text."""
+    help_text="Paste the Vast SSH command (ssh -p PORT root@HOST) or an ssh://root@HOST:PORT address."
+    if not isinstance(value,str):
+        raise ValueError(help_text)
+    value=value.strip()
+    if not 0<len(value)<=2500 or any(ch in value for ch in "\r\n"):
+        raise ValueError(help_text)
+    if value.lower().startswith("ssh://"):
+        try:
+            address=urlsplit(value.strip())
+            if (address.username not in ("root",None) or address.password is not None or
+                    address.path not in ("","/") or address.query or address.fragment):
+                raise ValueError(help_text)
+            host,port=address.hostname,address.port if address.port is not None else 22
+        except ValueError as exc:
+            raise ValueError(help_text) from exc
+    else:
+        try:
+            parts=iter(shlex.split(value,posix=True))
+        except ValueError as exc:
+            raise ValueError(help_text) from exc
+        if next(parts,None) not in ("ssh","ssh.exe"):
+            raise ValueError(help_text)
+        port,host=22,None
+        saw_port=False
+        for part in parts:
+            if part=="-p" and not saw_port:
+                specified=next(parts,"")
+                if not re.fullmatch(r"[0-9]{1,5}",specified):
+                    raise ValueError(help_text)
+                port=int(specified)
+                saw_port=True
+            elif part=="-L":
+                forward=next(parts,"")
+                if not re.fullmatch(r"(?:(?:localhost|127\.0\.0\.1):)?[0-9]{1,5}:(?:localhost|127\.0\.0\.1):[0-9]{1,5}",forward):
+                    raise ValueError(help_text)
+            elif part in ("-N","-T"):
+                continue
+            elif host is None and part.startswith("root@"):
+                host=part[5:]
+            else:
+                raise ValueError(help_text)
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}",host or "") or not 1<=port<=65535:
+        raise ValueError(help_text)
+    return {"host":host.lower(),"port":port}
+
 
 class Connection:
     def __init__(self, path, discover, remote):
@@ -92,13 +142,17 @@ class Connection:
                 raise ValueError("Connect to Vast and verify the SSH session first.")
             return dict(self.endpoint)
 
-    def resolve(self, instance):
+    def discover_instances(self):
         try:
             rows = self.discover()
         except Exception:
             self._indicate(api='red')
             raise
         self._indicate(api='green')
+        return rows
+
+    def resolve(self, instance):
+        rows=self.discover_instances()
         row = next((r for r in rows if int(r['id']) == int(instance)), None)
         if not row:
             raise ValueError('Selected instance was not found')
@@ -110,23 +164,32 @@ class Connection:
         return dict(row, host=host, port=port)
 
     def connect(self, instance=None, auto=False):
+        if not instance and self.settings.get("ssh"):
+            return self._start(dict(ssh=self.settings["ssh"],auto=bool(auto)))
         instance = int(instance or self.settings.get('instance') or 0)
         if instance <= 0:
             raise ValueError('Select a rented instance first')
+        return self._start(dict(instance=instance,auto=bool(auto)))
+
+    def connect_ssh(self, command, auto=False):
+        return self._start(dict(ssh=ssh_address(command),auto=bool(auto)))
+
+    def _start(self, settings):
         with self.lock:
             if self.thread and self.thread.is_alive():
-                if self.settings.get('instance') == instance:
+                if all(self.settings.get(key)==settings.get(key) for key in ("instance","ssh")):
                     return self.snapshot()
                 raise ValueError('Disconnect before selecting a different instance')
-            self.settings = dict(instance=instance, auto=bool(auto))
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix('.tmp')
-            tmp.write_text(json.dumps(self.settings), encoding='utf-8')
+            tmp=self.path.with_suffix('.tmp')
+            tmp.write_text(json.dumps(settings),encoding='utf-8')
             tmp.replace(self.path)
+            self.settings=settings
+            self.endpoint=None
             self.stop.clear()
-            self._indicate(api='grey', ssh='grey', comfy='grey', gpu='grey')
+            self._indicate(api='grey',ssh='grey',comfy='grey',gpu='grey')
             self._state('Connecting')
-            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread=threading.Thread(target=self._run,daemon=True)
             self.thread.start()
         return self.snapshot()
 
@@ -225,7 +288,7 @@ class Connection:
                 self._state('Reconnecting' if attempt else 'Connecting')
                 stage = 'api'
                 try:
-                    target = self.resolve(self.settings['instance'])
+                    target = self.settings.get('ssh') or self.resolve(self.settings['instance'])
                     stage = 'ssh'
                     port = self._remote_port(target)
                     stage = 'comfy'
@@ -247,7 +310,7 @@ class Connection:
                         if not self._probe():
                             break
                         checks += 1
-                        if checks % 6 == 0:
+                        if self.settings.get('instance') and checks % 6 == 0:
                             try:
                                 self.resolve(self.settings['instance'])
                             except Exception:
