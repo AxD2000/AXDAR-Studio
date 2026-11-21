@@ -22,7 +22,7 @@ from production_services import webhook_url
 import take_quality
 
 STORE="/workspace/axdar-studio"
-SOURCES=("worker.py","production.py","vast_worker.py","vast_deploy.py","studio.pyw","studio_actions.py","story_engine.py","workflow_profiles.py","provision.py","model-lock.json","vast_connection.py","drive_archive.py","production_services.py","take_quality.py")
+SOURCES=("worker.py","production.py","vast_worker.py","vast_deploy.py","studio.pyw","studio_actions.py","story_engine.py","workflow_profiles.py","provision.py","model-lock.json","vast_connection.py","drive_archive.py","production_services.py","take_quality.py","editor_media.py","episode_editor.py")
 TERMINAL={"finished","needs attention","stopped","paused","waiting","limit reached"}
 
 

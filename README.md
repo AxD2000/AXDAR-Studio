@@ -29,6 +29,10 @@ Optional pre-existing assets can live in `assets/` or a directory set via `AXDAR
 
 See [Production](PRODUCTION.md) for deployment, retry budgets, technical QC, Drive authorization and lifecycle rehearsal.
 
+## Episode editor
+
+See [Episode editor](EDITOR.md) for first-cut assembly, subtitle timing, approval and horizontal or vertical MP4 export.
+
 ## Vast connection
 
 In Production, save the Vast API key, discover your instance, then connect. Credentials use the explicit Windows Credential Locker backend of `keyring`. SSH private keys remain local and host-key verification stays enabled. Register your SSH public key with Vast and independently verify each new server's fingerprint during initial setup.

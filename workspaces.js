@@ -1,7 +1,7 @@
 const spaces=['Story & Scenes','Shot Lab','Asset Vault','Production','Video Editor','Economics','Settings'];
 const symbols=['▤','▣','▧','◈','▥','∑','⚙'];
-const descriptions=['Script, scene breakdown and continuity','Prompts, character references and shot approvals','Project reference photos and voices','Workflow, generation queue and take history','Review locally saved takes in shot order','Estimate GPU time and retry costs','Local preferences and workflow configuration'];
-let storyTab='Script', selectedId='', takeKey='', estimateEpisode='';
+const descriptions=['Script, scene breakdown and continuity','Prompts, character references and shot approvals','Project reference photos and voices','Workflow, generation queue and take history','Assemble and review the episode','Estimate GPU time and retry costs','Local preferences and workflow configuration'];
+let storyTab='Script', selectedId='', estimateEpisode='';
 let estimate={shots:1,failure:10,rate:.55,minutes:6};
 function selectedShot(){return ep.shots.find(s=>s.id===selectedId)||ep.shots[0]}
 function heading(s,i){return esc(s.sourceHeading||('Shot '+String(i+1).padStart(2,'0')))}
@@ -17,12 +17,6 @@ function renderStory(){
 function renderShots(){
     const shot=selectedShot();
     return '<div class="lab"><section class="panel"><h2>Shot browser</h2>'+sceneBrowser()+'</section><div>'+(shot?shotPanel(shot):'<section class="panel">Add a scene in Story &amp; Scenes to begin.</section>')+'</div></div>';
-}
-function renderEditor(){
-    const takes=ep.shots.flatMap((s,i)=>versions(s).filter(v=>v.video).map(v=>({s,i,v})));
-    const clip=takes.find(x=>x.v.video===takeKey)||takes[0];
-    const bin=takes.map((x,i)=>'<button data-take="'+esc(x.v.video)+'" class="'+(x===clip?'on':'')+'">'+heading(x.s,x.i)+' · '+esc(x.v.version)+'</button>').join('');
-    return '<div class="lab"><section class="panel"><h2>Media bin</h2><div class="shot-list">'+(bin||'Completed MP4 takes will appear here.')+'</div></section><section class="panel"><h2>Program monitor</h2>'+(clip?'<video controls preload="metadata" src="'+esc(clip.v.video)+'"></video><p>'+heading(clip.s,clip.i)+'</p>':'<div class="monitor">No rendered take in this episode</div>')+'</section></div><section class="panel"><h2>Shot sequence</h2><div class="timeline">'+ep.shots.map((s,i)=>'<button data-open-shot="'+esc(s.id)+'">'+heading(s,i)+'<small>'+s.seconds+' s planned</small></button>').join('')+'</div><p class="muted">Trim, transitions, multitrack mixing and final assembly export require an editing backend.</p></section>';
 }
 function costOutput(){
     const attempts=estimate.shots/(1-estimate.failure/100),hours=attempts*estimate.minutes/60,base=estimate.shots*estimate.minutes/60*estimate.rate;
@@ -50,10 +44,9 @@ document.addEventListener('click',e=>{
     const b=e.target.closest('button');if(!b)return;
     if(b.dataset.storytab){storyTab=b.dataset.storytab;render()}
     if(b.dataset.shot||b.dataset.openShot){selectedId=b.dataset.shot||b.dataset.openShot;page=1;render()}
-    if(b.dataset.take){takeKey=b.dataset.take;render()}
 });
 document.addEventListener('change',e=>{
-    if(e.target.id==='episodeMenu'){ep=db.episodes.find(x=>x.id===e.target.value);selectedId='';takeKey='';render()}
+    if(e.target.id==='episodeMenu'){ep=db.episodes.find(x=>x.id===e.target.value);selectedId='';render()}
     if(e.target.id==='themeChoice'){document.documentElement.dataset.theme=e.target.value;localStorage.setItem('axdar.theme',e.target.value);showTheme()}
 });
 document.addEventListener('input',e=>{

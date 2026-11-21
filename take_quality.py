@@ -2,14 +2,16 @@
 import json
 import math
 import os
-import shutil
 import subprocess
 
 
+from editor_media import tool
+
+
 def check(path, job, timeout=180):
-    ffmpeg = shutil.which("ffmpeg")
-    ffprobe = shutil.which("ffprobe")
-    if not ffprobe or not ffmpeg:
+    try:
+        ffmpeg,ffprobe=tool("ffmpeg"),tool("ffprobe")
+    except ValueError:
         return {"technical":"unavailable", "visual":"review required", "reason":"Install ffmpeg and ffprobe on the production host, then recheck this take."}
     options = {"capture_output":True,"timeout":timeout,"creationflags":getattr(subprocess,"CREATE_NO_WINDOW",0)}
     try:
@@ -64,7 +66,7 @@ def review(path,job,endpoint=None):
     images=[]
     try:
         for position in (.15,.5,.85):
-            frame=subprocess.run([shutil.which("ffmpeg"),"-nostdin","-v","error","-ss",str(position*result["duration"]),
+            frame=subprocess.run([tool("ffmpeg"),"-nostdin","-v","error","-ss",str(position*result["duration"]),
                                   "-i",str(path),"-frames:v","1","-vf","scale=512:-2","-f","image2pipe","-vcodec","mjpeg","-"],
                                  capture_output=True,check=True,timeout=40)
             if not frame.stdout or len(frame.stdout)>1024*1024:

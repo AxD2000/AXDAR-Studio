@@ -132,6 +132,7 @@ import production
 import vast_deploy
 import drive_archive
 import take_quality
+from episode_editor import Editor,valid_id
 
 def prepare_shot(url, folder, eid, s, wf, record):
     images, voices = generation_images(s), generation_voices(s)
@@ -166,6 +167,7 @@ def run(url, deadline, jobs, wf):
 
 controller=vast_deploy.Controller(globals())
 drive_pending=None
+editor=Editor(globals())
 
 class Handler(BaseHTTPRequestHandler):
     def send(self, data, mime="application/json", status=200):
@@ -176,15 +178,74 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length",str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+    def send_file(self,path,download=None):
+        length=path.stat().st_size
+        start,end=0,length-1
+        range_header=self.headers.get("Range","")
+        if range_header:
+            match=re.fullmatch(r"bytes=(\d*)-(\d*)",range_header)
+            if match and any(match.groups()) and length:
+                first,last=match.groups()
+                if first:
+                    start=int(first)
+                    end=min(end,int(last)) if last else end
+                else:
+                    start=max(0,length-int(last))
+            if not match or not any(match.groups()) or start>end:
+                self.send_response(416)
+                self.send_header("Content-Range",f"bytes */{length}")
+                self.send_header("Content-Length","0")
+                self.end_headers()
+                return
+        self.send_response(206 if range_header else 200)
+        self.send_header("Content-Type",mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        self.send_header("Accept-Ranges","bytes")
+        self.send_header("Cache-Control","private, no-store")
+        self.send_header("Content-Length",str(end-start+1))
+        if range_header:
+            self.send_header("Content-Range",f"bytes {start}-{end}/{length}")
+        if download:
+            self.send_header("Content-Disposition",f'attachment; filename="{download}"')
+        self.end_headers()
+        try:
+            with path.open("rb") as stream:
+                stream.seek(start)
+                remaining=end-start+1
+                while remaining:
+                    block=stream.read(min(remaining,256*1024))
+                    if not block:
+                        break
+                    self.wfile.write(block)
+                    remaining-=len(block)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_GET(self):
         from urllib.parse import unquote
         route=unquote(urlsplit(self.path).path)
         if self.headers.get("Host") != f"127.0.0.1:{PORT}": return self.send({},status=403)
-        if route in ("/workspaces.js", "/workspaces.css", "/production-ui.js", "/plugin-manager.js", "/connection-ui.js", "/story-ui.js", "/workflow-ui.js"):
+        if route in ("/workspaces.js", "/workspaces.css", "/production-ui.js", "/plugin-manager.js", "/connection-ui.js", "/story-ui.js", "/workflow-ui.js", "/editor-ui.js"):
             mime = "text/javascript" if route.endswith(".js") else "text/css"
             return self.send((BASE/route[1:]).read_bytes(), mime + "; charset=utf-8")
         if route=="/":
             return self.send((BASE/"studio.html").read_text("utf-8").replace("__TOKEN__",TOKEN).encode(),"text/html; charset=utf-8")
+        if route.startswith("/editor/files/"):
+            parts=route.split("/")
+            if len(parts)==6 and valid_id(parts[3]) and valid_id(parts[4]) and parts[5] in ("video.mp4","subtitles.srt","subtitles.vtt","download"):
+                _,_,_,eid,jid,name=parts
+                job=editor.get_job(eid,jid)
+                if job and job["status"]=="done" and (name!="download" or job["kind"]=="final"):
+                    folder=editor.job_dir(eid,jid)
+                    path=folder/("video.mp4" if name=="download" else name)
+                    if path.is_file():
+                        label=None
+                        if name=="download":
+                            kind="review-cut" if job.get("reviewCut") else "episode"
+                            label=f"AXDAR-{kind}-{eid[:8]}-{job['media']['width']}x{job['media']['height']}.mp4"
+                        elif name=="subtitles.srt":
+                            label=f"AXDAR-{eid[:8]}.srt"
+                        return self.send_file(path,label)
+            return self.send({},status=404)
         if route=="/drive/callback":
             global drive_pending
             query=parse_qs(urlsplit(self.path).query)
@@ -237,12 +298,8 @@ class Handler(BaseHTTPRequestHandler):
             elif production.read(folder/"job.json",{}).get("review") in (None,"accepted"):
                 p=folder/"video.mp4"
         if p and p.is_file():
-            self.send_response(200)
-            self.send_header("Content-Type",mimetypes.guess_type(p.name)[0] or "application/octet-stream")
-            self.send_header("Content-Length",str(p.stat().st_size))
-            self.end_headers()
-            with p.open("rb") as src: shutil.copyfileobj(src,self.wfile)
-        else: self.send({},status=404)
+            return self.send_file(p)
+        return self.send({},status=404)
     def do_POST(self):
         global running,session,active_workflow,workflow_error,drive_pending
         if self.headers.get("X-Studio")!=TOKEN: return self.send({},status=403)
@@ -281,6 +338,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/migrate" or self.path.startswith(("/project/","/story/","/shots/","/characters/")):
                 with LOCK:
                     return self.send(actions.act(self.path, obj, blob if binary else None, filename))
+            if self.path=="/editor":
+                if self.headers.get("Host") != f"127.0.0.1:{PORT}":
+                    return self.send({},status=403)
+                return self.send(editor.action(obj))
             if self.path=="/drive/connect":
                 if self.headers.get("Host") != f"127.0.0.1:{PORT}":
                     return self.send({},status=403)

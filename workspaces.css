@@ -11,3 +11,11 @@ legend{padding:0 5px}.panel pre,.preserve-lines{white-space:pre-wrap;overflow-wr
 .dialogue-line strong,.dialogue-line span{display:block}
 select[multiple]{min-height:4.5em}button:disabled{cursor:default;opacity:.58}
 #notice{white-space:pre-wrap;overflow-wrap:anywhere}
+
+.editor-bin { max-height: 48vh; overflow: auto; }
+.editor-bin details { overflow-wrap: anywhere; }
+.editor-bin h3 { margin-top: 12px; }
+.clip-tools { margin-top: 14px; }
+.clip-tools form { margin: 12px 0; }
+.subtitleEdit blockquote { white-space: pre-wrap; margin: 4px 0; }
+#editorProgress progress { width: min(24rem, 100%); }
