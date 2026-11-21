@@ -6,7 +6,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 BASE = Path(__file__).resolve().parent
-ASSETS = Path(os.environ.get("AXDAR_ASSETS", str(BASE / "assets")))
+ASSETS = BASE.parent / "New folder" / "assets"
 DATA = BASE / "episodes"
 DATA.mkdir(exist_ok=True)
 DB = DATA / "project.json"
@@ -127,8 +127,6 @@ def read_workflow():
     if WORKFLOW_STATE.exists():
         data=json.loads(WORKFLOW_STATE.read_text("utf-8"))
         return prepare_workflow(data["name"],data["graph"])
-    if not (BASE/"workflow.json").exists():
-        raise ValueError("Upload a compatible ComfyUI API workflow in Studio to begin.")
     return prepare_workflow("workflow.json",json.loads((BASE/"workflow.json").read_text("utf-8")))
 
 try:
