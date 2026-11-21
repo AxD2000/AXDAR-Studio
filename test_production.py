@@ -22,7 +22,7 @@ def box(k,v):
     return struct.pack(">I4s",len(v)+8,k)+v
 
 def movie(seconds,audio=True):
-    header=bytes(12)+struct.pack(">II",1000,seconds*1000)
+    header=bytes(12)+struct.pack(">II",1000,round(seconds*1000))
     track=box(b"trak",box(b"mdia",box(b"hdlr",bytes(8)+b"vide")))
     if audio:track+=box(b"trak",box(b"mdia",box(b"hdlr",bytes(8)+b"soun")))
     return box(b"ftyp",b"isom")+box(b"mdat",b"sample")+box(b"moov",box(b"mvhd",header)+track)
@@ -110,6 +110,35 @@ class QueueTests(unittest.TestCase):
         file=self.dir/"wrong.mp4";file.write_bytes(movie(25))
         with self.assertRaises(ValueError):p.inspect_video(file,5)
 
+    def test_frame_grid_duration_is_used_for_render_and_resume(self):
+        from test_workflow_profiles import generic_graph
+        from workflow_profiles import inspect_workflow
+
+        graph, metadata = generic_graph()
+        graph["out"]["inputs"]["fps"] = 10
+        metadata["MyVideo"]["input"]["required"]["frame_count"][1]["step"] = 20
+        self.workflow = inspect_workflow("long frame steps", graph, metadata)
+        self.assertEqual(self.workflow["issues"], [])
+        jobs = self.jobs(1)
+        jobs[0][1]["seconds"] = 1
+        self.ctx["download_output"] = lambda url,folder,history,j: (folder/"video.part").write_bytes(movie(2.1))
+        self.assertEqual(self.drive(jobs)["status"],"finished")
+        record, = self.dir.glob("*/*/*/job.json")
+        self.assertEqual(p.read(record)["playback_seconds"],2.1)
+        self.status.unlink()
+        self.assertEqual(self.drive(jobs)["status"],"finished")
+        self.assertEqual(len(self.requests),1)
+
+    def test_output_audio_is_checked_against_the_runtime_graph(self):
+        jobs = self.jobs(2)
+        silent, voiced = (shot["id"] for _,shot,_ in jobs)
+        self.workflow["graph"] = {"141":{"inputs":{"audio":["51",0]}}}
+        def prepare(_url,_folder,_eid,shot,_workflow,_job):
+            return {"id":shot["id"], "141":{"inputs":{"audio":["51",0]} if shot["id"]==voiced else {}}}
+        self.ctx["prepare_shot"] = prepare
+        self.ctx["download_output"] = lambda url,folder,history,j: (folder/"video.part").write_bytes(movie(5,False))
+        self.assertEqual(self.drive(jobs)["shots"],{silent:"done",voiced:"error"})
+
     def test_missing_audio_track(self):
         path=self.dir/"video.mp4";path.write_bytes(movie(5,False))
         with self.assertRaisesRegex(ValueError,"audio track"):p.inspect_video(path,5,True)
@@ -137,7 +166,13 @@ class QueueTests(unittest.TestCase):
         import contextlib, threading
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         movie_bytes=movie(5)
-        graph=json.loads((ROOT/"workflow.json").read_text(encoding="utf8"))
+        selected = ROOT/"selected-workflow.json"
+        if selected.exists():
+            graph=json.loads(selected.read_bytes())["graph"]
+        elif (ROOT/"workflow.json").exists():
+            graph=json.loads((ROOT/"workflow.json").read_bytes())
+        else:
+            self.skipTest("Supply the user H3 API workflow for the remote artifact check.")
         graphs=[]
         class FakeComfy(BaseHTTPRequestHandler):
             def reply(inner,obj):
@@ -206,7 +241,10 @@ class QueueTests(unittest.TestCase):
 
     def test_real_studio_builds_graph_with_selected_assets(self):
         ctx=runpy.run_path(str(ROOT/"studio.pyw"))["prepare_shot"].__globals__
-        wf=ctx["active_workflow"];shot=dict(image="tom.png",refs=["emma.webp","tom.mp3"],prompt="Tom speaks to Emma",seconds=5,dialog=True,change="",id=str(uuid.uuid4()))
+        wf=ctx["active_workflow"]
+        if not wf or wf.get("adapter")!="minimax-h3":
+            self.skipTest("Select the user H3 workflow for the reference-graph check.")
+        shot=dict(image="tom.png",refs=["emma.webp","tom.mp3"],prompt="Tom speaks to Emma",seconds=5,dialog=True,change="",id=str(uuid.uuid4()))
         for name in [shot["image"],*shot["refs"]]:
             path=self.dir/(name+".source");path.write_bytes(b"x");ctx["files"][name]=path
         ctx["upload"]=lambda url,f,name:f.name

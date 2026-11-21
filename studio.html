@@ -1,147 +1,30 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AXDAR Studio</title><link rel="stylesheet" href="/workspaces.css"><script>try{document.documentElement.dataset.theme=localStorage.getItem('axdar.theme')==='cream'?'cream':'dark'}catch{}</script></head><body><canvas id="pointer-field" aria-hidden="true"></canvas><div class="shell"><aside><div class="brand"><span class="logo">◈</span> AXDAR STUDIO</div><nav id="nav" aria-label="Workspaces"></nav><div class="sidefoot"><small>Current episode</small><strong id="projectTitle"></strong><small id="projectCount"></small></div></aside><main class="main"><div class="global"><select id="episodeMenu" aria-label="Current episode"></select><div class="row"><span class="status" id="saved" role="status"></span><button id="theme"></button></div></div><div class="workspace-title"><h1 id="heading"></h1><p id="caption"></p></div><div id="notice" role="alert"></div><input id="fileImport" type="file" multiple hidden><input id="workflowInput" type="file" accept=".json,application/json" hidden><input id="txtInput" type="file" accept=".txt,text/plain" hidden><dialog id="workflowTools" aria-labelledby="workflowToolsTitle"><h2 id="workflowToolsTitle">Jupyter Terminal commands</h2><p>Runs Bash commands on the connected Vast instance. Same machine as Jupyter; no second connection.</p><label>Hugging Face token<input id="hfToken" type="password" autocomplete="off" placeholder="hf_..."></label><button data-connection="hf">Save HF token securely</button><small id="hfSaved" role="status"></small><label>Bash command<textarea id="remoteCommand" maxlength="4096" rows="6" placeholder="Paste your Jupyter Terminal command here"></textarea></label><button data-connection="command">Run once</button><pre id="remoteOutput" role="status" style="white-space:pre-wrap;max-height:40vh;overflow:auto"></pre><small>25-second command limit, 64 KiB output. HF_TOKEN is available to this command. Long downloads and interactive programs need Jupyter Terminal.</small><button data-tools="close">Close</button></dialog><dialog id="txtDialog" aria-labelledby="txtTitle"><h2 id="txtTitle">Review imported shots</h2><div id="txtPreview"></div><div class="actions row"><button id="txtCancel">Cancel</button><button class="primary" id="txtCommit">Add shots</button></div></dialog><div id="app"></div></main></div><script src="/workspaces.js"></script><script src="/connection-ui.js"></script><script src="/production-ui.js"></script><script defer src="/plugin-manager.js"></script><script>const translations={"المدة من دقيقتين إلى ١٤٤٠ دقيقة": "Set a session length between 2 and 1,440 minutes.", "اعتمد لقطة واحدة على الأقل": "Approve at least one shot first.", "أدخل رابط ComfyUI": "Enter a valid ComfyUI URL.", "الجلسة تعمل حالياً": "A session is already running.", "المشروع أكبر من الحجم المسموح": "The project exceeds the save limit.", "راجع صورة وبرومبت ومدة اللقطة ": "Check the image, prompt and duration of shot ", "العامل ما رجّع MP4 من عقدة الإخراج 141": "The worker returned no MP4 from output node 141.", "حافظ على شكل الشخصية وملابسها حسب الصورة الأساسية المختارة.": "Keep the character’s appearance and wardrobe consistent with the selected primary image.", "حافظ على ترتيب أثاث الغرفة واتجاه الإضاءة.": "Preserve the furniture layout and lighting direction.", "الكاميرا ثابتة أثناء الحوار.": "Keep the camera still during dialogue.", "حلقة جديدة": "New episode"};
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AXDAR Studio</title><link rel="stylesheet" href="/workspaces.css"><script>try{document.documentElement.dataset.theme=localStorage.getItem('axdar.theme')==='cream'?'cream':'dark'}catch{}</script></head><body><canvas id="pointer-field" aria-hidden="true"></canvas><div class="shell"><aside><div class="brand"><span class="logo">◈</span> AXDAR STUDIO</div><nav id="nav" aria-label="Workspaces"></nav><div class="sidefoot"><small>Current episode</small><strong id="projectTitle"></strong><small id="projectCount"></small></div></aside><main class="main"><div class="global"><select id="episodeMenu" aria-label="Current episode"></select><div class="row"><span class="status" id="saved" role="status"></span><button id="theme"></button></div></div><div class="workspace-title"><h1 id="heading"></h1><p id="caption"></p></div><div id="notice" role="alert"></div><input id="fileImport" type="file" multiple hidden><input id="workflowInput" type="file" accept=".json,application/json" hidden><input id="storyFile" type="file" accept=".txt,.md,.fountain,.docx,.pdf" hidden><input id="metadataFile" type="file" accept=".json,application/json" hidden><dialog id="workflowTools" aria-labelledby="workflowToolsTitle"><h2 id="workflowToolsTitle">Jupyter Terminal commands</h2><p>Runs Bash commands on the connected Vast instance. Same machine as Jupyter; no second connection.</p><label>Hugging Face token<input id="hfToken" type="password" autocomplete="off" placeholder="hf_..."></label><button data-connection="hf">Save HF token securely</button><small id="hfSaved" role="status"></small><label>Bash command<textarea id="remoteCommand" maxlength="4096" rows="6" placeholder="Paste your Jupyter Terminal command here"></textarea></label><button data-connection="command">Run once</button><pre id="remoteOutput" role="status" style="white-space:pre-wrap;max-height:40vh;overflow:auto"></pre><small>25-second command limit, 64 KiB output. HF_TOKEN is available to this command. Long downloads and interactive programs need Jupyter Terminal.</small><button data-tools="close">Close</button></dialog><div id="app"></div></main></div><script src="/workspaces.js"></script><script src="/connection-ui.js"></script><script src="/production-ui.js"></script><script src="/story-ui.js"></script><script src="/workflow-ui.js"></script><script defer src="/plugin-manager.js"></script><script>const translations={"المدة من دقيقتين إلى ١٤٤٠ دقيقة": "Set a session length between 2 and 1,440 minutes.", "اعتمد لقطة واحدة على الأقل": "Approve at least one shot first.", "أدخل رابط ComfyUI": "Enter a valid ComfyUI URL.", "الجلسة تعمل حالياً": "A session is already running.", "المشروع أكبر من الحجم المسموح": "The project exceeds the save limit.", "راجع صورة وبرومبت ومدة اللقطة ": "Check the image, prompt and duration of shot ", "العامل ما رجّع MP4 من عقدة الإخراج 141": "The worker returned no MP4 from output node 141.", "حافظ على شكل الشخصية وملابسها حسب الصورة الأساسية المختارة.": "Keep the character’s appearance and wardrobe consistent with the selected primary image.", "حافظ على ترتيب أثاث الغرفة واتجاه الإضاءة.": "Preserve the furniture layout and lighting direction.", "الكاميرا ثابتة أثناء الحوار.": "Keep the camera still during dialogue.", "حلقة جديدة": "New episode"};
 function localize(text){for(const [key,value] of Object.entries(translations))if(text?.startsWith(key))return value+text.slice(key.length);return text}
 
+const studioToken='__TOKEN__';
 const $=s=>document.querySelector(s), uid=()=>crypto.randomUUID(), esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let db,assets,ep,page=0,state={results:[]},saveQueue=Promise.resolve(),timer,saveError='',sessionUrl='',sessionMinutes=60;
+let db,assets,ep,page=0,state={results:[]},saveQueue=Promise.resolve(),timer,editsPending=false,saveError='',sessionUrl='',sessionMinutes=60;
 
 const aliases={'Grumpy Orange Tabby Character Sheet.png':'Orange tabby','Golden Retriever Character Turnaround Sheet (1).png':'Golden retriever','Cozy Sunlit Traditional Living Room.png':'Living room','emma.png':'Emma','jack.png':'Jack','tobby.png':'Tobby','emma.mp3':'Emma · voice','jack.mp3':'Jack · voice','tom.mp3':'Tom · voice'};
 const name=f=>aliases[f]||f, audio=f=>/\.(mp3|wav|ogg|m4a|flac)$/i.test(f), images=()=>assets.filter(f=>!audio(f)), src=f=>'/asset/'+encodeURIComponent(f);
 function option(v,t,selected){return '<option value="'+esc(v)+'" '+(v===selected?'selected':'')+'>'+esc(t)+'</option>'}
 async function post(path,obj){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Studio':'__TOKEN__'},body:JSON.stringify(obj)});let data=await r.json();if(!r.ok)throw Error(localize(data.error)||r.status);return data}
-function save(){clearTimeout(timer);let snapshot=JSON.parse(JSON.stringify(db));$('#saved').textContent='Saving…';saveQueue=saveQueue.catch(()=>{}).then(()=>post('/save',snapshot)).then(()=>{saveError='';$('#saved').textContent='Saved locally'}).catch(e=>{saveError=e.message;$('#saved').textContent='Save failed: '+saveError});return saveQueue}
-function dirty(){clearTimeout(timer);$('#saved').textContent='Unsaved changes';timer=setTimeout(save,300)}
-window.addEventListener('pagehide',()=>{if(db&&$('#saved').textContent==='Unsaved changes')fetch('/save',{method:'POST',headers:{'X-Studio':'__TOKEN__'},body:JSON.stringify(db),keepalive:true}).catch(()=>{})});
-function episode(){return {id:uid(),title:'New episode',story:'',shots:[]}}
-function shot(line=''){return {id:uid(),revision:uid(),prompt:line?'One continuous shot. '+line:'',dialog:/قال|تقول|يقول|قالت|يسأل|تسأل|[«»“”"]|\b(?:says?|asks?|replies)\b/i.test(line),seconds:15,image:'',refs:[],change:'',approved:false}}
-const castAliases=[
-    ['emma','ايما'],['tom','توم','orange tabby','القط البرتقالي'],['jack','جاك'],['tobby','toby','توبي']
-];
-function normalizeName(value){
-    return value.normalize('NFKC').toLowerCase().replace(/[\u064b-\u065f\u0670ـ]/g,'').replace(/[أإآ]/g,'ا').replace(/[^\p{L}\p{N}]+/gu,' ').trim();
+function save(){
+    clearTimeout(timer);timer=null;
+    const snapshot=structuredClone(db);
+    editsPending=false;$('#saved').textContent='Saving…';
+    saveQueue=saveQueue.then(()=>post('/save',{...snapshot,_edit:db._edit})).then(result=>{
+        db._edit=result.edit;saveError='';
+        if(!editsPending)$('#saved').textContent='Saved locally';
+    }).catch(e=>{saveError=e.message;editsPending=true;$('#saved').textContent='Save failed: '+saveError});
+    return saveQueue;
 }
-function assetCast(file){
-    const legacy={'Grumpy Orange Tabby Character Sheet.png':'tom','Cozy Sunlit Traditional Living Room.png':'living room'};
-    const stem=normalizeName(legacy[file]||file.replace(/\.[^.]+$/,'')).split(' ').filter(w=>!['photo','image','voice','audio','ref','صوت','صورة','مرجع'].includes(w)&&!/^\p{N}+$/u.test(w)).join(' ');
-    if(!stem)return [];
-    return castAliases.find(names=>names.includes(stem))||[stem];
-}
-function namePattern(alias){
-    const prefix=/^[\u0600-\u06ff]/.test(alias)?'و?':'';
-    return '(?<![\\p{L}\\p{N}])'+prefix+alias+'(?![\\p{L}\\p{N}])';
-}
-function detectReferences(s){
-    const text=s.prompt.toLowerCase().normalize('NFKC').replace(/[\u064b-\u065f\u0670ـ]/g,'').replace(/[أإآ]/g,'ا');
-    const matches=[];
-    for(const file of assets){
-        const names=assetCast(file);
-        if(file==='Cozy Sunlit Traditional Living Room.png')continue;
-        let pos=Infinity, speaks=false;
-        for(const alias of names){
-            const pat=namePattern(alias);
-            const index=text.search(new RegExp(pat,'iu'));
-            if(index<0)continue;
-            pos=Math.min(pos,index);
-            if(new RegExp(pat+'\\s*(?:[:：]|(?:says?|asks?|replies|speaks?|whispers?|يقول|تقول|قالت?|يسأل|تسأل|يهمس|تهمس)(?![\\p{L}]))|(?:قالت?|يقول|تقول|يسأل|تسأل)\\s+'+pat,'iu').test(text))speaks=true;
-        }
-        if(Number.isFinite(pos))matches.push({file,pos,speaks});
-    }
-    matches.sort((a,b)=>a.pos-b.pos);
-    const pics=matches.filter(m=>!audio(m.file)),voices=matches.filter(m=>audio(m.file)&&m.speaks);
-    return {pics:pics.map(m=>m.file),voices:voices.map(m=>m.file),dialog:matches.some(m=>m.speaks)};
-}
-function matchShot(s){
-    const before=JSON.stringify([s.image,s.refs,s.dialog]);
-    const found=detectReferences(s);
-    const manual=s.refs.filter(f=>!(s.autoReferences||[]).includes(f)&&assets.includes(f));
-    const manualImage=s.image&&s.image!==s.autoImage&&assets.includes(s.image)?s.image:'';
-    s.image=manualImage||found.pics[0]||'';
-    s.autoImage=found.pics[0]||'';
-    s.autoReferences=[...found.pics,...found.voices].filter(f=>f!==s.image);
-    s.refs=[...new Set([...s.autoReferences,...manual])].filter(f=>f!==s.image);
-    s.castVersion=2;
-    if(found.dialog)s.dialog=true;
-    if(before!==JSON.stringify([s.image,s.refs,s.dialog]))invalidate(s);
-    return s;
-}
-function draft(line){
-    const s=shot(line);
-    s.prompt=(s.dialog?'Medium dialogue shot. ':/غرفة المعيشة|living room/i.test(line)?'Wide establishing shot. ':'Follow the action in one continuous shot. ')+line;
-    return matchShot(s);
-}
-function pictureStrip(s){
-    return '<div class="gallery shot-pictures">'+[...new Set([s.image,...s.refs])].filter(f=>f&&!audio(f)).map((f,i)=>'<figure><img loading="lazy" alt="'+esc(name(f))+'" src="'+esc(src(f))+'"><figcaption>Picture '+(i+1)+' · '+esc(f)+'</figcaption></figure>').join('')+'</div>';
-}
-function castSummary(s){
-    const pictures=[s.image,...s.refs].filter(f=>f&&!audio(f)).map(f=>esc(name(f))).join(', ');
-    const voices=s.refs.filter(audio).map(f=>esc(name(f))).join(', ');
-    return '<p class="muted"><strong>Photos</strong> · '+(pictures||'None selected')+'<br><strong>Voices</strong> · '+(voices||'None selected')+'</p>';
-}
-function generationPrompt(s){
-    const voices=[...new Set(s.refs.filter(audio))].map((file,i)=>'<Audio '+(i+1)+'> is the voice reference for '+file.replace(/\.[^.]+$/,'')+'.');
-    return ['r34l1sm',s.prompt,...voices,...matching(s),s.change].filter(Boolean).join('\n');
-}
-function matching(s){return db.rules.filter(r=>r.scope==='all'||(r.scope==='dialog'&&s.dialog)||[s.image,...s.refs].includes(r.scope)).map(r=>translations[r.text]||r.text).filter(Boolean)}
+function dirty(){editsPending=true;clearTimeout(timer);$('#saved').textContent='Unsaved changes';timer=setTimeout(save,300)}
+window.addEventListener('pagehide',()=>{if(db&&!migrationNeeded()&&editsPending)fetch('/save',{method:'POST',headers:{'X-Studio':studioToken},body:JSON.stringify(db),keepalive:true}).catch(()=>{})});
+function episode(){return {id:uid(),title:'New episode',story:'',scenes:[],shots:[],story_imports:[]}}
 function versions(s){return state.results.filter(v=>v.episode===ep.id&&v.id===s.id)}
 const statuses={submitting:'Submitting',uncertain:'Check original submission',done:'Complete',error:'Technical error',queued:'Rendering',preparing:'Preparing references',waiting:'Waiting to resume'};
-function results(s){return versions(s).map((v,i)=>'<div><hr><strong>Take '+(i+1)+' · '+esc(statuses[v.status])+'</strong>'+ (v.error?'<p class="danger">'+esc(localize(v.error))+'</p>':'')+(v.video?'<video controls src="'+esc(v.video)+'"></video><button data-retake="'+s.id+'">Retake shot</button>'+ (page===3?'<button data-archive-version="'+esc(v.version)+'" data-archive-shot="'+esc(s.id)+'">Generate from archived inputs</button>':''):'')+'</div>').join('')}
-function card(s,i){return '<article data-id="'+s.id+'"><div class="top"><h3 dir="auto">'+esc(s.sourceHeading||('Shot '+String(i+1).padStart(2,'0')))+'</h3><span class="pill">'+(s.approved?'Approved':'In review')+'</span></div><div class="meta" dir="ltr">'+s.id+'</div><label>Shot prompt</label><textarea data-k="prompt" dir="auto">'+esc(s.prompt)+'</textarea><div class="row"><label>Duration (seconds) <input type="number" min="1" max="60" data-k="seconds" value="'+s.seconds+'"></label><label><input type="checkbox" data-k="dialog" '+(s.dialog?'checked':'')+'> Dialogue shot</label></div>'+castSummary(s)+'<button data-match-shot="'+s.id+'">Match this shot</button><label>First generation image</label><select data-k="image">'+option('','Choose an image',s.image)+assets.filter(f=>!audio(f)).map(f=>option(f,name(f),s.image)).join('')+'</select><div class="preview">'+pictureStrip(s)+'</div><details><summary>Additional images &amp; voice references ('+s.refs.length+')</summary><div class="refs">'+assets.filter(f=>f!==s.image).map(f=>'<label><input type="checkbox" data-ref="'+esc(f)+'" '+(s.refs.includes(f)?'checked':'')+'>'+esc(name(f))+'</label>').join('')+'</div>'+s.refs.filter(audio).map(f=>'<label>'+esc(name(f))+'</label><audio controls src="'+src(f)+'"></audio>').join('')+'</details><details><summary>Final prompt with continuity rules</summary><p style="white-space:pre-wrap" data-final>'+esc(generationPrompt(s))+'</p></details><label>Retake notes</label><input data-k="change" value="'+esc(s.change)+'"><div class="actions row"><button data-approve="'+s.id+'">'+(s.approved?'Revoke approval':'Approve shot')+'</button>'+'<button data-delete="'+s.id+'">Delete shot</button>' +'</div>'+results(s)+'</article>'}
-function parseShotFile(text) {
-    const lines=text.replace(/^\uFEFF/, '').split(/\r\n|\n|\r/);
-    const patterns=[
-        /^\s*(?:#{1,6}\s*)?(?:EP\d+\s*[·|:/–—-]\s*)?SH\d+(?:\s*[|:：–—-].*)?\s*$/iu,
-        /^\s*(?:#{1,6}\s*)?(?:(?:ال)?لقط[هة]|shot)\s*#?\s*[0-9٠-٩۰-۹]+(?:\s*[|:：–—-].*)?\s*$/iu,
-        /^\s*(?:#{1,6}\s*)?(?:(?:ال)?مشهد|scene)\s*#?\s*[0-9٠-٩۰-۹]+(?:\s*[|:：–—-].*)?\s*$/iu
-    ];
-    const heading=patterns.find(pattern=>lines.some(line=>pattern.test(line)));
-    if(!heading)throw Error('No numbered shot or scene headings found.');
-    const blocks = [];
-    let current;
-    for (const line of lines) {
-        if (heading.test(line)) {
-            current = {heading:line.trim().replace(/^#+\s*/, ''), lines:[]};
-            blocks.push(current);
-        } else if (current) current.lines.push(line);
-
-    }
-    if (!blocks.length) throw Error('No numbered shot headings found.');
-    return blocks.map(({heading, lines}) => {
-        while (lines.length && !lines.at(-1).trim()) lines.pop();
-        let first = lines.findIndex(line => line.trim());
-        if (first < 0) throw Error('Missing prompt under '+heading+'.');
-        return {heading, prompt:lines.slice(first).join('\n')};
-    });
-}
-let previewBlocks=[];
-function previewStory(blocks){
-    previewBlocks=blocks;
-    $('#txtPreview').innerHTML=blocks.map(b=>'<section><h3 dir="auto">'+esc(b.heading)+'</h3><p dir="auto">'+esc(b.prompt)+'</p></section>').join('');
-    $('#txtCommit').textContent=ep.shots.length?'Create corrected episode ('+blocks.length+' shots)':'Add '+blocks.length+' shots';
-    $('#txtDialog').showModal();
-}
-let separateEpisode=false;
-const importDialog=$('#txtDialog');
-$('#txtInput').onchange=async event=>{
-    const file=event.target.files[0];
-    if(!file)return;
-    try {
-        const text=new TextDecoder('utf-8',{fatal:true}).decode(await file.arrayBuffer());
-        separateEpisode=false;previewBlocks=parseShotFile(text);
-        $('#txtPreview').innerHTML=previewBlocks.map(b=>'<section><h3 dir="auto">'+esc(b.heading)+'</h3><p dir="auto">'+esc(b.prompt)+'</p></section>').join('');
-        $('#txtCommit').textContent='Add '+previewBlocks.length+(previewBlocks.length===1?' shot':' shots');
-        importDialog.showModal();
-    }catch(error){$('#notice').textContent=error instanceof TypeError?'Save your TXT file as UTF-8 and try again.':error.message;$('#notice').scrollIntoView({block:'nearest'})}
-    finally{event.target.value=''}
-};
-$('#txtCancel').onclick=()=>importDialog.close();
-$('#txtCommit').onclick=async()=>{
-    const imported=previewBlocks.map(b=>matchShot({...shot(),sourceHeading:b.heading,prompt:b.prompt}));
-    if(!imported.length)return;
-    if(separateEpisode&&ep.shots.length){ep={...ep,id:uid(),title:ep.title+' · by heading',shots:[]};db.episodes.push(ep)}
-    separateEpisode=false;previewBlocks=[];ep.shots.push(...imported);
-    importDialog.close();render();await save();
-};
-
-function plan(){let room=assets.find(f=>f.startsWith('Cozy'));return '<div class="layout"><section class="panel">'+(room?'<div class="scene"><img alt="Living room reference" src="'+src(room)+'"><span>Living room reference</span></div>':'')+'<div class="row"><button id="newEp">New episode</button></div><label>Episode title</label><input id="title" value="'+esc(ep.title)+'"><label>Story</label><textarea id="story" dir="auto" rows="5" placeholder="Paste your numbered scenes or write a story here.">'+esc(ep.story)+'</textarea><div class="actions row"><button class="primary" id="split">Draft '+(ep.shots.length?'more shots':'shots')+'</button><button id="example">Try sample story</button></div><small>For a more detailed breakdown, share the story in your Codex chat.</small></section><section class="panel"><h2>Episode structure</h2><p>'+ep.shots.length+' shots · '+ep.shots.reduce((n,s)=>n+Number(s.seconds||0),0)+' seconds planned</p><div class="toolbar"><button id="importTxt">Import TXT</button><button data-page="1">Open Shot Lab</button></div>'+shotList()+'</section></div>'}
+function results(s){return versions(s).map((v,i)=>'<div><hr><strong>Take '+(i+1)+' · '+esc(statuses[v.status])+'</strong>'+ (v.error?'<p class="danger">'+esc(localize(v.error))+'</p>':'')+(v.video?'<video controls src="'+esc(v.video)+'"></video><button data-review-retake="'+esc(s.id)+'">Retake shot</button>'+ (page===3?'<button data-archive-version="'+esc(v.version)+'" data-archive-shot="'+esc(s.id)+'">Generate from archived inputs</button>':''):'')+'</div>').join('')}
 function bible(){return '<section class="panel"><h2>Continuity rules</h2><p>Choose when each rule applies. Matching rules appear in the final shot prompt.</p>'+db.rules.map((r,i)=>'<div class="rule" data-rule="'+i+'"><select data-scope>'+option('all','All shots',r.scope)+option('dialog','Dialogue shots',r.scope)+assets.map(f=>option(f,name(f),r.scope)).join('')+'</select><textarea data-text>'+esc(translations[r.text]||r.text)+'</textarea><button data-remove="'+i+'">Remove</button></div>').join('')+'<button id="newRule">+ Add rule</button></section>'}
 
 
@@ -174,75 +57,72 @@ async function importFiles(input){
     finally{input.value='';render()}
 }
 
-$('#workflowInput').onchange=async event=>{
-    const file=event.target.files[0];if(!file)return;
-    try{
-        const graph=JSON.parse((await file.text()).replace(/^\uFEFF/,''));
-        const result=await post('/workflow',{name:file.name,graph});
-        state.workflow=result.name;render();$('#saved').textContent='Workflow saved';
-    }catch(error){$('#notice').textContent='Workflow upload failed. '+error.message;$('#notice').scrollIntoView({block:'nearest'})}
-    finally{event.target.value=''}
-};
-function sessionView(){return productionPanel()+'<div class="layout"><section class="panel"><h2>'+esc(ep.title)+'</h2><p>Connect the ComfyUI instance running your MiniMax H3 Singularity workflow.</p><label>Active workflow</label><div class="row"><strong id="workflowName">'+esc(state.workflow||'workflow.json')+'</strong><button id="chooseWorkflow">Upload workflow</button><button data-tools="open">Terminal &amp; HF Token</button></div><small>Choose a compatible MiniMax H3 workflow exported in ComfyUI API format. Applies to the next session.</small><label>ComfyUI URL</label><input dir="ltr" id="url" placeholder="https://…" value="'+esc(state.connection?.url||sessionUrl)+'"><label>Remaining session time (minutes)</label><input type="number" id="minutes" min="2" max="1440" value="'+sessionMinutes+'"><div class="actions"><button class="primary" id="start" '+(state.running?'disabled':'')+'>Start or resume session</button></div><small>Videos are saved locally. New submissions stop in the last minute. Resume an active render on the same instance or regenerate it on a new one. Keep your computer on during rendering. Manage billing on Vast.</small></section><section class="panel"><h2>Shot history</h2><p>'+(state.running?'Session runs until '+new Date(state.session.end*1000).toLocaleTimeString('en-US'):'No active session')+'</p>'+ep.shots.map((s,i)=>'<div><strong>'+esc(s.sourceHeading||('Shot '+(i+1)))+' · '+(s.approved?'Approved':'In review')+'</strong><div class="meta">'+s.id+'</div>'+results(s)+'</div>').join('')+'</section></div>'}
+function sessionView(){
+    const approved=ep.shots.filter(s=>s.approved).length;
+    return workflowPanel()+productionPanel()+'<div class="layout"><section class="panel"><h2>Direct ComfyUI submission</h2><p>'+approved+' approved shots in '+esc(ep.title)+'</p><label>ComfyUI URL<input dir="ltr" id="url" placeholder="https://…" value="'+esc(sessionUrl||state.connection?.url||'')+'"></label><label>Remaining session time (minutes)<input type="number" id="minutes" min="2" max="1440" value="'+esc(sessionMinutes)+'"></label><div class="actions"><button class="primary" id="start" '+(state.running||!approved?'disabled':'')+'>Submit approved shots</button></div></section><section class="panel"><h2>Shot history</h2><p>'+(state.running?'Session runs until '+new Date(state.session.end*1000).toLocaleTimeString():'No active session')+'</p>'+ep.shots.map((s,i)=>'<div><strong>'+heading(s,i)+' · '+(s.approved?'Approved':'In review')+'</strong>'+results(s)+'</div>').join('')+'</section></div>'
+}
 function invalidate(s){s.revision=uid();s.approved=false}
-function ruleEdit(action){let before=new Map(db.episodes.flatMap(e=>e.shots.map(s=>[s.id,JSON.stringify(matching(s))])));action();for(let e of db.episodes)for(let s of e.shots)if(before.get(s.id)!==JSON.stringify(matching(s)))invalidate(s)}
-document.addEventListener('input',e=>{let t=e.target,a=t.closest('article'),s=a&&ep.shots.find(x=>x.id===a.dataset.id),k=t.dataset.k;
-if(t.id==='url'){sessionUrl=t.value;return}if(t.id==='minutes'){sessionMinutes=t.value;return}
-if(t.id==='title')ep.title=t.value;else if(t.id==='story')ep.story=t.value;
-else if(s&&k){s[k]=t.type==='checkbox'?t.checked:t.type==='number'?Number(t.value):t.value;invalidate(s);if(k==='dialog'||k==='image')render();else{a.querySelector('.pill').textContent='In review';a.querySelector('[data-approve]').textContent='Approve shot';a.querySelector('[data-final]').textContent=generationPrompt(s)}}
-else if(s&&t.hasAttribute('data-ref')){s.refs=s.refs.filter(f=>f!==t.dataset.ref);if(t.checked)s.refs.push(t.dataset.ref);invalidate(s);render();document.querySelector('[data-id="'+s.id+'"] details').open=true}
-else if(t.closest('[data-rule]')){let r=db.rules[Number(t.closest('[data-rule]').dataset.rule)];ruleEdit(()=>r[t.hasAttribute('data-scope')?'scope':'text']=t.value)}else return;dirty()});
-document.addEventListener('change',e=>{if(e.target.dataset.k==='prompt'){
-    const article=e.target.closest('article'),s=ep.shots.find(x=>x.id===article.dataset.id);
-    matchShot(s);dirty();
-    const fresh=document.createElement('template');fresh.innerHTML=card(s,ep.shots.indexOf(s));
-    for(const selector of ['[data-match-shot]','.preview','details','[data-final]']){
-        const current=article.querySelector(selector),next=fresh.content.querySelector(selector);
-        if(selector==='[data-match-shot]')current.previousElementSibling.replaceWith(next.previousElementSibling);
-        else {if(current.open)next.open=true;current.replaceWith(next)}
-    }
-    article.querySelector('[data-k="image"]').value=s.image;
-    article.querySelector('[data-k="dialog"]').checked=s.dialog;
+function ruleEdit(action){
+    action();
+    for(const e of db.episodes)for(const s of e.shots)if(s.approved)invalidate(s);
 }
-if(e.target.id==='fileImport'){importFiles(e.target);return}if(e.target.id==='selectEp'){ep=db.episodes.find(x=>x.id===e.target.value);render()}if(e.target.id==='title')render()});
-document.addEventListener('click',async e=>{let b=e.target.closest('button');if(!b)return;$('#notice').textContent='';try{
-if(b.dataset.archiveVersion){await productionAction('start',[b.dataset.archiveShot,b.dataset.archiveVersion]);return}
-if(b.dataset.production){b.disabled=true;try{await productionAction(b.dataset.production)}finally{b.disabled=false}return}
-if(b.hasAttribute('data-page')){page=Number(b.dataset.page);render();return}
-if(b.dataset.import){
-    const input=$('#fileImport');input.dataset.kind=b.dataset.import;
-    input.accept=b.dataset.import==='voice'?'.mp3,.wav,.m4a,.ogg,.flac':'.png,.jpg,.jpeg,.webp,.avif';
-    input.click();return;
-}
-if(b.hasAttribute('data-drop-file')){
-    const f=b.dataset.dropFile;
-    if(!confirm('Remove '+name(f)+' from the library, shot references and matching rules?'))return;
-    await save();if(saveError)throw Error(saveError);
-    const id=ep.id, updated=await post('/library/remove',{name:f});
-    db=updated.project;assets=updated.assets;ep=db.episodes.find(e=>e.id===id);render();return;
-}
-if(b.id==='matchCast'||b.dataset.matchShot){
-    const latest=await(await fetch('/api')).json();assets=latest.assets;
-    const targets=b.dataset.matchShot?ep.shots.filter(s=>s.id===b.dataset.matchShot):ep.shots;
-    targets.forEach(matchShot);await save();render();return;
-}
-if(b.id==='chooseWorkflow'){$('#workflowInput').click();return}
-if(b.id==='importTxt'){$('#txtInput').click();return}
-if(b.id==='newEp'){ep=episode();db.episodes.push(ep)}
-else if(b.id==='example'){if(ep.story||ep.shots.length){ep=episode();db.episodes.push(ep)}ep.title='Morning light';ep.story='Jack enters the living room and sets a book by the window.\nEmma turns and asks, “Where did you find that book?”\nThe orange tabby lifts its head towards the sound.'}
-else if(b.id==='split'){
-    let structured;
-    try{structured=parseShotFile(ep.story)}catch(err){if(err.message!=='No numbered shot or scene headings found.')throw err}
-    if(structured){separateEpisode=true;previewStory(structured);return}
-    let parts=ep.story.trim().split(/\n+|(?<=[.!؟?])\s+/u).map(x=>x.trim()).filter(Boolean);if(!parts.length)throw Error('Enter a story first.');ep.shots.push(...parts.map(draft))}
-else if(b.dataset.delete){if(!confirm('Delete this shot from the episode?'))return;ep.shots=ep.shots.filter(s=>s.id!==b.dataset.delete)}
-else if(b.id==='addShot'){const fresh=shot();ep.shots.push(fresh);selectedId=fresh.id}
-else if(b.hasAttribute('data-approve')||b.hasAttribute('data-retake')){let s=ep.shots.find(x=>x.id===(b.dataset.approve||b.dataset.retake));if(!s.image||!s.prompt.trim()||s.seconds<1||s.seconds>60)throw Error('Choose an image, enter a prompt and set a duration from 1 to 60 seconds.');if(b.dataset.retake){page=1;selectedId=s.id;if(!s.change.trim()){render();document.querySelector('[data-id="'+s.id+'"] [data-k="change"]').focus();throw Error('Describe your changes and click Retake shot.')}s.revision=uid();s.approved=true}else s.approved=!s.approved}
-else if(b.id==='newRule')db.rules.push({scope:'all',text:''});
-else if(b.hasAttribute('data-remove'))ruleEdit(()=>db.rules.splice(Number(b.dataset.remove),1));
-else if(b.id==='start'){await save();if(saveError)throw Error(saveError);await post('/start',{episode:ep.id,url:sessionUrl,minutes:sessionMinutes});state=await (await fetch('/status')).json();render();return}else return;
-await save();render()}catch(err){$('#notice').textContent=err.message;$('#notice').scrollIntoView({block:'nearest'})}});
-(async()=>{let data=await (await fetch('/api')).json();db=data.project;for(const r of db.rules)r.text=translations[r.text]||r.text;for(const e of db.episodes)if(e.title==="حلقة جديدة"&&!e.story&&!e.shots.length)e.title="New episode";assets=data.assets;ep=db.episodes.at(-1);if(!ep){ep=episode();db.episodes.push(ep);await save()}let migrated=false;for(const episode of db.episodes)for(const s of episode.shots){if(s.castVersion!==2){matchShot(s);migrated=true}}if(migrated)await save();state=await(await fetch('/status')).json();render();$('#saved').textContent='Saved locally';setInterval(async()=>{try{let next=await(await fetch('/status')).json();let changed=JSON.stringify(state)!==JSON.stringify(next);state=next;productionNotice(next.production);if(changed&&(page===3||page===4&&!document.querySelector('video'))&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName))render()}catch{}},4000)})().catch(e=>$('#notice').textContent=e.message)
+document.addEventListener('input',e=>{
+    const t=e.target;
+    if(t.id==='url'){sessionUrl=t.value;return}
+    if(t.id==='minutes'){sessionMinutes=t.value;return}
+    if(t.id==='title')ep.title=t.value;
+    else if(t.closest('[data-rule]')){
+        const r=db.rules[Number(t.closest('[data-rule]').dataset.rule)];
+        ruleEdit(()=>r[t.hasAttribute('data-scope')?'scope':'text']=t.value);
+    }else return;
+    dirty();
+});
+document.addEventListener('change',e=>{
+    if(e.target.id==='fileImport')importFiles(e.target);
+    if(e.target.id==='title'){$('#projectTitle').textContent=ep.title;const current=$('#episodeMenu').selectedOptions[0];if(current)current.textContent=(db.episodes.indexOf(ep)+1)+'. '+ep.title}
+});
+document.addEventListener('click',async e=>{
+    const b=e.target.closest('button');if(!b)return;
+    try{
+        if(b.dataset.archiveVersion){await productionAction('start',[b.dataset.archiveShot,b.dataset.archiveVersion]);return}
+        if(b.dataset.production){b.disabled=true;try{await productionAction(b.dataset.production)}finally{b.disabled=false}return}
+        if(b.hasAttribute('data-page')){page=Number(b.dataset.page);render();return}
+        if(b.dataset.import){
+            const input=$('#fileImport');input.dataset.kind=b.dataset.import;
+            input.accept=b.dataset.import==='voice'?'.mp3,.wav,.m4a,.ogg,.flac':'.png,.jpg,.jpeg,.webp,.avif';
+            input.click();return;
+        }
+        if(b.hasAttribute('data-drop-file')){
+            const file=b.dataset.dropFile;
+            if(!confirm('Remove '+name(file)+' from the library and associated references?'))return;
+            const updated=await projectAction('/library/remove',{name:file});
+            assets=updated.assets;render();return;
+        }
+        if(b.id==='newEp'){await projectAction('/project/episode',{title:'New episode'});ep=db.episodes.at(-1);selectedId='';render();return}
+        else if(b.id==='newRule')db.rules.push({scope:'all',text:''});
+        else if(b.hasAttribute('data-remove'))ruleEdit(()=>db.rules.splice(Number(b.dataset.remove),1));
+        else if(b.id==='start'){
+            await flushEdits();const submission=await post('/start',{episode:ep.id,url:$('#url').value,minutes:sessionMinutes});
+            state=await(await fetch('/status')).json();render();reportSubmission(submission);return;
+        }else return;
+        await save();render();
+    }catch(err){reportError(err)}
+});
+(async()=>{
+    const data=await(await fetch('/api')).json();
+    migration=data.migration;db=data.project;assets=data.assets;ep=db.episodes.at(-1);
+    state=await(await fetch('/status')).json();
+    if(!migrationNeeded()&&!ep){await projectAction('/project/episode',{title:'New episode'});ep=db.episodes.at(-1)}
+    if(!migrationNeeded())await loadWorkflows();
+    render();
+    setInterval(async()=>{
+        try{
+            const next=await(await fetch('/status')).json(),changed=JSON.stringify(state)!==JSON.stringify(next);
+            state=next;productionNotice(next.production);
+            if(changed&&!migrationNeeded()&&(page===3||page===4&&!document.querySelector('video'))&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!document.querySelector('#workflowFields[open]'))render();
+        }catch{}
+    },4000);
+})().catch(reportError);
 const themeButton = document.querySelector('#theme');
 function showTheme() {
     const dark = document.documentElement.dataset.theme === 'dark';

@@ -11,15 +11,12 @@ function shotList(){
 }
 function renderStory(){
     const subnav=['Script','Scenes','Storyboard','Continuity'].map(k=>'<button class="'+(storyTab===k?'on':'')+'" data-storytab="'+k+'">'+k+'</button>').join('');
-    let body;
-    if(storyTab==='Script')body=plan();
-    else if(storyTab==='Continuity')body=bible();
-    else body='<section class="panel"><h2>'+storyTab+'</h2><div class="'+(storyTab==='Storyboard'?'board':'scene-list')+'">'+ep.shots.map((s,i)=>'<button class="scene-card" data-open-shot="'+esc(s.id)+'">'+(storyTab==='Storyboard'&&s.image?'<img loading="lazy" alt="" src="'+esc(src(s.image))+'">':'')+'<strong>'+heading(s,i)+'</strong><span>'+esc(s.prompt.slice(0,120))+'</span><small>'+s.seconds+' s · '+(s.approved?'Approved':'In review')+'</small></button>').join('')+'</div>'+(!ep.shots.length?'<p>Draft shots from the Script tab to populate this view.</p>':'')+'</section>';
+    const body=storyTab==='Script'?scriptPanel():storyTab==='Continuity'?bible():scenePanels(storyTab==='Storyboard');
     return '<div class="toolbar">'+subnav+'</div>'+body;
 }
 function renderShots(){
-    const s=selectedShot();
-    return '<div class="lab"><section class="panel"><h2>Shot browser</h2><div class="toolbar"><button id="addShot">+ Add shot</button><button id="matchCast">Match references</button></div>'+shotList()+'</section><div>'+(s?card(s,ep.shots.indexOf(s)):'<section class="panel">Add a shot or import prompts from Story &amp; Scenes.</section>')+'</div></div>';
+    const shot=selectedShot();
+    return '<div class="lab"><section class="panel"><h2>Shot browser</h2>'+sceneBrowser()+'</section><div>'+(shot?shotPanel(shot):'<section class="panel">Add a scene in Story &amp; Scenes to begin.</section>')+'</div></div>';
 }
 function renderEditor(){
     const takes=ep.shots.flatMap((s,i)=>versions(s).filter(v=>v.video).map(v=>({s,i,v})));
@@ -37,15 +34,17 @@ function renderEconomics(){
     return '<div class="layout"><section class="panel"><h2>Cost parameters</h2>'+fields.map(([key,label,min,max,step])=>'<label>'+label+'<input data-cost="'+key+'" type="number" min="'+min+'" max="'+max+'" step="'+step+'" value="'+estimate[key]+'"></label>').join('')+'</section><section class="panel"><h2>GPU-only estimate</h2><div id="costOutput">'+costOutput()+'</div><small>Assumes independent retries at a fixed rate. Storage, idle time and bandwidth are excluded.</small></section></div>';
 }
 function renderSettings(){
-    return '<section class="panel"><h2>Interface</h2><label>Color theme<select id="themeChoice">'+option('dark','Dark',document.documentElement.dataset.theme)+option('cream','Cream',document.documentElement.dataset.theme)+'</select></label></section><section class="panel"><h2>Models &amp; workflow</h2><p>'+esc(state.workflow||'workflow.json')+'</p><button id="chooseWorkflow">Upload workflow</button><button data-tools="open">Terminal &amp; HF Token</button></section><section class="panel"><h2>Storage &amp; automation</h2><p>Episodes, references and takes are stored locally. Start or resume a session in Production.</p><small>Provider credential storage, rental automation and scheduled batches require backend integration.</small></section>';
+    return '<section class="panel"><h2>Interface</h2><label>Color theme<select id="themeChoice">'+option('dark','Dark',document.documentElement.dataset.theme)+option('cream','Cream',document.documentElement.dataset.theme)+'</select></label></section>'+workflowPanel();
 }
 function render(){
+    if(migrationNeeded()){renderMigration();return}
+    if(!ep)return;
     $('#heading').textContent=spaces[page];$('#caption').textContent=descriptions[page];
     $('#nav').innerHTML=spaces.map((n,i)=>'<button data-page="'+i+'" aria-current="'+(page===i?'page':'false')+'" class="'+(page===i?'on':'')+'"><span aria-hidden="true">'+symbols[i]+'</span>'+n+'</button>').join('');
     $('#episodeMenu').innerHTML=db.episodes.map((e,i)=>option(e.id,(i+1)+'. '+(e.title||'Untitled episode'),ep.id)).join('');
     $('#projectTitle').textContent=ep.title||'Untitled episode';
-    $('#projectCount').textContent=ep.shots.length+' shots · '+ep.shots.filter(s=>s.approved).length+' approved';
-    $('#app').innerHTML=[renderStory,renderShots,libraryView,sessionView,renderEditor,renderEconomics,renderSettings][page]();
+    $('#projectCount').textContent=(ep.scenes||[]).length+' scenes · '+ep.shots.length+' shots · '+ep.shots.filter(s=>s.approved).length+' approved';
+    $('#app').innerHTML=[renderStory,renderShots,()=>characterRegistry()+libraryView(),sessionView,renderEditor,renderEconomics,renderSettings][page]();
 }
 document.addEventListener('click',e=>{
     const b=e.target.closest('button');if(!b)return;

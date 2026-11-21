@@ -5,8 +5,13 @@ from urllib.parse import urlencode, urlsplit, unquote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+import story_engine
+import workflow_profiles
+from studio_actions import StudioActions, production_prompt, url_for_comfy
+
 BASE = Path(__file__).resolve().parent
-ASSETS = BASE.parent / "New folder" / "assets"
+desktop_assets = BASE.parent / "New folder" / "assets"
+ASSETS = Path(os.environ.get("AXDAR_ASSETS") or (desktop_assets if desktop_assets.is_dir() else BASE / "assets"))
 DATA = BASE / "episodes"
 DATA.mkdir(exist_ok=True)
 DB = DATA / "project.json"
@@ -66,73 +71,14 @@ def clean_assets(db):
 WORKFLOW_STATE = BASE / "selected-workflow.json"
 
 def prepare_workflow(name, graph):
-    if not isinstance(graph, dict) or "nodes" in graph:
-        raise ValueError("Export this workflow from ComfyUI in API format (Save / Export API).")
-    graph = graph.get("prompt", graph)
-    if isinstance(graph,dict):
-        missing=[str(k) for k,n in graph.items() if isinstance(n,dict) and not n.get("class_type")]
-        if missing: raise ValueError("API export is missing class_type for "+str(len(missing))+" nodes: "+", ".join(missing)+". Load the original in ComfyUI with all custom nodes available, then export in API format.")
-    if not isinstance(graph, dict) or not graph or not all(
-        str(key).isdigit() and isinstance(node, dict) and isinstance(node.get("inputs"), dict)
-        and isinstance(node.get("class_type"), str) for key, node in graph.items()
-    ):
-        raise ValueError("Expected a ComfyUI API graph with numeric node IDs.")
-    def single(ids, role):
-        ids = list(ids)
-        if len(ids) != 1:
-            raise ValueError(f"Expected one {role}, found {len(ids)}.")
-        return ids[0]
+    return workflow_profiles.inspect_workflow(name, graph)
 
-    def upstream(key):
-        seen, todo = set(), [key]
-        while todo:
-            current = todo.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            for value in graph[current]["inputs"].values():
-                if isinstance(value, list) and len(value)==2 and isinstance(value[0],str) and isinstance(value[1],int):
-                    if value[0] not in graph:
-                        raise ValueError(f"Node {current} links to missing node {value[0]}.")
-                    todo.append(value[0])
-        return seen
-
-    candidates = [k for k,n in graph.items() if n["class_type"]=="VHS_VideoCombine"
-                  and n["inputs"].get("save_output",True) and "mp4" in str(n["inputs"].get("format","")).lower()]
-    final = [k for k in candidates if "final" in graph[k].get("_meta",{}).get("title","").lower()]
-    output = single(final or candidates, "final MP4 output (VHS_VideoCombine)")
-    branch = upstream(output)
-    reference = single((k for k in branch if graph[k]["class_type"]=="MiniMaxH3ReferenceToVideo"), "MiniMax H3 reference node")
-    inputs = graph[reference]["inputs"]
-    def source(slot, types):
-        link = inputs.get(slot)
-        if not isinstance(link,list) or len(link)!=2 or graph.get(link[0],{}).get("class_type") not in types:
-            raise ValueError(f"Unsupported connection for {slot} on node {reference}.")
-        return link[0]
-    prompt_id = source("prompt", {"PrimitiveStringMultiline","PrimitiveString"})
-    # Determine the first existing reference image slot (sorted numerically)
-    ref_slots = [s for s in inputs if s.startswith("ref_images.ref_image_") and re.fullmatch(r"ref_images\.ref_image_(\d+)", s)]
-    if not ref_slots:
-        raise ValueError("No reference image slots found on MiniMax H3 reference node")
-    # Sort slots by numeric suffix
-    ref_slots.sort(key=lambda s: int(s.split("_")[-1]))
-    loader = source(ref_slots[0], {"LoadImage"})
-    duration_branch = upstream(source("length", {node["class_type"] for node in graph.values()}))
-    numbers = [k for k in duration_branch if graph[k]["class_type"] in ("PrimitiveFloat","PrimitiveInt")
-               and isinstance(graph[k]["inputs"].get("value"),(float,int))]
-    duration = single([k for k in numbers if "duration" in graph[k].get("_meta",{}).get("title","").lower()] or numbers, "shot duration control")
-    return dict(name=name, graph=graph, reference=reference, loader=loader, prompt=prompt_id, duration=duration, output=output)
-
-def read_workflow():
-    if WORKFLOW_STATE.exists():
-        data=json.loads(WORKFLOW_STATE.read_text("utf-8"))
-        return prepare_workflow(data["name"],data["graph"])
-    return prepare_workflow("workflow.json",json.loads((BASE/"workflow.json").read_text("utf-8")))
-
+actions = StudioActions(globals())
 try:
-    active_workflow = read_workflow()
-    workflow_error = ""
-except ValueError as exc:
+    candidate = actions.bootstrap_workflow()
+    active_workflow = actions.store.active() if candidate else None
+    workflow_error = "" if active_workflow else "Import or map a compatible ComfyUI API workflow."
+except (ValueError, OSError) as exc:
     active_workflow = None
     workflow_error = str(exc)
 
@@ -143,10 +89,13 @@ def save(path, obj):
     temp.replace(path)
 
 def project():
-    return json.loads(DB.read_text("utf-8")) if DB.exists() else {"episodes":[], "rules":[
+    if DB.is_file():
+        return json.loads(DB.read_text("utf-8"))
+    db = story_engine.new_project([
         {"scope":"all","text":"حافظ على شكل الشخصية وملابسها حسب الصورة الأساسية المختارة."},
         {"scope":"Cozy Sunlit Traditional Living Room.png","text":"حافظ على ترتيب أثاث الغرفة واتجاه الإضاءة."},
-        {"scope":"dialog","text":"الكاميرا ثابتة أثناء الحوار."}]}
+        {"scope":"dialog","text":"الكاميرا ثابتة أثناء الحوار."}])
+    return actions.commit(db)
 
 def generation_voices(shot):
     return list(dict.fromkeys(name for name in shot["refs"] if Path(name).suffix.lower() in VOICES))
@@ -179,44 +128,21 @@ def generation_images(shot):
     return list(dict.fromkeys(name for name in [shot["image"], *shot["refs"]]
                               if name and Path(name).suffix.lower() in PHOTOS))
 
-def connect_images(graph_copy, names, upload_image, wf):
-    if not 1 <= len(names) <= 9:
-        raise ValueError("Choose between 1 and 9 character images for this shot.")
-    next_id = max(map(int, graph_copy)) + 1
-    inputs = graph_copy[wf["reference"]]["inputs"]
-    for slot in list(inputs):
-        if slot.startswith("ref_images.ref_image_"): del inputs[slot]
-    for index, name in enumerate(names):
-        node_id = wf["loader"] if index == 0 else str(next_id + index - 1)
-        loader = copy.deepcopy(graph_copy[wf["loader"]])
-        loader["inputs"]["image"] = upload_image(name)
-        graph_copy[node_id] = loader
-        inputs[f"ref_images.ref_image_{index}"] = [node_id, 0]
-
 import production
 import vast_deploy
 
 def prepare_shot(url, folder, eid, s, wf, record):
-    for name in set(filter(None,[s["image"],*s["refs"]])):
-        shutil.copy2(files[name],folder/name)
-    g=copy.deepcopy(wf["graph"])
-    connect_images(g, generation_images(s), lambda name: upload(url,folder/name,uuid.uuid4().hex+Path(name).suffix), wf)
-    inputs = g[wf["reference"]]["inputs"]
-    for slot in list(inputs):
-        if slot.startswith("ref_audios.ref_audio_"):
-            del inputs[slot]
-    for index, name in enumerate(generation_voices(s)):
-        node_id = str(max(map(int, g)) + 1)
-        uploaded = upload(url, folder/name, uuid.uuid4().hex + Path(name).suffix)
-        g[node_id] = {"class_type": "LoadAudio", "inputs": {"audio": uploaded}}
-        inputs[f"ref_audios.ref_audio_{index}"] = [node_id, 0]
-    g[wf["prompt"]]["inputs"]["value"]=record["prompt"]
-    g[wf["duration"]]["inputs"]["value"]=s["seconds"]
-    g[wf["output"]]["inputs"]["filename_prefix"]="AXDAR/"+eid+"/"+s["id"]+"/"+folder.name
-    return g
+    images, voices = generation_images(s), generation_voices(s)
+    for name in dict.fromkeys([*images,*voices]):
+        if name not in files or Path(name).name != name:
+            raise ValueError("Missing asset: " + name)
+        shutil.copy2(files[name], folder/name)
+    return workflow_profiles.runtime_graph(wf, s, record["prompt"], images, voices,
+        lambda name: upload(url, folder/name, uuid.uuid4().hex + Path(name).suffix),
+        "AXDAR/" + eid + "/" + s["id"] + "/" + folder.name)
 
 def download_output(url,folder,h,record):
-    outputs=h.get("outputs",{}).get(record.get("output_node","141"),{})
+    outputs=h.get("outputs",{}).get(str(record["output_node"]),{})
     video=next((v for group in outputs.values() if isinstance(group,list) for v in group if isinstance(v,dict) and v.get("filename","").lower().endswith(".mp4")),None)
     if not video: raise ValueError("No MP4 returned from the final output node.")
     query=urlencode({k:video[k] for k in ("filename","subfolder","type") if k in video})
@@ -250,7 +176,7 @@ class Handler(BaseHTTPRequestHandler):
         from urllib.parse import unquote
         route=unquote(urlsplit(self.path).path)
         if self.headers.get("Host") != f"127.0.0.1:{PORT}": return self.send({},status=403)
-        if route in ("/workspaces.js", "/workspaces.css", "/production-ui.js", "/plugin-manager.js", "/connection-ui.js"):
+        if route in ("/workspaces.js", "/workspaces.css", "/production-ui.js", "/plugin-manager.js", "/connection-ui.js", "/story-ui.js", "/workflow-ui.js"):
             mime = "text/javascript" if route.endswith(".js") else "text/css"
             return self.send((BASE/route[1:]).read_bytes(), mime + "; charset=utf-8")
         if route=="/":
@@ -258,7 +184,9 @@ class Handler(BaseHTTPRequestHandler):
         if route=="/api":
             with LOCK:
                 db = project()
-                return self.send(dict(project=db,assets=active_assets(db)))
+                if db.get("schema_version") == story_engine.SCHEMA_VERSION and story_engine.sync_takes(db, DATA):
+                    save(DB, db)
+                return self.send(dict(project=db, assets=active_assets(db), migration=story_engine.migration_preview(db, DATA)))
         if route=="/status":
             result=[]
             for p in sorted(DATA.glob("*/*/*/job.json")):
@@ -297,8 +225,21 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     name = import_asset(unquote(self.headers.get("X-Filename","")), blob)
                     return self.send({"name":name})
-            if size>8000000: raise ValueError("المشروع أكبر من الحجم المسموح")
-            obj=json.loads(self.rfile.read(size))
+            limit = 32 * 1024 * 1024 if self.path in ("/workflow/import","/workflow/inspect","/story/parse","/story/commit","/save") else 8 * 1024 * 1024
+            if not 0 < size <= limit:
+                raise ValueError("Request is empty or exceeds the upload limit.")
+            blob = self.rfile.read(size)
+            if len(blob) != size:
+                raise ValueError("Upload incomplete.")
+            filename = unquote(self.headers.get("X-Filename",""))
+            binary = self.path == "/workflow/import" or self.path == "/story/parse" and filename
+            obj = {} if binary else json.loads(blob)
+            if self.path.startswith("/workflow/"):
+                with LOCK:
+                    return self.send(actions.workflow(self.path.rsplit("/",1)[1], obj, blob if binary else None, filename))
+            if self.path == "/migrate" or self.path.startswith(("/project/","/story/","/shots/","/characters/")):
+                with LOCK:
+                    return self.send(actions.act(self.path, obj, blob if binary else None, filename))
             if self.path=="/connection":
                 if self.headers.get("Host") != f"127.0.0.1:{PORT}": return self.send({},status=403)
                 action=obj.get("action")
@@ -318,29 +259,30 @@ class Handler(BaseHTTPRequestHandler):
                 if action=="command": return self.send({"output":connection.command(obj.get("command"))})
                 raise ValueError("Unknown connection action")
             if self.path=="/production":
-                if running: raise ValueError("The manual session is active")
-                if not active_workflow and obj.get("action") in ("start","retry","resume"): raise ValueError(workflow_error)
-                return self.send(controller.action(obj))
+                with LOCK:
+                    if running: raise ValueError("The manual session is active")
+                    if not active_workflow and obj.get("action") == "start" and not obj.get("archive"):
+                        raise ValueError(workflow_error)
+                    return self.send(controller.action(obj))
             with LOCK:
                 if self.path=="/workflow":
-                    new = prepare_workflow(str(obj["name"]),obj["graph"])
-                    save(WORKFLOW_STATE,dict(name=new["name"],graph=new["graph"]))
-                    active_workflow=new
-                    workflow_error=""
-                    return self.send({"name":new["name"]})
+                    result = actions.workflow("import", {}, json.dumps(obj["graph"]).encode(), str(obj["name"]))
+                    return self.send(dict(result, name=result["profile"]["name"]))
                 if self.path=="/save":
-                    obj["removedAssets"] = project().get("removedAssets", [])
-                    clean_assets(obj)
-                    save(DB,obj)
+                    return self.send(actions.general_save(obj))
                 elif self.path=="/library/remove":
                     name = obj["name"]
                     db = project()
+                    actions.check(db, obj)
                     if name not in files:
                         raise ValueError("File not found in the library.")
                     if name not in db.setdefault("removedAssets", []):
                         db["removedAssets"].append(name)
                     clean_assets(db)
-                    save(DB, db)
+                    for character in db.get("characters", []):
+                        for field in ("images", "voices"):
+                            character[field] = [item for item in character.get(field, []) if item != name]
+                    actions.commit(db)
                     return self.send(dict(project=db, assets=active_assets(db)))
                 elif self.path=="/start":
                     if not active_workflow: raise ValueError(workflow_error)
@@ -352,16 +294,14 @@ class Handler(BaseHTTPRequestHandler):
                     if not 2<=minutes<=1440: raise ValueError("المدة من دقيقتين إلى ١٤٤٠ دقيقة")
                     db=project()
                     ep=next(e for e in db["episodes"] if e["id"]==obj["episode"])
-                    jobs=[(ep["id"],s,db["rules"]) for s in ep["shots"] if s["approved"]]
-                    if not jobs: raise ValueError("اعتمد لقطة واحدة على الأقل")
-                    for eid,s,_ in jobs:
-                        if len(generation_voices(s)) > 3: raise ValueError("Choose at most 3 voice references per shot.")
-                        if len(generation_images(s)) > 9: raise ValueError("Shot "+s["id"]+" exceeds the 9-image limit.")
-                        if not all(re.fullmatch(r"[a-f0-9-]{36}",x) for x in (eid,s["id"])) or s["image"] not in files or not s["prompt"].strip() or not 1<=s["seconds"]<=60: raise ValueError("راجع صورة وبرومبت ومدة اللقطة "+s["id"])
+                    jobs, skipped = actions.approved_jobs(db, ep)
+                    if not jobs:
+                        raise ValueError(next((reason for reasons in skipped.values() for reason in reasons), "Approve at least one ready shot."))
                     end=time.time()+60*minutes
-                    session=dict(end=end,episode=ep["id"])
+                    session=dict(end=end,episode=ep["id"],submitted=len(jobs),blocked=skipped)
                     running=True
                     threading.Thread(target=run,args=(url,end,jobs,active_workflow),daemon=True).start()
+                    return self.send({"ok":True,"submitted":len(jobs),"blocked":skipped})
                 else: return self.send({},status=404)
             self.send({"ok":True})
         except Exception as e: self.send({"error":str(e)},status=400)

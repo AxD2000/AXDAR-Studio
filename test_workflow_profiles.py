@@ -1,0 +1,189 @@
+import copy
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import workflow_profiles as profiles
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def node(kind, **inputs):
+    return {"class_type":kind,"inputs":inputs}
+
+
+def generic_graph():
+    graph = {"t":node("MyText", positive_prompt="keep me", negative_prompt="negative"),
+             "pic":node("LoadImage", image="unrelated.png"),
+             "voice":node("LoadAudio", audio="unrelated.wav"),
+             "gen":node("MyVideo", conditioning=["t",0], frame_count=49, portrait=["pic",0], speech=["voice",0]),
+             "out":node("StudioMovieSink", video=["gen",0], format="mp4", fps=24,filename_prefix="original")}
+    metadata = {"MyText":{"input":{"required":{"positive_prompt":["STRING"],"negative_prompt":["STRING"]}}},
+                "MyVideo":{"input":{"required":{"conditioning":["CONDITIONING"],"portrait":["IMAGE"],
+                                                 "frame_count":["INT",{"min":1,"max":97,"step":8}]},
+                                    "optional":{"speech":["AUDIO"]}}},
+                "StudioMovieSink":{"output_node":True}}
+    return graph,metadata
+
+
+class WorkflowProfiles(unittest.TestCase):
+    @unittest.skipUnless((ROOT/"selected-workflow.json").exists(), "Supply the user H3 workflow for this check.")
+    def test_real_studio_original_and_optional_h3_groups(self):
+        raw = (ROOT/"selected-workflow.json").read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = profiles.WorkflowStore(tmp)
+            wf = store.import_workflow("Studio H3",raw)
+            self.assertEqual(wf["issues"],[])
+            self.assertEqual(wf["mapping"]["positive"],"84.value")
+            self.assertEqual(wf["mapping"]["duration"],"74.value")
+            self.assertEqual(wf["output"],"141")
+            copied = copy.deepcopy(wf["graph"])
+            shot = {"seconds":5}
+            uploaded = []
+            def upload(name):
+                uploaded.append(name)
+                return "staged/"+name
+            g = profiles.runtime_graph(wf,shot,"new words",["left.png","right.png"],["line.wav"],upload,"AXDAR/take")
+            inputs = g["56"]["inputs"]
+            for i,name in enumerate(["left.png","right.png"]):
+                self.assertEqual(g[inputs[f"ref_images.ref_image_{i}"][0]]["inputs"]["image"],"staged/"+name)
+            self.assertEqual(g[inputs["ref_audios.ref_audio_0"][0]]["inputs"]["audio"],"staged/line.wav")
+            self.assertEqual(g["74"]["inputs"]["value"],5)
+            self.assertEqual(g["84"]["inputs"]["value"],"new words")
+            self.assertEqual(g["141"]["inputs"]["filename_prefix"],"AXDAR/take")
+            self.assertEqual(uploaded,["left.png","right.png","line.wav"])
+            self.assertNotIn("135",g)
+            self.assertEqual(profiles.timing(wf,5)["frames"],124)
+            self.assertEqual(profiles.limits(wf)["trained_frame_range"],[124,362])
+            no_refs = profiles.runtime_graph(wf,shot,"quiet",[],[],upload,"p")
+            self.assertFalse(any(k.startswith(("ref_images.","ref_audios.")) for k in no_refs["56"]["inputs"]))
+            self.assertFalse(any(n["class_type"] in ("LoadImage","LoadAudio") for n in no_refs.values()))
+            self.assertEqual(copied,wf["graph"])
+            self.assertEqual(store.original(wf["version"]),raw)
+            self.assertEqual(store.active()["version"],wf["version"])
+            too_long = profiles.timing(wf,180)
+            self.assertTrue(too_long["issues"])
+            self.assertEqual(sum(too_long["split"]),180)
+            with self.assertRaisesRegex(ValueError,"images references"):
+                profiles.runtime_graph(wf,shot,"x",["a.png"]*10,[],upload,"p")
+
+    @unittest.skipUnless((ROOT/"selected-workflow.json").exists(), "Supply the user H3 workflow for this check.")
+    def test_h3_changed_expression_or_playback_rate_never_guesses_seconds(self):
+        raw = json.loads((ROOT/"selected-workflow.json").read_bytes())["graph"]
+        raw["141"]["inputs"]["frame_rate"] = 30
+        wf = profiles.inspect_workflow("30fps",raw)
+        self.assertEqual(wf["issues"],[])
+        self.assertEqual(wf["mapping"]["frames"],"56.length")
+        self.assertEqual(wf["mapping"]["fps"],30)
+        g = profiles.runtime_graph(wf,{"seconds":5},"words",[],[],str,"p")
+        self.assertEqual(g["56"]["inputs"]["length"],158)
+        self.assertNotIn("75",g)
+        raw["141"]["inputs"]["frame_rate"] = 24
+        raw["75"]["inputs"]["expression"] = "a * 3"
+        self.assertEqual(profiles.inspect_workflow("changed calculator",raw)["mapping"]["frames"],"56.length")
+
+    def test_editor_export_and_actual_incomplete_api_export_report_action(self):
+        with self.assertRaisesRegex(ValueError,"API format"):
+            profiles.inspect_workflow("editor",{"nodes":[{"type":"LoadImage"}],"links":[]})
+        if not (ROOT/"workflow.json").exists():
+            return
+        with self.assertRaisesRegex(ValueError,"missing class_type"):
+            profiles.inspect_workflow("incomplete", (ROOT/"workflow.json").read_bytes())
+
+    def test_generic_custom_output_negative_optional_and_required_references(self):
+        graph,metadata = generic_graph()
+        wf = profiles.inspect_workflow("custom",graph,metadata)
+        self.assertEqual(wf["issues"],[])
+        self.assertEqual(wf["adapter"],"api")
+        self.assertEqual(profiles.limits(wf)["max_images"],1)
+        self.assertEqual(profiles.limits(wf)["min_audio"],0)
+        self.assertTrue(profiles.validate_shot(wf,{"seconds":3},[],[]))
+        shot = dict(seconds=3,negativePrompt="changed negative")
+        rendered = profiles.runtime_graph(wf,shot,"changed positive",["shot.png"],[],lambda n:"new/"+n,"new/shot")
+        self.assertEqual(rendered["t"]["inputs"],dict(positive_prompt="changed positive",negative_prompt="changed negative"))
+        self.assertEqual(rendered["pic"]["inputs"]["image"],"new/shot.png")
+        self.assertNotIn("voice",rendered)
+        self.assertNotIn("speech",rendered["gen"]["inputs"])
+        self.assertEqual(rendered["gen"]["inputs"]["frame_count"],73)
+        self.assertEqual(profiles.timing(wf,7)["split"],[4,3])
+        with self.assertRaisesRegex(ValueError,"maximum"):
+            profiles.runtime_graph(wf,{"seconds":7},"x",["shot.png"],[],str,"p")
+        self.assertEqual(graph["pic"]["inputs"]["image"],"unrelated.png")
+        no_voice = profiles.inspect_workflow("custom",graph,metadata,dict(wf["mapping"],audio=[]))
+        self.assertEqual(no_voice["issues"],[])
+        self.assertNotIn("voice",profiles.runtime_graph(no_voice,shot,"p",["right.png"],[],str,"p"))
+
+    def test_missing_nonprimitive_and_required_widget(self):
+        graph,metadata = generic_graph()
+        metadata["MyVideo"]["input"]["required"].update(model=["MODEL"],guidance=["FLOAT",{"min":0,"max":10}])
+        wf = profiles.inspect_workflow("custom",graph,metadata)
+        self.assertIn("gen.model"," ".join(wf["issues"]))
+        self.assertIn("gen.guidance"," ".join(wf["issues"]))
+        bad = profiles.inspect_workflow("custom",graph,metadata,dict(parameters={"gen.guidance":11,"gen.model":"some.safetensors"}))
+        self.assertIn("requires a connected MODEL"," ".join(bad["issues"]))
+        self.assertIn("allowed range"," ".join(bad["issues"]))
+        graph["model"] = node("ModelLoader",name="model.safetensors")
+        graph["gen"]["inputs"]["model"] = ["model",0]
+        fixed = profiles.inspect_workflow("custom",graph,metadata,dict(parameters={"gen.guidance":4}))
+        self.assertEqual(fixed["issues"],[])
+        shot = {"seconds":3,"workflowParameters":{"gen.guidance":6}}
+        out = profiles.runtime_graph(fixed,shot,"words",["ref.png"],[],str,"prefix")
+        self.assertEqual(out["gen"]["inputs"]["guidance"],6)
+
+    def test_missing_image_socket_can_be_bound_and_absent_optional_audio_stays_absent(self):
+        graph,metadata = generic_graph()
+        del graph["gen"]["inputs"]["portrait"],graph["pic"]
+        wf = profiles.inspect_workflow("custom",graph,metadata)
+        self.assertEqual(wf["mapping"]["images"],["gen.portrait"])
+        self.assertEqual(wf["issues"],[])
+        out = profiles.runtime_graph(wf,{"seconds":2},"text",["correct.png"],[],str,"p")
+        loader = out["gen"]["inputs"]["portrait"][0]
+        self.assertEqual(out[loader],node("LoadImage",image="correct.png"))
+
+    def test_ambiguous_text_output_and_source_bytes_survive_remapping(self):
+        graph = {"a":node("CustomWords",literal_a="first",literal_b="second"),
+                 "b":node("CustomVideo",text=["a",0],seconds=8),
+                 "z":node("OpaqueSaver",media=["b",0])}
+        raw = b"\xef\xbb\xbf"+json.dumps({"prompt":graph},indent=3).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = profiles.WorkflowStore(tmp)
+            prev = store.import_workflow("confirmed",json.dumps({"t":node("Words",positive_prompt="scene"),
+                                                                "g":node("Video",text=["t",0],seconds=4),
+                                                                "o":node("VHS_VideoCombine",images=["g",0],format="video/h264-mp4")}).encode())
+            draft = store.import_workflow("custom.json",raw)
+            self.assertTrue(draft["issues"])
+            self.assertEqual(store.active()["version"],prev["version"])
+            with self.assertRaisesRegex(ValueError,"Review workflow"):
+                store.select(draft["version"])
+            approved = store.remap(draft["version"],{"output":"z","positive":"a.literal_a","negative":"a.literal_b"})
+            self.assertEqual(approved["issues"],[])
+            new = store.remap(approved["version"],dict(approved["mapping"],positive="a.literal_b",negative="a.literal_a"))
+            self.assertNotEqual(new["version"],approved["version"])
+            self.assertEqual(store.original(new["version"]),raw)
+            self.assertEqual(store.get(approved["version"])["mapping"]["positive"],"a.literal_a")
+            self.assertEqual(store.select(approved["version"]),store.active())
+            self.assertTrue(all(row.keys()>={"version","name","ready"} for row in store.list()))
+
+    def test_image_only_graph_rejected_and_metadata_does_not_switch_selection(self):
+        graph,metadata = generic_graph()
+        graph["out"]=node("SaveImage",images=["gen",0],filename_prefix="x")
+        wf = profiles.inspect_workflow("still",graph,metadata,dict(output="out"))
+        self.assertIn("MP4"," ".join(wf["issues"]))
+        graph,metadata = generic_graph()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = profiles.WorkflowStore(tmp)
+            current = store.import_workflow("confirmed",json.dumps({"t":node("Words",positive_prompt="scene"),
+                                                                "g":node("Video",text=["t",0],seconds=4),
+                                                                "o":node("VHS_VideoCombine",images=["g",0],format="video/h264-mp4")}).encode())
+            pending = store.import_workflow("other",json.dumps(graph).encode())
+            self.assertTrue(pending["issues"])
+            inspected = store.inspect_metadata(pending["version"],metadata)
+            self.assertFalse(inspected["issues"])
+            self.assertEqual(store.active()["version"],current["version"])
+            self.assertEqual(store.select(inspected["version"]),store.active())
+
+
+if __name__=="__main__":
+    unittest.main()

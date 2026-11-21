@@ -78,7 +78,9 @@ def execute(directory):
         ctx=ctx["prepare_shot"].__globals__
         ctx["DATA"]=directory/"episodes"
         ctx["files"]={name:store/"blobs"/sha for name,sha in spec["assets"].items()}
-        wf=ctx["prepare_workflow"](spec["workflow"]["name"],spec["workflow"]["graph"])
+        wf=spec["workflow"]
+        if "mapping" not in wf:
+            wf=ctx["prepare_workflow"](wf["name"],wf["graph"])
         status=directory/"status.json"
         try:
             progress=prod.read(status,{})

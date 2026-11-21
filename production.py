@@ -81,12 +81,17 @@ def inspect_video(path, seconds, require_audio=False):
                                     handler=f.read(4)
                                     video |= handler == b"vide"
                                     audio |= handler == b"soun"
-    # H3 rounds to a supported frame count, at most 16 frames at 24 fps.
+    # Allow for differences in MP4 track and movie header timing.
     if require_audio and not audio:
         raise ValueError("Expected audio track is missing from the MP4")
     if not (brand and media and video and duration > 0 and abs(duration-seconds) <= 1):
         raise ValueError(f"Invalid MP4 or unexpected duration {duration:.2f}s (expected {seconds}s)")
     return duration
+
+
+def inspect_take(path, job):
+    seconds = job.get("playback_seconds", job["settings"]["seconds"])
+    return inspect_video(path, seconds, job.get("audioRequired",False))
 
 
 def lookup(api, url, marker):
@@ -117,7 +122,7 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
             continue
         folder = path.parent
         if j["status"] == "done":
-            inspect_video(folder/"video.mp4", shot["seconds"],j.get("audioRequired",False))
+            inspect_take(folder/"video.mp4", j)
             return "done"
         if j["status"] in ("queued","waiting","submitting","uncertain") or j.get("ticket") and j["status"]!="error":
             if j.get("url") != url:
@@ -136,6 +141,10 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
         j = dict(shot=shot["id"], revision=shot["revision"], url=url, status="preparing",
                  prompt=shot.get("frozenPrompt") or ctx["prompt"](shot,rules), settings=shot,rules=rules, workflow=wf["name"],
                  output_node=wf["output"], marker=uuid.uuid4().hex)
+        if wf.get("version"):
+            from workflow_profiles import timing
+            j.update(workflow_version=wf["version"], workflow_profile=wf, scene_id=shot.get("scene_id"),
+                     playback_seconds=timing(wf,shot["seconds"])["playback_seconds"])
         atomic(path,j)
     for attempt in range(retries+1):
         try:
@@ -147,6 +156,7 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
                 else:
                     graph = ctx["prepare_shot"](url, folder, eid, shot, wf, j)
                     atomic(folder/"graph.json",graph)
+                    j["audioRequired"] = "audio" in graph.get(str(j["output_node"]),{}).get("inputs",{})
                     j["status"]="submitting"
                     atomic(path,j)
                     try:
@@ -165,8 +175,10 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
                         details=next((m[1] for m in h["status"].get("messages",[]) if m[0]=="execution_error"),{})
                         raise ValueError(str(details.get("node_type","Render"))+": "+str(details.get("exception_message","ComfyUI execution failed"))[:800])
                     ctx["download_output"](url,folder,h,j)
-                    j["audioRequired"]="audio" in wf.get("graph",{}).get(wf["output"],{}).get("inputs",{})
-                    duration=inspect_video(folder/"video.part",shot["seconds"],j["audioRequired"])
+                    if "audioRequired" not in j:
+                        graph = read(folder/"graph.json", wf.get("graph",{}))
+                        j["audioRequired"] = "audio" in graph.get(str(j["output_node"]),{}).get("inputs",{})
+                    duration=inspect_take(folder/"video.part",j)
                     (folder/"video.part").replace(folder/"video.mp4")
                     j.update(status="done", duration=duration, sha256=digest(folder/"video.mp4"))
                     j.pop("error",None)

@@ -18,7 +18,7 @@ from urllib.parse import urlencode
 import production as prod
 
 STORE="/workspace/axdar-studio"
-SOURCES=("worker.py","production.py","vast_worker.py","vast_deploy.py","studio.pyw","workflow.json","provision.py","model-lock.json","vast_connection.py")
+SOURCES=("worker.py","production.py","vast_worker.py","vast_deploy.py","studio.pyw","studio_actions.py","story_engine.py","workflow_profiles.py","provision.py","model-lock.json","vast_connection.py")
 TERMINAL={"finished","needs attention","stopped","paused","waiting","limit reached"}
 
 
@@ -142,7 +142,7 @@ def fetch_take(target,spec,data_dir,rel,j,sources=None):
     _,run=paths(spec)
     tmp=dest/"transfer.part"
     required={"video.mp4","history.json","graph.json"}
-    for name in {j["settings"]["image"],*j["settings"]["refs"]}:
+    for name in set(filter(None, [j["settings"]["image"], *j["settings"]["refs"]])):
         if Path(name).name!=name or name not in spec["assets"]:raise ValueError("Unexpected take asset")
         source=(sources or {}).get(name)
         if source and source.is_file() and prod.digest(source)==spec["assets"][name]:
@@ -160,7 +160,7 @@ def fetch_take(target,spec,data_dir,rel,j,sources=None):
             with arch.extractfile(m) as src,part.open("wb") as out:
                 shutil.copyfileobj(src,out)
             if name=="video.mp4":
-                prod.inspect_video(part,j["settings"]["seconds"],j.get("audioRequired",False))
+                prod.inspect_take(part,j)
                 if prod.digest(part)!=j["sha256"]:raise ValueError("Video checksum mismatch; retry sync")
             if name in spec["assets"] and prod.digest(part)!=spec["assets"][name]:raise ValueError("Archive asset checksum mismatch")
             part.replace(dest/name)
@@ -225,12 +225,12 @@ class Controller:
                 if self.thread and self.thread.is_alive() or old and self.view.get("status") not in ("finished","stopped","needs attention","deployment failed"):
                     raise ValueError("Finish or stop the current production first")
                 target=self.connection.target() if obj.get("instance") else {"host":obj.get("host",""),"port":int(obj.get("port",22))}
-                if obj.get("instance") and str(target["id"])!=str(obj["instance"]):raise ValueError("Connect the selected instance first")
+                if obj.get("instance") and (not target or str(target["id"])!=str(obj["instance"])):raise ValueError("Connect the selected instance first")
                 if not target:raise ValueError("Connect the selected instance first")
-                ep=next(e for e in self.ctx["project"]()["episodes"] if e["id"]==obj["episode"])
                 db=self.ctx["project"]()
+                ep=next(e for e in db["episodes"] if e["id"]==obj["episode"])
                 jobs=[]; assets={}; ids=set()
-                shots=ep["shots"]
+                skipped={}
                 sources=self.ctx["files"]
                 wf=self.ctx["active_workflow"]
                 rules=db["rules"]
@@ -246,45 +246,47 @@ class Controller:
                     original["frozenPrompt"]=old_job["prompt"]
                     shots=[original]
                     rules=old_job["rules"]
-                    sources={name:folder/name for name in [original["image"],*original["refs"]]}
-                    wf=self.ctx["prepare_workflow"](old_job["workflow"],prod.read(folder/"graph.json"))
+                    sources={name:folder/name for name in filter(None, [original["image"],*original["refs"]])}
+                    wf=old_job.get("workflow_profile") or self.ctx["prepare_workflow"](old_job["workflow"],prod.read(folder/"graph.json"))
+                else:
+                    prepared,skipped=self.ctx["actions"].approved_jobs(db,ep)
+                    shots=[row[1] for row in prepared]
+                    sources=self.ctx["files"]
                 for s in shots:
                     if not s["approved"]:continue
                     for value in [ep["id"],s["id"]]:
                         if str(uuid.UUID(value))!=value:raise ValueError("Invalid project or shot identifier")
                     if s["id"] in ids:raise ValueError("Duplicate shot ID")
                     ids.add(s["id"])
-                    if not s["prompt"].strip() or not 1<=s["seconds"]<=60 or not s["image"]:raise ValueError("Incomplete approved shot "+s["id"])
                     previous=[(p,prod.read(p)) for p in sorted((self.ctx["DATA"]/ep["id"]/s["id"]).glob("*/job.json"),reverse=True)]
                     matching=next(((p,j) for p,j in previous if j.get("revision")==s["revision"]),None)
                     if matching:
                         p,j=matching
                         if j["status"]=="done":
-                            prod.inspect_video(p.parent/"video.mp4",s["seconds"])
+                            prod.inspect_take(p.parent/"video.mp4",j)
                             continue
                         if j["status"] in ("queued","waiting","submitting","uncertain"):
                             raise ValueError("Resume the previous session for shot "+s["id"]+" before starting another.")
-                    if len(self.ctx["generation_images"](s))>9 or len(self.ctx["generation_voices"](s))>3:raise ValueError("Reference limit exceeded for "+s["id"])
-                    for name in [s["image"],*s["refs"]]:
+                    for name in filter(None,[s["image"],*s["refs"]]):
                         if Path(name).name!=name or name not in sources or not sources[name].is_file():raise ValueError("Missing asset: "+name)
                         if name not in assets: assets[name]=prod.digest(sources[name])
                     jobs.append([ep["id"],s,rules])
-                if not jobs:raise ValueError("No pending approved shots")
+                if not jobs:raise ValueError(next((reason for reasons in skipped.values() for reason in reasons), "No pending approved shots"))
                 rate=float(target.get("rate") or obj.get("rate",0));budget=float(obj.get("budget",0))
                 minutes=int(obj["minutes"]);retries=int(obj["retries"])
                 if not all(math.isfinite(v) and v>=0 for v in (rate,budget)) or not 2<=minutes<=1440 or not 0<=retries<=5 or budget and not rate:raise ValueError("Check rate, budget, minutes and retries")
                 stop_when_limited=obj.get("policy")=="stop-instance"
                 if stop_when_limited and not target.get("id"):raise ValueError("Select a discovered Vast instance for automatic stopping")
-                spec=dict(id=uuid.uuid4().hex,episode=ep["id"],target=target, jobs=jobs,assets=assets,workflow=dict(name=wf["name"],graph=wf["graph"]),rate=rate,budget=budget,expectedSeconds=360,retries=retries,started=time.time(),end=time.time()+60*minutes,
+                spec=dict(id=uuid.uuid4().hex,episode=ep["id"],target=target, jobs=jobs,assets=assets,workflow=wf,blocked=skipped,rate=rate,budget=budget,expectedSeconds=360,retries=retries,started=time.time(),end=time.time()+60*minutes,
                           dispatch=uuid.uuid4().hex,stopOnLimit=stop_when_limited,release=hashlib.sha256("".join(prod.digest(self.base/n) for n in SOURCES).encode()).hexdigest())
                 ledger=prod.read(self.dir/"costs.json",{}).get(ep["id"],{})
                 spec["priorEstimate"]=sum(ledger.values())
                 if budget and spec["priorEstimate"]>=budget:raise ValueError("Project budget already reached. Review previous estimated production spend.")
                 if archive:spec["archive"]=[ep["id"],*archive]
                 prod.atomic(self.ptr,spec)
-                self.view=dict(status="deploying",current=None,total=len(jobs),episode=ep["id"],rate=rate)
+                self.view=dict(status="deploying",current=None,total=len(jobs),episode=ep["id"],rate=rate,blocked=skipped)
                 self.watch(spec,True)
-                return {"ok":True}
+                return {"ok":True,"submitted":len(jobs),"blocked":skipped}
             if not old:raise ValueError("No production session")
             if act=="resume" and self.view.get("status")=="deployment failed":
                 self.view.update(status="deploying")
@@ -356,7 +358,7 @@ class Controller:
                         if key not in self.synced:
                             fetch_take(target,spec,self.ctx["DATA"],rel,j,self.files(spec))
                             self.synced.add(key)
-                    self.view=dict(state,healthy=True,episode=spec["episode"],total=len(spec["jobs"]),rate=spec["rate"],budget=spec["budget"])
+                    self.view=dict(state,healthy=True,episode=spec["episode"],total=len(spec["jobs"]),rate=spec["rate"],budget=spec["budget"],blocked=spec.get("blocked",{}))
                     if state and "estimate" in state:
                         cost_file=self.dir/"costs.json"
                         costs=prod.read(cost_file,{})

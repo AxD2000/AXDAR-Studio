@@ -15,9 +15,15 @@ python studio.pyw
 
 Open http://127.0.0.1:18753/ if the browser does not open automatically. The application listens on localhost.
 
-Upload your own compatible MiniMax H3 ComfyUI workflow in API JSON format. Workflow import is currently H3-specific; arbitrary ComfyUI graphs and GitHub projects are not automatically compatible. A fresh checkout starts without an active workflow.
+When opening an existing project, review the migration and choose **Create backup and migrate**. AXDAR saves a copy of the previous project JSON beside it, preserves episode and shot IDs, and links existing takes. Generated media stays in its original folder.
 
-Import media in Asset Vault. Optional pre-existing assets can be placed under `assets/`, or selected through the `AXDAR_ASSETS` environment variable. Project state is created under `episodes/`, and imported references under `library/`; both are ignored by Git.
+1. In **Asset Vault**, add references and register each character with a name, aliases, a visual reference, and any voices.
+2. In **Story & Scenes → Script**, paste text or choose **Import story file**. AXDAR accepts TXT, Markdown, Fountain, DOCX, and PDF with extractable text. Edit the proposed scenes and shots and choose **Add reviewed scenes**. The original text is retained.
+3. In **Settings** or **Production**, import a ComfyUI API JSON graph, then review its input and video output mapping. Use **Read /object_info** with a running ComfyUI server for its installed node contracts. Save edits as a new mapping revision and choose **Use this version** to activate it. AXDAR saves the original file and builds separate runtime graphs.
+4. In **Shot Lab**, edit and preview the cast, prompts, references, and timing. Resolve ambiguous names, missing references, and any proposed splits. Approve individual shots or choose **Approve all ready shots**.
+5. In **Production**, connect to ComfyUI or the existing Vast instance and submit the approved batch. The worker archives the derived graph and MP4 with the take.
+
+Optional pre-existing assets can live in `assets/` or a directory set via `AXDAR_ASSETS`. Project state is created under `episodes/`, imported references under `library/`, and workflow revisions under `workflow-profiles/`. Git ignores these directories.
 
 ## Vast connection
 
@@ -40,10 +46,10 @@ See [PLUGINS.md](PLUGINS.md) for the manifest, registry and action contract. `pl
 Local deterministic checks:
 
 ```powershell
-python -B -m unittest -q test_connection test_connection_http test_plugins
+python -B -m unittest discover -q
 ```
 
-`test_production.py` also exercises the queue and mocked remote artifacts. Two of its cases require a compatible `workflow.json` supplied locally; no third-party workflow is distributed here. These are not paid GPU tests.
+`test_production.py` also exercises the queue and mocked remote artifacts. The H3 integration checks use the user's saved `selected-workflow.json` when it is available. The repository does not distribute user workflow exports. These are not paid GPU tests.
 
 The project is a working prototype. Real rendering still depends on compatible ComfyUI nodes, models and server setup. The source includes a small reviewed provisioning allowlist; it is not a general installer for every missing custom node.
 

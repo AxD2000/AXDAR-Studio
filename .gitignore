@@ -16,3 +16,4 @@ __pycache__/
 *.key
 id_ed25519*
 known_hosts*
+/workflow-profiles/
