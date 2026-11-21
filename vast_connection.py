@@ -86,6 +86,12 @@ class Connection:
                 raise ValueError('Connect to Vast and wait for Ready first')
             return dict(self.endpoint)
 
+    def ssh_target(self):
+        with self.lock:
+            if self.stop.is_set() or self.state=='Disconnected' or not self.endpoint:
+                raise ValueError("Connect to Vast and verify the SSH session first.")
+            return dict(self.endpoint)
+
     def resolve(self, instance):
         try:
             rows = self.discover()
@@ -150,8 +156,10 @@ class Connection:
         return self.snapshot()
 
     def _remote_port(self, target):
-        code = ('import urllib.request,json\n'
-                'for port in (18188,8188):\n'
+        code = ('import urllib.request,json,os\n'
+                'candidate=os.environ.get("COMFY_PORT","")\n'
+                'ports=[int(candidate)] if candidate.isdecimal() and 1024<=int(candidate)<=65535 else []\n'
+                'for port in ports+[18188,8188]:\n'
                 ' try:\n'
                 '  d=json.load(urllib.request.urlopen("http://127.0.0.1:%s/system_stats"%port,timeout=2))\n'
                 '  if "system" in d: print(port);break\n'
@@ -159,6 +167,8 @@ class Connection:
         import shlex
         command = 'python3 -c ' + shlex.quote(code)
         result = self.remote(target, command, timeout=12).strip()
+        with self.lock:
+            self.endpoint=target
         self._indicate(ssh='green')
         if not result:
             self._state('ComfyUI Starting')
@@ -169,7 +179,7 @@ class Connection:
                 raise ValueError('Connection cancelled')
             result = self.remote(target, command, timeout=12).strip()
         port = int(result or 0)
-        if port not in (18188, 8188):
+        if not 1024 <= port <= 65535:
             self._indicate(comfy='red')
             raise ValueError('ComfyUI is unavailable on the existing configured ports')
         return port
@@ -267,7 +277,7 @@ class Connection:
         if not self.command_lock.acquire(blocking=False):
             raise ValueError('A terminal command is already running')
         try:
-            target = self.target()
+            target = self.ssh_target()
             # A bounded output pipe and timeout; command is never automatically replayed.
             import shlex
             token = hf_token() or ''

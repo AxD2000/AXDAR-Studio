@@ -25,6 +25,10 @@ When opening an existing project, review the migration and choose **Create backu
 
 Optional pre-existing assets can live in `assets/` or a directory set via `AXDAR_ASSETS`. Project state is created under `episodes/`, imported references under `library/`, and workflow revisions under `workflow-profiles/`. Git ignores these directories.
 
+## Autonomous production
+
+See [Production](PRODUCTION.md) for deployment, retry budgets, technical QC, Drive authorization and lifecycle rehearsal.
+
 ## Vast connection
 
 In Production, save the Vast API key, discover your instance, then connect. Credentials use the explicit Windows Credential Locker backend of `keyring`. SSH private keys remain local and host-key verification stays enabled. Register your SSH public key with Vast and independently verify each new server's fingerprint during initial setup.

@@ -112,7 +112,7 @@ class Uncertain(Exception):
     pass
 
 
-def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_failed=False):
+def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_failed=False, retry_key=None, admit=True, budget_check=None):
     root = ctx["DATA"]/eid/shot["id"]
     root.mkdir(parents=True, exist_ok=True)
     versions = sorted(root.glob("*/job.json"))
@@ -121,6 +121,8 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
         if j["revision"] != shot["revision"]:
             continue
         folder = path.parent
+        if j["status"] == "preparing":
+            break
         if j["status"] == "done":
             inspect_take(folder/"video.mp4", j)
             return "done"
@@ -128,24 +130,33 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
             if j.get("url") != url:
                 raise Uncertain("Prior submission belongs to another server; reconcile it before generating again.")
             break
-        if j["status"] == "error" and not retry_failed:
+        if j["status"] == "error" and (not retry_failed or retry_key and j.get("retry_key")==retry_key):
             return "error"
         versions = []
         break
     else:
         versions = []
     if not versions:
+        if not admit:
+            return "limit reached"
         folder = root/str(time.time_ns())
         folder.mkdir()
         path = folder/"job.json"
         j = dict(shot=shot["id"], revision=shot["revision"], url=url, status="preparing",
                  prompt=shot.get("frozenPrompt") or ctx["prompt"](shot,rules), settings=shot,rules=rules, workflow=wf["name"],
-                 output_node=wf["output"], marker=uuid.uuid4().hex)
+                 output_node=wf["output"], marker=uuid.uuid4().hex,
+                 retry_key=retry_key, take_id=str(uuid.uuid4()), started=time.time(), resolution=shot.get("resolution"))
         if wf.get("version"):
             from workflow_profiles import timing
             j.update(workflow_version=wf["version"], workflow_profile=wf, scene_id=shot.get("scene_id"),
                      playback_seconds=timing(wf,shot["seconds"])["playback_seconds"])
         atomic(path,j)
+    def finish(status):
+        j.update(status=status, completed=time.time(), renderSeconds=max(0,time.time()-j.get("started",time.time())))
+        atomic(path,j)
+        if ctx.get("record_take"):
+            ctx["record_take"](folder, j)
+        return status
     for attempt in range(retries+1):
         try:
             if not j.get("ticket"):
@@ -154,21 +165,31 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
                     if not ticket:
                         raise Uncertain("Submission acknowledgement missing. Inspect the original ComfyUI queue/history before retrying.")
                 else:
+                    if not admit:
+                        return "limit reached"
                     graph = ctx["prepare_shot"](url, folder, eid, shot, wf, j)
                     atomic(folder/"graph.json",graph)
+                    if budget_check and not budget_check():
+                        return "limit reached"
                     j["audioRequired"] = "audio" in graph.get(str(j["output_node"]),{}).get("inputs",{})
                     j["status"]="submitting"
                     atomic(path,j)
                     try:
                         ticket=ctx["json_api"](url,"/prompt",{"prompt":graph,"extra_data":{"axdar_attempt":j["marker"]}})["prompt_id"]
-                    except (json.JSONDecodeError,KeyError) as exc:
+                        if not isinstance(ticket,str) or not ticket:
+                            raise TypeError("Invalid prompt ID.")
+                    except (json.JSONDecodeError,KeyError,TypeError) as exc:
                         raise Uncertain("Invalid ComfyUI acknowledgement; reconcile before retrying.") from exc
                 j.update(ticket=ticket,status="queued")
                 atomic(path,j)
             missing_checks=0
-            while time.time()<deadline:
+            poll_deadline=max(deadline,time.time()+8) if not admit else deadline
+            while time.time()<poll_deadline:
                 notify()
-                h=ctx["json_api"](url,"/history/"+j["ticket"]).get(j["ticket"])
+                try:
+                    h=ctx["json_api"](url,"/history/"+j["ticket"]).get(j["ticket"])
+                except (ValueError,AttributeError) as exc:
+                    raise Uncertain("The recorded prompt ID could not be checked. Reconcile before retrying.") from exc
                 if h:
                     atomic(folder/"history.json",h)
                     if h.get("status",{}).get("status_str")=="error":
@@ -178,12 +199,21 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
                     if "audioRequired" not in j:
                         graph = read(folder/"graph.json", wf.get("graph",{}))
                         j["audioRequired"] = "audio" in graph.get(str(j["output_node"]),{}).get("inputs",{})
-                    duration=inspect_take(folder/"video.part",j)
-                    (folder/"video.part").replace(folder/"video.mp4")
-                    j.update(status="done", duration=duration, sha256=digest(folder/"video.mp4"))
+                    part=folder/"video.part"
+                    try:
+                        duration=inspect_take(part,j)
+                    except ValueError as exc:
+                        j["quality"]={"technical":"failed","visual":"review required","reason":str(exc)}
+                        raise
+                    if reviewer:=ctx.get("technical_qc"):
+                        j["quality"]=reviewer(part,j)
+                        if j["quality"]["technical"]=="failed":
+                            raise ValueError(j["quality"]["reason"])
+                        j["review"]="required"
+                    part.replace(folder/"video.mp4")
+                    j.update(duration=duration,sha256=digest(folder/"video.mp4"))
                     j.pop("error",None)
-                    atomic(path,j)
-                    return "done"
+                    return finish("done")
                 missing_checks+=1
                 if missing_checks%10==0:
                     queue=ctx["json_api"](url,"/queue")
@@ -203,6 +233,10 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
             j.update(status="uncertain",error=str(exc))
         except Exception as exc:
             j.update(status="error",error=str(exc)[:900])
+        if j["status"]=="error":
+            if (folder/"video.part").is_file():
+                (folder/"video.part").replace(folder/"video.failed.mp4")
+            return finish("error")
         atomic(path,j)
         return j["status"]
 
@@ -211,49 +245,104 @@ def drive(ctx, spec, jobs, wf, state_path, control_path, retry_id=None):
     state=read(state_path, {}) or {}
     if state.get("id")!=spec["id"] or "shots" not in state:
         state=dict(id=spec["id"], started=spec["started"], shots={}, total=len(jobs), seconds=[])
+    state.setdefault("shotRetries", {})
+    state.setdefault("inflightRetry", {})
+    state.setdefault("renderSeconds", 0)
+    state.setdefault("retrySeconds", 0)
+    state.setdefault("usableSeconds", 0)
+
     def publish():
         state["updated"]=time.time()
         elapsed=max(0,state["updated"]-state["started"])
         state["elapsed"]=elapsed
         state["estimate"]=elapsed*spec["rate"]/3600
         state["projectEstimate"]=spec.get("priorEstimate",0)+state["estimate"]
+        state["monthlyEstimate"]=spec.get("priorMonthEstimate",0)+state["estimate"]
+        state["overheadSeconds"]=max(0,elapsed-state["renderSeconds"])
         good=state["seconds"]
         state["meanSeconds"]=sum(good)/len(good) if good else None
         atomic(state_path,state)
-    try:
-        state.update(status="running",current=None,error="",url=spec["url"],dispatch=spec.get("dispatch"))
+
+    def may_submit():
         publish()
-        for eid,s,rules in jobs:
-            sid=s["id"]
-            if retry_id and retry_id!=sid: continue
-            if state["shots"].get(sid) in ("done","error") and retry_id!=sid: continue
-            action=read(control_path,{}).get("action")
-            if action in ("pause","stop"):
-                state["status"]="paused" if action=="pause" else "stopped"
-                break
-            publish()
-            expected=state["meanSeconds"] or spec["expectedSeconds"]
-            if time.time()>=spec["end"]-60 or (spec["budget"] and state["projectEstimate"]+expected*spec["rate"]/3600>spec["budget"]):
-                state["status"]="limit reached"
-                break
-            state.update(current=sid,shotStarted=time.time())
-            publish()
-            try:
-                result=render(ctx,spec["url"],spec["end"],eid,s,rules,wf,spec["retries"],publish,retry_id==sid)
-            except Exception as exc:
-                result="uncertain" if isinstance(exc,Uncertain) else "error"
-                state["error"]=f"{sid}: {exc}"
-            state["shots"][sid]=result
-            if result=="done":
-                state["seconds"].append(time.time()-state["shotStarted"])
-            publish()
-            if result=="waiting":
-                state["status"]="waiting"
-                break
-        else:
-            values=state["shots"].values()
-            state["status"]="needs attention" if any(x!="done" for x in values) else ("finished" if len(state["shots"])==len(jobs) else "paused")
-    finally:
+        projected=(state["meanSeconds"] or spec["expectedSeconds"])*spec["rate"]/3600
+        budgets=(("budget","estimate"),("episodeBudget","projectEstimate"),("monthBudget","monthlyEstimate"))
+        return time.time()<spec["end"]-60 and all(
+            not spec.get(limit) or state[cost]+projected<=spec[limit] for limit,cost in budgets)
+
+    def run_job(row, retry=False, manual=False):
+        eid,shot,rules=row
+        sid=shot["id"]
+        action=read(control_path,{}).get("action")
+        if action in ("pause","stop"):
+            state["status"]="paused" if action=="pause" else "stopped"
+            return False
+        admit=may_submit()
+        previous=state["shots"].get(sid)
+        if not admit and previous not in ("waiting","uncertain") and state.get("current")!=sid:
+            state["status"]="limit reached"
+            return False
+        key = state["inflightRetry"].get(sid)
+        if retry and admit and not key:
+            key=spec.get("dispatch",spec["id"])+":"+uuid.uuid4().hex
+            state["inflightRetry"][sid]=key
+            if not manual:
+                state["shotRetries"][sid]=state["shotRetries"].get(sid,0)+1
+        started=time.time()
+        state.update(current=sid,shotStarted=started)
+        publish()
+        try:
+            result=render(ctx,spec["url"],spec["end"],eid,shot,rules,wf,spec["retries"],
+                          publish,retry_failed=bool(key),retry_key=key,admit=admit,budget_check=may_submit)
+        except Exception as exc:
+            result="uncertain" if isinstance(exc,Uncertain) else "error"
+            state["error"]=f"{sid}: {exc}"
+        elapsed=time.time()-started
+        state["renderSeconds"]+=elapsed
+        if key:
+            state["retrySeconds"]+=elapsed
+        # Replaying an interrupted retry reuses its attempt key until the durable result is reconciled.
+        if result=="limit reached":
+            state["status"]=result
+            return False
+        state["shots"][sid]=result
+        if result=="done":
+            state["seconds"].append(elapsed)
+            state["usableSeconds"]+=shot["seconds"]
+        if result in ("done","error"):
+            state["inflightRetry"].pop(sid,None)
         state["current"]=None
         publish()
+        if result in ("waiting","uncertain"):
+            state["status"]="waiting" if result=="waiting" else "needs attention"
+            return False
+        return True
 
+    try:
+        state.update(status="running",error="",url=spec["url"],dispatch=spec.get("dispatch"))
+        if retry_id:
+            pending=next((row for row in jobs if row[1]["id"]==retry_id),None)
+            if pending and not run_job(pending,retry=True,manual=True):
+                return
+        else:
+            for row in jobs:
+                sid=row[1]["id"]
+                if state["shots"].get(sid) in ("done","error") and sid not in state["inflightRetry"]:
+                    continue
+                if not run_job(row):
+                    return
+            # A full pass always gets the first attempt before any definite failure is retried.
+            for pass_number in range(spec.get("shotRetries",0)):
+                for row in jobs:
+                    sid=row[1]["id"]
+                    if state["shots"].get(sid)!="error" or state["shotRetries"].get(sid,0)>pass_number:
+                        continue
+                    if not run_job(row,retry=True):
+                        return
+        values=state["shots"].values()
+        state["status"]="needs attention" if any(x!="done" for x in values) else ("finished" if len(state["shots"])==len(jobs) else "paused")
+    finally:
+        state["current"]=None
+        if spec.get("package2"):
+            state["maintenance"]="pending"
+        publish()

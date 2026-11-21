@@ -1,7 +1,7 @@
 from pathlib import Path
 import copy, json, mimetypes, os, re, secrets, shutil, threading, time, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlencode, urlsplit, unquote
+from urllib.parse import urlencode, urlsplit, unquote, parse_qs
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -130,6 +130,8 @@ def generation_images(shot):
 
 import production
 import vast_deploy
+import drive_archive
+import take_quality
 
 def prepare_shot(url, folder, eid, s, wf, record):
     images, voices = generation_images(s), generation_voices(s)
@@ -150,11 +152,12 @@ def download_output(url,folder,h,record):
 
 def run(url, deadline, jobs, wf):
     global running
+    ctx=dict(globals(),technical_qc=take_quality.check)
     try:
         for eid, shot, rules in jobs:
             if time.time() >= deadline-60: break
             try:
-                result=production.render(globals(),url,deadline,eid,shot,rules,wf,2,lambda:None,True)
+                result=production.render(ctx,url,deadline,eid,shot,rules,wf,2,lambda:None,True)
                 if result=="waiting": break
             except Exception as exc:
                 session["error"]=f"{shot['id']}: {exc}"
@@ -162,6 +165,7 @@ def run(url, deadline, jobs, wf):
         with LOCK: running=False
 
 controller=vast_deploy.Controller(globals())
+drive_pending=None
 
 class Handler(BaseHTTPRequestHandler):
     def send(self, data, mime="application/json", status=200):
@@ -181,6 +185,27 @@ class Handler(BaseHTTPRequestHandler):
             return self.send((BASE/route[1:]).read_bytes(), mime + "; charset=utf-8")
         if route=="/":
             return self.send((BASE/"studio.html").read_text("utf-8").replace("__TOKEN__",TOKEN).encode(),"text/html; charset=utf-8")
+        if route=="/drive/callback":
+            global drive_pending
+            query=parse_qs(urlsplit(self.path).query)
+            state=query.get("state",[""])[0]
+            with LOCK:
+                pending=drive_pending
+                if pending and secrets.compare_digest(state,pending["state"]):
+                    drive_pending=None
+                else:
+                    pending=None
+            try:
+                drive_archive.connect(pending,state,query.get("code",[""])[0])
+                message="Google Drive connected. Return to AXDAR Production to enable archive backup."
+            except (ValueError,OSError,RuntimeError):
+                message="Google authorization did not complete. Return to AXDAR and retry the connection."
+            return self.send(message.encode(),"text/plain; charset=utf-8")
+        if route=="/drive/status":
+            try:
+                return self.send({"connected":bool(drive_archive.account())})
+            except Exception:
+                return self.send({"connected":False})
         if route=="/api":
             with LOCK:
                 db = project()
@@ -191,10 +216,26 @@ class Handler(BaseHTTPRequestHandler):
             result=[]
             for p in sorted(DATA.glob("*/*/*/job.json")):
                 j=json.loads(p.read_text("utf-8"))
-                result.append(dict(episode=p.parents[2].name,id=j["shot"],version=p.parent.name,status=j["status"],error=j.get("error",""),revision=j["revision"],video="/video/"+p.parent.relative_to(DATA).as_posix() if (p.parent/"video.mp4").exists() else ""))
+                relative=p.parent.relative_to(DATA).as_posix()
+                review=j.get("review")
+                video=(p.parent/"video.mp4").exists() and review in (None,"accepted")
+                preview=(p.parent/"preview.mp4").exists() or (p.parent/"video.mp4").exists()
+                result.append(dict(episode=p.parents[2].name,id=j["shot"],version=p.parent.name,status=j["status"],
+                                   error=j.get("error",""),revision=j["revision"],takeId=j.get("take_id"),review=review,
+                                   quality=j.get("quality"),renderSeconds=j.get("renderSeconds"),
+                                   remote=bool(j.get("remote_run")),video="/video/"+relative if video else "",
+                                   preview="/take-preview/"+relative if preview and review else ""))
             return self.send(dict(production=controller.current(),running=running,session=session,results=result,workflow=active_workflow["name"] if active_workflow else "Workflow blocked",workflowError=workflow_error,connection=controller.connection.snapshot()))
         p=files.get(route[7:]) if route.startswith("/asset/") else None
-        if re.fullmatch(r"/video/[a-f0-9-]+/[a-f0-9-]+/\d+",route): p=DATA/route[7:]/"video.mp4"
+        if re.fullmatch(r"/(video|take-preview)/[a-f0-9-]+/[a-f0-9-]+/\d+",route):
+            kind,eid,sid,version=route[1:].split("/")
+            folder=DATA/eid/sid/version
+            if kind=="take-preview":
+                p=folder/"preview.mp4"
+                if not p.is_file():
+                    p=folder/"video.mp4"
+            elif production.read(folder/"job.json",{}).get("review") in (None,"accepted"):
+                p=folder/"video.mp4"
         if p and p.is_file():
             self.send_response(200)
             self.send_header("Content-Type",mimetypes.guess_type(p.name)[0] or "application/octet-stream")
@@ -203,7 +244,7 @@ class Handler(BaseHTTPRequestHandler):
             with p.open("rb") as src: shutil.copyfileobj(src,self.wfile)
         else: self.send({},status=404)
     def do_POST(self):
-        global running,session,active_workflow,workflow_error
+        global running,session,active_workflow,workflow_error,drive_pending
         if self.headers.get("X-Studio")!=TOKEN: return self.send({},status=403)
         try:
             size=int(self.headers["Content-Length"])
@@ -240,6 +281,12 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/migrate" or self.path.startswith(("/project/","/story/","/shots/","/characters/")):
                 with LOCK:
                     return self.send(actions.act(self.path, obj, blob if binary else None, filename))
+            if self.path=="/drive/connect":
+                if self.headers.get("Host") != f"127.0.0.1:{PORT}":
+                    return self.send({},status=403)
+                with LOCK:
+                    drive_pending,url=drive_archive.authorization(obj["client"],f"http://127.0.0.1:{PORT}/drive/callback")
+                return self.send({"url":url})
             if self.path=="/connection":
                 if self.headers.get("Host") != f"127.0.0.1:{PORT}": return self.send({},status=403)
                 action=obj.get("action")
@@ -316,6 +363,7 @@ if __name__=="__main__":
         webbrowser.open(address)
     else:
         webbrowser.open(address)
+        controller.reconnect()
         if controller.connection.settings.get("auto"):
             controller.connection.connect(auto=True)
         server.serve_forever()

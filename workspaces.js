@@ -31,7 +31,7 @@ function costOutput(){
 function renderEconomics(){
     if(estimateEpisode!==ep.id){estimate.shots=ep.shots.length;estimateEpisode=ep.id}
     const fields=[['shots','Target shots',0,10000,1],['failure','Failure probability (%)',0,95,1],['rate','GPU hourly rate ($)',0,100,.01],['minutes','Minutes per attempt',.1,1440,.1]];
-    return '<div class="layout"><section class="panel"><h2>Cost parameters</h2>'+fields.map(([key,label,min,max,step])=>'<label>'+label+'<input data-cost="'+key+'" type="number" min="'+min+'" max="'+max+'" step="'+step+'" value="'+estimate[key]+'"></label>').join('')+'</section><section class="panel"><h2>GPU-only estimate</h2><div id="costOutput">'+costOutput()+'</div><small>Assumes independent retries at a fixed rate. Storage, idle time and bandwidth are excluded.</small></section></div>';
+    return productionMetrics()+'<div class="layout"><section class="panel"><h2>Cost parameters</h2>'+fields.map(([key,label,min,max,step])=>'<label>'+label+'<input data-cost="'+key+'" type="number" min="'+min+'" max="'+max+'" step="'+step+'" value="'+estimate[key]+'"></label>').join('')+'</section><section class="panel"><h2>GPU-only estimate</h2><div id="costOutput">'+costOutput()+'</div><small>Assumes independent retries at a fixed rate. Storage, idle time and bandwidth are excluded.</small></section></div>';
 }
 function renderSettings(){
     return '<section class="panel"><h2>Interface</h2><label>Color theme<select id="themeChoice">'+option('dark','Dark',document.documentElement.dataset.theme)+option('cream','Cream',document.documentElement.dataset.theme)+'</select></label></section>'+workflowPanel();

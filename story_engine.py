@@ -75,9 +75,14 @@ def sync_takes(db, data_dir):
     for eid, sid, version in _records(data_dir):
         shot = shots.get((eid, sid))
         entries = shot.setdefault("takes", []) if shot is not None else orphaned
-        take_id = _take_id(db["id"], eid, sid, version)
-        if any(entry["id"] == take_id for entry in entries):
+        if any(entry.get("version")==version and entry.get("shot_id")==sid and entry.get("episode_id")==eid for entry in entries):
             continue
+        file=Path(data_dir)/eid/sid/version/"job.json"
+        try:
+            recorded=json.loads(file.read_bytes()).get("take_id")
+        except (OSError,ValueError,AttributeError):
+            recorded=None
+        take_id=recorded or _take_id(db["id"], eid, sid, version)
         entries.append({"id": take_id, "episode_id": eid, "shot_id": sid, "version": version,
                         "job": "/".join((eid, sid, version, "job.json"))})
         changed = True

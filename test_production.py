@@ -32,7 +32,7 @@ class QueueTests(unittest.TestCase):
     def setUp(self):
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
         self.dir=Path(tmp.name); self.status=self.dir/"status.json"; self.control=self.dir/"control.json"
-        self.eid=str(uuid.uuid4());self.requests=[];self.fail=set();self.lose=False;self.network=0
+        self.eid=str(uuid.uuid4());self.requests=[];self.failed_shots=set();self.lose=False;self.network=0
         self.workflow={"name":"fixture","output":"141"}
         self.ctx={"DATA":self.dir,"prompt":lambda s,r:s["prompt"],"prepare_shot":lambda url,folder,eid,s,w,j:{"id":s["id"]},"json_api":self.api,"download_output":lambda u,f,h,j:(f/"video.part").write_bytes(movie(j["settings"]["seconds"]))}
         self.spec=dict(id="test",started=time.time(),url="http://fixture",budget=0,expectedSeconds=30,rate=1,end=time.time()+600,retries=2)
@@ -54,7 +54,7 @@ class QueueTests(unittest.TestCase):
         if self.network:
             self.network-=1;raise ConnectionError("reset")
         ticket=path.split("/")[-1];shot=self.requests[int(ticket)-1]["prompt"]["id"]
-        return {ticket:{"status":{"status_str":"error" if shot in self.fail else "success"}}}
+        return {ticket:{"status":{"status_str":"error" if shot in self.failed_shots else "success"}}}
 
     def drive(self,jobs,retry=None):
         p.drive(self.ctx,self.spec,jobs,self.workflow,self.status,self.control,retry)
@@ -67,10 +67,45 @@ class QueueTests(unittest.TestCase):
         self.status.unlink();self.drive(jobs);self.assertEqual(len(self.requests),200)
 
     def test_failure_continues_and_manual_retry(self):
-        jobs=self.jobs(3);bad=jobs[1][1]["id"];self.fail.add(bad)
+        jobs=self.jobs(3);bad=jobs[1][1]["id"];self.failed_shots.add(bad)
         state=self.drive(jobs);self.assertEqual(list(state["shots"].values()),["done","error","done"])
-        self.fail.clear();self.assertEqual(self.drive(jobs,bad)["status"],"finished")
+        self.failed_shots.clear();self.assertEqual(self.drive(jobs,bad)["status"],"finished")
         self.assertEqual(len(self.requests),4)
+
+    def test_definite_failures_retry_only_after_the_initial_pass(self):
+        jobs=self.jobs(3)
+        ids=[s["id"] for _,s,_ in jobs]
+        self.failed_shots.add(ids[0])
+        self.spec["shotRetries"]=1
+        def api(url,path,obj=None):
+            if path=="/prompt" and len(self.requests)==3:
+                self.failed_shots.clear()
+            return self.api(url,path,obj)
+        self.ctx["json_api"]=api
+        state=self.drive(jobs)
+        self.assertEqual(state["status"],"finished")
+        self.assertEqual([x["prompt"]["id"] for x in self.requests],[*ids,ids[0]])
+        takes=sorted((self.dir/self.eid/ids[0]).glob("*/job.json"))
+        self.assertEqual([p.read(t)["status"] for t in takes],["error","done"])
+        self.assertEqual(len({p.read(t)["take_id"] for t in takes}),2)
+        self.assertEqual(self.drive(jobs)["status"],"finished")
+        self.assertEqual(len(self.requests),4)
+
+    def test_budget_is_checked_again_after_preparing_and_before_submission(self):
+        jobs=self.jobs(1)
+        self.spec["monthBudget"]=.15
+        self.spec["priorMonthEstimate"]=.1
+        started=self.spec["started"]
+        elapsed=0
+        def prepare(*args):
+            nonlocal elapsed
+            elapsed=210
+            return {"id":args[3]["id"]}
+        self.ctx["prepare_shot"]=prepare
+        with patch("production.time.time",side_effect=lambda:started+elapsed):
+            self.assertEqual(self.drive(jobs)["status"],"limit reached")
+        self.assertEqual(self.requests,[])
+        self.assertEqual(len(list(self.dir.glob("*/*/*/job.json"))),1)
 
     def test_ambiguous_submit_and_transient_poll(self):
         self.lose=True;self.network=1
