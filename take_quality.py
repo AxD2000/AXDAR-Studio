@@ -45,11 +45,11 @@ def check(path, job, timeout=180):
     except subprocess.TimeoutExpired:
         return {"technical":"unavailable","visual":"review required","reason":"The decode timed out. Recheck the preserved take."}
     except subprocess.CalledProcessError as exc:
-        tool = os.path.basename(exc.cmd[0])
+        diagnostic_tool = os.path.basename(exc.cmd[0])
         reason = (exc.stderr or b"")[-500:].decode(errors="replace").replace(str(path),path.name)
     except (ValueError,KeyError,TypeError,OSError) as exc:
-        tool, reason = "Video probe", str(exc)
-    return {"technical":"failed","visual":"review required","reason":f"{tool}: {reason.strip()}"}
+        diagnostic_tool, reason = "Video probe", str(exc)
+    return {"technical":"failed","visual":"review required","reason":f"{diagnostic_tool}: {reason.strip()}"}
 
 
 
