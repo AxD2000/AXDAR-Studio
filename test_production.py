@@ -66,6 +66,34 @@ class QueueTests(unittest.TestCase):
         self.assertEqual([x["prompt"]["id"] for x in self.requests],[s["id"] for _,s,_ in jobs])
         self.status.unlink();self.drive(jobs);self.assertEqual(len(self.requests),200)
 
+    def test_direct_output_is_available_after_technical_checks(self):
+        eid,shot,rules=self.jobs(1)[0]
+        ctx=dict(self.ctx,direct=True,instance=12,
+                 technical_qc=lambda path,job:{"technical":"passed","visual":"review required"})
+        args=(eid,shot,rules,self.workflow,0,lambda:None)
+        self.assertEqual(p.render(ctx,self.spec["url"],self.spec["end"],*args),"done")
+        record=next((self.dir/eid/shot["id"]).glob("*/job.json"))
+        take=p.read(record)
+        self.assertEqual(take["instance"],12)
+        self.assertNotIn("review",take)
+        self.assertEqual(take["quality"],{"technical":"passed"})
+        self.assertTrue((record.parent/"video.mp4").is_file())
+        self.assertEqual(p.render(ctx,"http://new-tunnel",self.spec["end"],*args),"done")
+        self.assertEqual(len(self.requests),1)
+
+    def test_atomic_retries_when_windows_reader_holds_destination(self):
+        error=PermissionError("sharing violation")
+        error.winerror=32
+        replace=p.os.replace
+        def retryable_replace(src,dest):
+            if mocked.call_count==1:
+                raise error
+            replace(src,dest)
+        with patch("production.os.replace",side_effect=retryable_replace) as mocked:
+            p.atomic(self.status,{"phase":"done"})
+        self.assertEqual(mocked.call_count,2)
+        self.assertEqual(p.read(self.status),{"phase":"done"})
+
     def test_failure_continues_and_manual_retry(self):
         jobs=self.jobs(3);bad=jobs[1][1]["id"];self.failed_shots.add(bad)
         state=self.drive(jobs);self.assertEqual(list(state["shots"].values()),["done","error","done"])

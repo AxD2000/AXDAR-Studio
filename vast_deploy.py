@@ -22,7 +22,7 @@ from production_services import webhook_url
 import take_quality
 
 STORE="/workspace/axdar-studio"
-SOURCES=("worker.py","production.py","vast_worker.py","vast_deploy.py","studio.pyw","studio_actions.py","story_engine.py","workflow_profiles.py","provision.py","model-lock.json","vast_connection.py","drive_archive.py","production_services.py","take_quality.py","editor_media.py","episode_editor.py")
+SOURCES=("worker.py","production.py","vast_worker.py","vast_deploy.py","studio.pyw","studio_actions.py","story_engine.py","workflow_profiles.py","provision.py","model-lock.json","vast_connection.py","vast_ssh_setup.py","drive_archive.py","production_services.py","take_quality.py","editor_media.py","episode_editor.py")
 TERMINAL={"finished","needs attention","stopped","paused","waiting","limit reached"}
 
 
@@ -108,12 +108,13 @@ def request_instance_stop(target):
 
 
 def ssh(target,command,*,data=None,stream=None,out=None,timeout=70):
+    from vast_connection import identity_options
     host=str(target["host"])
     port=int(target["port"])
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}",host) or not 1<=port<=65535:
         raise ValueError("Invalid SSH host or port")
     args=["ssh","-T","-o","BatchMode=yes","-o","StrictHostKeyChecking=yes","-o","ConnectTimeout=8",
-          "-o","ServerAliveInterval=15","-o","ServerAliveCountMax=2","-p",str(port),"root@"+host,command]
+          "-o","ServerAliveInterval=15","-o","ServerAliveCountMax=2",*identity_options(target),"-p",str(port),"root@"+host,command]
     p=subprocess.run(args,input=data,stdin=stream,stdout=out or subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
     if p.returncode:
         raise OSError(p.stderr.decode(errors="replace").strip()[-550:] or "Remote command failed")
@@ -140,11 +141,7 @@ def paths(spec):
     return STORE+"/releases/"+release,STORE+"/runs/"+sid
 
 
-def deploy(base,target,spec,assets):
-    release,run=paths(spec)
-    ssh(target,f"umask 077; mkdir -p {release} {run} {STORE}/blobs")
-    planned={release+"/"+name:base/name for name in SOURCES}
-    planned.update({STORE+"/blobs/"+sha:assets[name] for name,sha in spec["assets"].items()})
+def deploy_files(target, planned):
     # One remote check for the whole manifest; transmit only missing or damaged files.
     manifest="".join(f"{prod.digest(src)}  {dst}\n" for dst,src in planned.items())
     check=ssh(target,"while read -r hash path; do echo \"$hash  $path\" | sha256sum -c --status 2>/dev/null || echo \"$path\"; done",data=manifest.encode())
@@ -153,6 +150,37 @@ def deploy(base,target,spec,assets):
         if dst.startswith(STORE+"/blobs/") and prod.digest(planned[dst])!=dst.rsplit("/",1)[1]:
             raise ValueError("An asset changed during deployment. Start a new snapshot.")
         put(target,dst,planned[dst])
+
+
+def prepare_direct(ctx, target, jobs, workflow, timeout):
+    from vast_worker import runtime_requirements
+    base = ctx["BASE"]
+    requirements = runtime_requirements(ctx, {"jobs":jobs}, workflow)
+    revision = hashlib.sha256("".join(prod.digest(base/n) for n in SOURCES).encode()).hexdigest()
+    release = STORE + "/releases/" + revision
+    ssh(target, f"umask 077; mkdir -p {release}")
+    deploy_files(target, {release+"/"+name:base/name for name in SOURCES})
+    code = ("import json, sys\nfrom vast_worker import ready\n"
+            "from urllib.request import urlopen\n"
+            "def api(url, path):\n"
+            " with urlopen(url + path, timeout=15) as response: return json.load(response)\n"
+            "try: ready({'json_api':api}, json.load(sys.stdin))\n"
+            "except Exception as exc: sys.exit(str(exc))")
+    try:
+        ssh(target, f"cd {release} && python3 -c {shlex.quote(code)}",
+            data=json.dumps(requirements).encode(), timeout=max(15, timeout()))
+    except subprocess.TimeoutExpired:
+        raise ValueError("ComfyUI dependency setup ran out of session time.") from None
+    except OSError as exc:
+        raise ValueError(str(exc).splitlines()[-1]) from None
+
+
+def deploy(base,target,spec,assets):
+    release,run=paths(spec)
+    ssh(target,f"umask 077; mkdir -p {release} {run} {STORE}/blobs")
+    planned={release+"/"+name:base/name for name in SOURCES}
+    planned.update({STORE+"/blobs/"+sha:assets[name] for name,sha in spec["assets"].items()})
+    deploy_files(target, planned)
     put_json(target,run+"/spec.json",spec)
 
 

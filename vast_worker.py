@@ -68,9 +68,13 @@ def ready(ctx, wf, repair=True):
                 choices=field[0] if isinstance(field[0],list) else (field[1].get("options") if len(field)>1 else None)
                 if isinstance(choices,list) and value.replace("\\","/") not in [str(c).replace("\\","/") for c in choices]:
                     models.add(value)
-    if missing or models:
+    sage_required = any(node["class_type"] == "MiniMaxH3MemoryEfficientSageAttentionPatch"
+                        for node in wf["graph"].values())
+    sage_missing = sage_required and not provision.sage_ready()
+    if missing or models or sage_missing:
         if not repair:
-            raise ValueError("Still unavailable after preparation: "+", ".join(sorted(set(missing)|models)))
+            raise ValueError("Still unavailable after preparation: "+", ".join(
+                sorted(set(missing)|models|({"SageAttention"} if sage_missing else set()))))
         queue=ctx["json_api"](url,"/queue")
         if queue["queue_running"] or queue["queue_pending"]:
             raise ValueError("ComfyUI has another job. Resume setup after its queue is empty.")
@@ -87,6 +91,11 @@ def ready(ctx, wf, repair=True):
             provision.install_models(root,models)
         except (OSError,ValueError,subprocess.SubprocessError) as exc:
             raise ValueError("Model installation failed: " + ", ".join(sorted(models)) + ". Repair it in Jupyter Terminal, then Resume.") from exc
+        if sage_missing:
+            try:
+                provision.install_sage(root)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                raise ValueError("SageAttention setup failed on this CUDA/PyTorch environment.") from exc
         subprocess.run(["supervisorctl","restart","comfyui"],check=True,timeout=90)
         for attempt in range(30):
             time.sleep(3)

@@ -32,7 +32,7 @@ function workflowMappingForm(p){
     };
     return '<p class="muted">Version '+esc(p.version)+'</p>'+
         (p.issues?.length?'<ul class="danger">'+p.issues.map(i=>'<li>'+esc(i)+'</li>').join('')+'</ul>':'<p>Mapping is ready.</p>')+
-        '<label>ComfyUI base URL for node metadata<input id="inspectionUrl" type="url" placeholder="http://127.0.0.1:8188" value="'+esc(sessionUrl||state.connection?.url||'')+'"></label><div class="row"><button data-wf="inspect">Read /object_info</button><button data-wf="metadata">Load object_info JSON file</button></div>'+
+        '<label>ComfyUI base URL for node metadata<input id="inspectionUrl" type="url" placeholder="http://127.0.0.1:8188" value="'+esc(state.connection?.url||'')+'"></label><div class="row"><button data-wf="inspect">Read /object_info</button><button data-wf="metadata">Load object_info JSON file</button></div>'+
         Object.entries(roleLabels).map(([key,label])=>select(key,label,fields.filter(f=>f.roles?.includes(key)).map(f=>[f.id,mappingField(f)]))).join('')+
         select('output','Video output node',(p.outputs||[]).map(o=>[o.id,o.label+' ('+o.id+')']))+
         multi('images','Ordered image inputs')+multi('audio','Ordered audio inputs')+

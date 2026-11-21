@@ -29,7 +29,15 @@ def hash_stream(stream):
 def atomic(path, obj):
     tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     tmp.write_text(json.dumps(obj, ensure_ascii=False), "utf-8")
-    os.replace(tmp, path)
+    for attempt in range(6):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:
+            # Windows may deny the rename while a status poll holds the old JSON open.
+            if getattr(exc, "winerror", None) not in (5, 32) or attempt == 5:
+                raise
+            time.sleep(0.02 * 2**attempt)
 
 
 def inspect_video(path, seconds, require_audio=False):
@@ -124,10 +132,12 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
         if j["status"] == "preparing":
             break
         if j["status"] == "done":
-            inspect_take(folder/"video.mp4", j)
+            if not (ctx.get("direct") and j.get("remote_run") and not (folder/"video.mp4").is_file()):
+                inspect_take(folder/"video.mp4", j)
             return "done"
         if j["status"] in ("queued","waiting","submitting","uncertain") or j.get("ticket") and j["status"]!="error":
-            if j.get("url") != url:
+            same_target = j["instance"] == ctx.get("instance") if j.get("instance") else j.get("url") == url
+            if not same_target:
                 raise Uncertain("Prior submission belongs to another server; reconcile it before generating again.")
             break
         if j["status"] == "error" and (not retry_failed or retry_key and j.get("retry_key")==retry_key):
@@ -172,7 +182,9 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
                     if budget_check and not budget_check():
                         return "limit reached"
                     j["audioRequired"] = "audio" in graph.get(str(j["output_node"]),{}).get("inputs",{})
-                    j["status"]="submitting"
+                    j.update(status="submitting",url=url)
+                    if ctx.get("instance"):
+                        j["instance"] = ctx["instance"]
                     atomic(path,j)
                     try:
                         ticket=ctx["json_api"](url,"/prompt",{"prompt":graph,"extra_data":{"axdar_attempt":j["marker"]}})["prompt_id"]
@@ -209,7 +221,10 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
                         j["quality"]=reviewer(part,j)
                         if j["quality"]["technical"]=="failed":
                             raise ValueError(j["quality"]["reason"])
-                        j["review"]="required"
+                        if ctx.get("direct"):
+                            j["quality"].pop("visual",None)
+                        else:
+                            j["review"]="required"
                     part.replace(folder/"video.mp4")
                     j.update(duration=duration,sha256=digest(folder/"video.mp4"))
                     j.pop("error",None)

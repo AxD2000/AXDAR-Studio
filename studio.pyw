@@ -151,19 +151,61 @@ def download_output(url,folder,h,record):
     query=urlencode({k:video[k] for k in ("filename","subfolder","type") if k in video})
     with remote(url,"/view?"+query) as src, (folder/"video.part").open("wb") as out: shutil.copyfileobj(src,out)
 
-def run(url, deadline, jobs, wf):
+def production_busy():
+    return controller.current().get("status") in (
+        "waiting for connection","reconnecting","deploying","starting worker",
+        "checking ComfyUI and requirements","running")
+
+
+def discover_vast():
+    while True:
+        if controller.connection.snapshot()["state"] not in ("Ready","Connecting","ComfyUI Starting","Reconnecting"):
+            with LOCK:
+                if not running:
+                    controller.connection.refresh(keep_active=production_busy() and controller.connection.thread is not None)
+        time.sleep(30)
+
+
+def run(url, deadline, jobs, wf, target=None):
     global running
-    ctx=dict(globals(),technical_qc=take_quality.check)
+    ctx=dict(globals(),technical_qc=take_quality.check,direct=True,instance=(target or {}).get("id"))
     try:
+        if target and target.get("id"):
+            vast_deploy.prepare_direct(ctx,target,jobs,wf,lambda:deadline-time.time())
+            while time.time()<deadline-60:
+                view=controller.connection.snapshot()
+                if view.get("instance")==target["id"] and view.get("url"):
+                    url=view["url"]
+                    break
+                if view["state"]=="Failed":
+                    controller.connection.connect(target["id"],auto=True)
+                time.sleep(2)
+            else:
+                raise ValueError("ComfyUI did not reconnect in time after setup.")
+        session["phase"]="Rendering"
         for eid, shot, rules in jobs:
-            if time.time() >= deadline-60: break
+            if time.time() >= deadline-60:
+                session["error"]="Session time limit reached."
+                break
             try:
+                if target:
+                    url=controller.connection.snapshot().get("url") or url
                 result=production.render(ctx,url,deadline,eid,shot,rules,wf,2,lambda:None,True)
-                if result=="waiting": break
+                if result in ("waiting","uncertain"):
+                    session["error"]="The original ComfyUI job still needs to be reconciled."
+                    break
+                if result=="error":
+                    session["failed"]+=1
+                if result=="done":
+                    session["completed"]+=1
             except Exception as exc:
                 session["error"]=f"{shot['id']}: {exc}"
+    except Exception as exc:
+        session["error"]=str(exc)
     finally:
-        with LOCK: running=False
+        with LOCK:
+            session["phase"]="Finished" if not session.get("error") and not session["failed"] else "Needs attention"
+            running=False
 
 controller=vast_deploy.Controller(globals())
 drive_pending=None
@@ -356,12 +398,15 @@ class Handler(BaseHTTPRequestHandler):
                     from vast_connection import api_key
                     try: api_key(obj.get("key"))
                     except Exception: raise ValueError("Windows credential storage failed")
-                    return self.send({"ok":True})
+                    action="refresh"
                 if action=="hf":
                     from vast_connection import hf_token
                     hf_token(obj.get("token"))
                     return self.send({"ok":True})
                 if action=="instances": return self.send(connection.discover_instances())
+                if action=="refresh":
+                    with LOCK:
+                        return self.send(connection.refresh(keep_active=running or production_busy()))
                 if action=="connect": return self.send(connection.connect(obj.get("instance"),obj.get("auto",False)))
                 if action=="connect-ssh": return self.send(connection.connect_ssh(obj.get("ssh"),obj.get("auto",False)))
                 if action=="disconnect": return self.send(connection.disconnect())
@@ -395,11 +440,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(dict(project=db, assets=active_assets(db)))
                 elif self.path=="/start":
                     if not active_workflow: raise ValueError(workflow_error)
-                    if controller.current().get("status") not in (None,"finished","stopped","needs attention","deployment failed"): raise ValueError("Finish remote production first")
+                    if production_busy(): raise ValueError("Finish the active production session first.")
                     if running: raise ValueError("الجلسة تعمل حالياً")
-                    url=(controller.connection.snapshot().get("url") or obj.get("url", "")).strip().rstrip("/")
+                    connected=controller.connection.snapshot().get("url")
+                    target=controller.connection.target() if connected else None
+                    url=(connected or obj.get("url", "")).strip().rstrip("/")
                     if urlsplit(url).scheme not in ("http","https") or not urlsplit(url).hostname: raise ValueError("أدخل رابط ComfyUI")
-                    minutes=int(obj["minutes"])
+                    minutes=int(obj.get("minutes",60))
                     if not 2<=minutes<=1440: raise ValueError("المدة من دقيقتين إلى ١٤٤٠ دقيقة")
                     db=project()
                     ep=next(e for e in db["episodes"] if e["id"]==obj["episode"])
@@ -407,9 +454,10 @@ class Handler(BaseHTTPRequestHandler):
                     if not jobs:
                         raise ValueError(next((reason for reasons in skipped.values() for reason in reasons), "Approve at least one ready shot."))
                     end=time.time()+60*minutes
-                    session=dict(end=end,episode=ep["id"],submitted=len(jobs),blocked=skipped)
+                    session=dict(end=end,episode=ep["id"],submitted=len(jobs),blocked=skipped,
+                                 phase="Preparing ComfyUI",completed=0,failed=0)
                     running=True
-                    threading.Thread(target=run,args=(url,end,jobs,active_workflow),daemon=True).start()
+                    threading.Thread(target=run,args=(url,end,jobs,active_workflow,target),daemon=True).start()
                     return self.send({"ok":True,"submitted":len(jobs),"blocked":skipped})
                 else: return self.send({},status=404)
             self.send({"ok":True})
@@ -426,6 +474,5 @@ if __name__=="__main__":
     else:
         webbrowser.open(address)
         controller.reconnect()
-        if controller.connection.settings.get("auto"):
-            controller.connection.connect(auto=True)
+        threading.Thread(target=discover_vast,daemon=True).start()
         server.serve_forever()

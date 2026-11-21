@@ -11,6 +11,14 @@ from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 SERVICE = 'AXDAR Studio Vast'
+VAST_IDENTITY = Path.home() / '.ssh' / 'id_axdar_vast'
+
+
+def identity_options(target):
+    if not target.get('id') or not VAST_IDENTITY.is_file():
+        return []
+    files = [VAST_IDENTITY] + [VAST_IDENTITY.with_name(name) for name in ('id_ed25519','id_rsa','id_ecdsa')]
+    return [arg for file in files if file.is_file() for arg in ('-i', str(file))]
 
 def connection_error(exc):
     """Classify diagnostics without displaying raw SSH/API output or credentials."""
@@ -120,6 +128,7 @@ class Connection:
         with self.lock:
             return dict(self.settings, state=self.state, error=self.error,
                         indicators=dict(self.indicators),
+                        gpu=(self.endpoint or {}).get('gpu'),
                         url=self.url if self.state == 'Ready' else None)
 
     def _indicate(self, **values):
@@ -151,8 +160,9 @@ class Connection:
         self._indicate(api='green')
         return rows
 
-    def resolve(self, instance):
-        rows=self.discover_instances()
+    def resolve(self, instance, rows=None):
+        if rows is None:
+            rows = self.discover_instances()
         row = next((r for r in rows if int(r['id']) == int(instance)), None)
         if not row:
             raise ValueError('Selected instance was not found')
@@ -162,6 +172,33 @@ class Connection:
         if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}', host) or not 1 <= port <= 65535:
             raise ValueError('Vast has not provided a valid SSH endpoint yet')
         return dict(row, host=host, port=port)
+
+    def refresh(self, keep_active=False):
+        try:
+            rows = self.discover_instances()
+        except Exception as exc:
+            if self.state != 'Ready':
+                self._state('Unavailable', connection_error(exc))
+            return self.snapshot()
+        if keep_active:
+            return self.snapshot()
+        candidates = []
+        for row in rows:
+            try:
+                candidates.append(self.resolve(row['id'], [row]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not candidates:
+            if self.state != 'Ready':
+                self._state('Waiting for Vast', 'No running Vast instance with an SSH endpoint.')
+            return self.snapshot()
+        target = max(candidates, key=lambda row: int(row['id']))
+        if self.thread and self.thread.is_alive():
+            if self.settings.get('instance') == int(target['id']) and (
+                    not self.endpoint or all(self.endpoint.get(k) == target[k] for k in ('host', 'port'))):
+                return self.snapshot()
+            self.disconnect()
+        return self.connect(target['id'], auto=True)
 
     def connect(self, instance=None, auto=False):
         if not instance and self.settings.get("ssh"):
@@ -229,7 +266,27 @@ class Connection:
                 ' except Exception: pass\n')
         import shlex
         command = 'python3 -c ' + shlex.quote(code)
-        result = self.remote(target, command, timeout=12).strip()
+        try:
+            result = self.remote(target, command, timeout=12).strip()
+        except OSError as exc:
+            if not target.get('id'):
+                raise
+            from vast_ssh_setup import attach_key, trust_host
+            message = str(exc).lower()
+            if 'host key verification failed' in message and 'remote host identification has changed' not in message:
+                trust_host(target)
+                try:
+                    result = self.remote(target, command, timeout=12).strip()
+                except OSError as retry:
+                    if 'permission denied (publickey' not in str(retry).lower():
+                        raise
+                    attach_key(target)
+                    result = self.remote(target, command, timeout=12).strip()
+            elif 'permission denied (publickey' in message:
+                attach_key(target)
+                result = self.remote(target, command, timeout=12).strip()
+            else:
+                raise
         with self.lock:
             self.endpoint=target
         self._indicate(ssh='green')
@@ -254,6 +311,7 @@ class Connection:
         args = ['ssh', '-N', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
                 '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=8',
                 '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2',
+                *identity_options(target),
                 '-L', f'127.0.0.1:{local}:127.0.0.1:{port}', '-p', str(target['port']),
                 'root@' + target['host']]
         self.process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

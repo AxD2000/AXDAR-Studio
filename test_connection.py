@@ -21,6 +21,33 @@ class ConnectionTests(unittest.TestCase):
         self.discover.return_value[0]['port']=5678
         self.assertEqual(self.c.resolve(12)['port'],5678)
 
+    def test_refresh_discovers_newest_running_instance_and_keeps_active_submission(self):
+        self.discover.return_value += [
+            dict(id=31,host='ssh2.vast.ai',port=22,status='stopped'),
+            dict(id=19,host='ssh3.vast.ai',port=4321,status='running'),
+        ]
+        with patch.object(self.c,"connect") as connect:
+            self.c.refresh(keep_active=True)
+            connect.assert_not_called()
+            self.c.refresh()
+            connect.assert_called_once_with(19,auto=True)
+        self.assertEqual(self.discover.call_count,2)
+
+    def test_first_login_verifies_host_and_attaches_key_when_needed(self):
+        self.remote.side_effect = [OSError("Host key verification failed"),
+                                   OSError("Permission denied (publickey)."), b"8188"]
+        with patch("vast_ssh_setup.trust_host") as trust, patch("vast_ssh_setup.attach_key") as attach:
+            target = self.discover.return_value[0]
+            self.assertEqual(self.c._remote_port(target),8188)
+            trust.assert_called_once_with(target)
+            attach.assert_called_once_with(target)
+
+    def test_changed_host_is_not_replaced(self):
+        self.remote.side_effect = OSError("REMOTE HOST IDENTIFICATION HAS CHANGED: Host key verification failed.")
+        with patch("vast_ssh_setup.trust_host") as trust, self.assertRaises(OSError):
+            self.c._remote_port(self.discover.return_value[0])
+        trust.assert_not_called()
+
     def test_stopped_and_unsafe_targets(self):
         for changes in [dict(status='stopped'),dict(host='-oProxyCommand=bad'),dict(port=0)]:
             self.discover.return_value=[dict(id=12,host='ssh1.vast.ai',port=22,status='running',**{})|changes]
