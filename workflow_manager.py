@@ -204,7 +204,7 @@ class WorkflowManager:
             threading.Thread(target=self.refresh_telemetry,daemon=True).start()
         with self.lock:
             view={key:self.record.get(key) for key in ("version","status","rate","started","finished","mode","stages",
-                                                       "report","log","message","exitCode")}
+                                                       "report","log","message","exitCode","bashExitCode")}
             if self.record:
                 view["elapsed"]=(self.record.get("finished") or time.time())-self.record["started"]
             previous=self.profile(version) if version else {}

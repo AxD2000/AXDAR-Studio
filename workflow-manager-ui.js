@@ -50,7 +50,7 @@ function installationView(){
     if(!i?.status)return '<p>No installation started.</p>';
     const terminal=['ready','needs attention','failed','cancelled','timed out'].includes(i.status);
     const cost=i.rate!=null?' · '+moneyLabel(i.elapsed/3600*i.rate)+' estimated':'';
-    return '<p role="status">'+esc(i.status)+' · '+timeLabel(i.elapsed)+cost+(i.exitCode!=null?' · Exit '+i.exitCode:'')+'</p>'+
+    return '<p role="status">'+esc(i.status)+' · '+timeLabel(i.elapsed)+cost+(i.exitCode!=null?' · Installer exit '+i.exitCode:'')+(i.bashExitCode!=null?' · Bash exit '+i.bashExitCode:'')+'</p>'+
         '<p>'+esc(i.message||'')+'</p>'+
         (!terminal?'<button data-wm="cancel">Cancel Installation</button>':'')+
         '<table><thead><tr><th>Stage</th><th>Status</th><th>Elapsed</th><th>Progress</th></tr></thead><tbody>'+

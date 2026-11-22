@@ -73,6 +73,14 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertEqual({m["name"]:m["status"] for m in result["models"]},
                          {"x.safetensors":"Incompatible","unknown.gguf":"Requires manual action"})
 
+    def test_verified_model_source_matches_its_known_comfy_subfolder(self):
+        graph={"1":node("VAELoader",vae_name="Minimax/minimax_h3_video_vae_fp16.safetensors")}
+        result=remote.scan(graph,{})
+        model=result["models"][0]
+        self.assertEqual(model["status"],"Missing")
+        self.assertTrue(model["verified"])
+        self.assertEqual(model["source"]["repo"],"Comfy-Org/MiniMax-H3")
+
     def test_install_checks_actual_registration_and_runs_confirmed_script(self):
         (self.root/"install.sh").write_text("printf success","utf-8")
         fixture={"1":node("Lora Loader Stack (rgthree)")}
@@ -88,6 +96,7 @@ class WorkflowManagerTests(unittest.TestCase):
             nonlocal verified
             if argv[:2]==["supervisorctl","restart"]:
                 verified=True
+            return subprocess.CompletedProcess(argv,0)
         def install(root,missing):
             self.assertEqual(root,self.root)
             installed.update(missing)
@@ -97,11 +106,32 @@ class WorkflowManagerTests(unittest.TestCase):
              patch.object(remote.subprocess,"run",side_effect=command) as run,patch.object(provision,"install_nodes",side_effect=install):
             self.assertEqual(remote.execute(self.root,config),0)
             self.assertEqual(run.call_args_list[0].args[0][0],"bash")
-            self.assertEqual(run.call_args_list[1].args[0],["supervisorctl","restart","comfyui"])
+            self.assertEqual(run.call_args_list[0].args[0][:2],["bash","-n"])
+            self.assertEqual(run.call_args_list[2].args[0],["supervisorctl","restart","comfyui"])
             verified=False
-            run.side_effect=lambda *_args,**_kw:None
+            run.side_effect=lambda args,**_kw:subprocess.CompletedProcess(args,0)
             self.assertEqual(remote.execute(self.root,config),2)
         self.assertEqual(production.read(self.root/"stage.json")["report"]["nodes"],["Lora Loader Stack (rgthree)"])
+
+    def test_script_token_filter_keeps_hf_hub_function_names(self):
+        script="from huggingface_hub import hf_hub_download"
+        self.assertEqual(remote.redact(script),script)
+        self.assertEqual(remote.redact("hf_ABCDEFGH12345678"),"[REDACTED]")
+
+    def test_invalid_bash_reports_exact_exit_code_before_script_or_installs(self):
+        (self.root/"install.sh").write_text("echo unsafe if lint fails\\nfi","utf-8")
+        fixture={"1":node("VHS_VideoCombine")}
+        def endpoint(url,**_):
+            return io.BytesIO(b'{"queue_running":[],"queue_pending":[]}' if url.endswith("/queue") else b"{}")
+        with patch.object(remote,"root_path",return_value=self.root),patch.object(remote,"urlopen",side_effect=endpoint), \
+             patch.object(remote.subprocess,"run",return_value=subprocess.CompletedProcess([],2)) as run, \
+             patch.object(provision,"install_nodes") as install:
+            result=remote.execute(self.root,{"port":18188,"graph":fixture,"mode":"install"})
+        self.assertEqual(result,1)
+        self.assertEqual(production.read(self.root/"stage.json")["bashExitCode"],2)
+        self.assertEqual(run.call_count,1)
+        self.assertEqual(run.call_args.args[0][:2],["bash","-n"])
+        install.assert_not_called()
 
     def manager(self):
         store=workflow_profiles.WorkflowStore(self.root/"profiles")

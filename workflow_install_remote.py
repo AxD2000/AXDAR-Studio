@@ -22,13 +22,16 @@ def redact(text, token=""):
     text=str(text or "")
     if token:
         text = text.replace(token,"[REDACTED]")
-    return re.sub(r"\bhf_[A-Za-z0-9_-]{8,}", "[REDACTED]", text)
+    return re.sub(r"\bhf_[A-Za-z0-9]{8,}\b", "[REDACTED]", text)
 
 
 def scan(graph, info, exists=None):
     missing = sorted({n["class_type"] for n in graph.values()} - info.keys())
     models = {}
     verified = provision.model_sources()
+    for filename,source in list(verified.items()):
+        folder = source["folder"].split("/")
+        verified["/".join([*folder[1:],filename])] = source
     for node in graph.values():
         kind = node["class_type"]
         schema = info.get(kind,{}).get("input",{})
@@ -118,8 +121,18 @@ def execute(folder, config):
         idle()
         script=folder/"install.sh"
         if script.is_file():
+            stage(PHASES[3],"Running","Checking Bash syntax before execution")
+            check=subprocess.run(["bash","-n",str(script)],cwd=root)
+            state["bashExitCode"]=check.returncode
+            if check.returncode:
+                stage(PHASES[3],"Failed","Bash syntax check failed. No script commands ran.")
+                return 1
             stage(PHASES[3],"Running","Running the approved Bash script")
-            subprocess.run(["bash",str(script)],cwd=root,check=True)
+            execution=subprocess.run(["bash",str(script)],cwd=root)
+            state["bashExitCode"]=execution.returncode
+            if execution.returncode:
+                stage(PHASES[3],"Failed","The Bash script returned a nonzero exit code.")
+                return 1
             info=api("/object_info")
             result=scan(graph,info,exists)
             report(result)
