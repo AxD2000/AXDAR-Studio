@@ -134,6 +134,9 @@ import drive_archive
 import take_quality
 from episode_editor import Editor,valid_id
 from freecut_bridge import FreecutBridge
+from workflow_manager import WorkflowManager
+from direct_session import DirectSession
+from workflow_install_remote import redact
 
 def prepare_shot(url, folder, eid, s, wf, record):
     images, voices = generation_images(s), generation_voices(s)
@@ -167,51 +170,18 @@ def discover_vast():
         time.sleep(30)
 
 
-def run(url, deadline, jobs, wf, target=None):
+def run_direct(url,wf,target):
     global running
-    ctx=dict(globals(),technical_qc=take_quality.check,direct=True,instance=(target or {}).get("id"))
-    try:
-        if target and target.get("id"):
-            vast_deploy.prepare_direct(ctx,target,jobs,wf,lambda:deadline-time.time())
-            while time.time()<deadline-60:
-                view=controller.connection.snapshot()
-                if view.get("instance")==target["id"] and view.get("url"):
-                    url=view["url"]
-                    break
-                if view["state"]=="Failed":
-                    controller.connection.connect(target["id"],auto=True)
-                time.sleep(2)
-            else:
-                raise ValueError("ComfyUI did not reconnect in time after setup.")
-        session["phase"]="Rendering"
-        for eid, shot, rules in jobs:
-            if time.time() >= deadline-60:
-                session["error"]="Session time limit reached."
-                break
-            try:
-                if target:
-                    url=controller.connection.snapshot().get("url") or url
-                result=production.render(ctx,url,deadline,eid,shot,rules,wf,2,lambda:None,True)
-                if result in ("waiting","uncertain"):
-                    session["error"]="The original ComfyUI job still needs to be reconciled."
-                    break
-                if result=="error":
-                    session["failed"]+=1
-                if result=="done":
-                    session["completed"]+=1
-            except Exception as exc:
-                session["error"]=f"{shot['id']}: {exc}"
-    except Exception as exc:
-        session["error"]=str(exc)
-    finally:
-        with LOCK:
-            session["phase"]="Finished" if not session.get("error") and not session["failed"] else "Needs attention"
-            running=False
+    running=True
+    threading.Thread(target=direct_session.run,args=(url,wf,target),daemon=True).start()
+
 
 controller=vast_deploy.Controller(globals())
 drive_pending=None
 editor=Editor(globals())
 freecut=FreecutBridge(editor)
+workflow_manager=WorkflowManager(globals())
+direct_session=DirectSession(globals())
 
 class Handler(BaseHTTPRequestHandler):
     def send(self, data, mime="application/json", status=200):
@@ -268,7 +238,7 @@ class Handler(BaseHTTPRequestHandler):
         from urllib.parse import unquote
         route=unquote(urlsplit(self.path).path)
         if self.headers.get("Host") != f"127.0.0.1:{PORT}": return self.send({},status=403)
-        if route in ("/workspaces.js", "/workspaces.css", "/production-ui.js", "/plugin-manager.js", "/connection-ui.js", "/story-ui.js", "/workflow-ui.js", "/editor-ui.js"):
+        if route in ("/workspaces.js", "/workspaces.css", "/production-ui.js", "/plugin-manager.js", "/connection-ui.js", "/story-ui.js", "/workflow-ui.js", "/editor-ui.js", "/workflow-manager-ui.js"):
             mime = "text/javascript" if route.endswith(".js") else "text/css"
             return self.send((BASE/route[1:]).read_bytes(), mime + "; charset=utf-8")
         if route=="/":
@@ -332,7 +302,9 @@ class Handler(BaseHTTPRequestHandler):
                 video=(p.parent/"video.mp4").exists() and review in (None,"accepted")
                 preview=(p.parent/"preview.mp4").exists() or (p.parent/"video.mp4").exists()
                 result.append(dict(episode=p.parents[2].name,id=j["shot"],version=p.parent.name,status=j["status"],
-                                   error=j.get("error",""),revision=j["revision"],takeId=j.get("take_id"),review=review,
+                                   error=redact(j.get("error","")),revision=j["revision"],takeId=j.get("take_id"),review=review,
+                                   promptId=j.get("ticket"),started=j.get("started"),workflowVersion=j.get("workflow_version"),
+                                   duration=j.get("duration"),
                                    quality=j.get("quality"),renderSeconds=j.get("renderSeconds"),
                                    remote=bool(j.get("remote_run")),video="/video/"+relative if video else "",
                                    preview="/take-preview/"+relative if preview and review else ""))
@@ -373,16 +345,38 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     name = import_asset(unquote(self.headers.get("X-Filename","")), blob)
                     return self.send({"name":name})
-            limit = 32 * 1024 * 1024 if self.path in ("/workflow/import","/workflow/inspect","/story/parse","/story/commit","/save") else 8 * 1024 * 1024
+            limit = 32 * 1024 * 1024 if self.path in ("/workflow/import","/workflow/attach","/workflow/inspect","/story/parse","/story/commit","/save") else 8 * 1024 * 1024
             if not 0 < size <= limit:
                 raise ValueError("Request is empty or exceeds the upload limit.")
             blob = self.rfile.read(size)
             if len(blob) != size:
                 raise ValueError("Upload incomplete.")
             filename = unquote(self.headers.get("X-Filename",""))
-            binary = self.path == "/workflow/import" or self.path == "/story/parse" and filename
+            binary = self.path in ("/workflow/import","/workflow/attach") or self.path == "/story/parse" and filename
             obj = {} if binary else json.loads(blob)
+            if self.path=="/workflow-manager":
+                return self.send(workflow_manager.action(obj))
+            if self.path=="/direct-production":
+                with LOCK:
+                    if obj.get("action")=="logs":
+                        eid,sid,version=obj.get("episode"),obj.get("shot"),obj.get("version")
+                        if not valid_id(eid) or not valid_id(sid) or not re.fullmatch(r"[0-9]{1,22}",str(version)):
+                            raise ValueError("Select a recorded shot attempt.")
+                        folder=DATA/eid/sid/version
+                        job=production.read(folder/"job.json",{})
+                        if not job:
+                            raise ValueError("Select a recorded shot attempt.")
+                        hist=production.read(folder/"history.json",{})
+                        rows=hist.get("status",{}).get("messages",[])
+                        messages=[dict(event=name,node=meta.get("node_id"),nodeType=meta.get("node_type"),
+                                       error=redact(meta.get("exception_message",""))[:900])
+                                  for name,meta in rows[-15:] if isinstance(meta,dict)]
+                        return self.send(dict(promptId=job.get("ticket"),status=job["status"],
+                                              error=redact(job.get("error","")),messages=messages))
+                    return self.send(direct_session.control(obj))
             if self.path.startswith("/workflow/"):
+                if self.path=="/workflow/attach":
+                    obj["version"]=self.headers.get("X-Workflow-Version")
                 with LOCK:
                     return self.send(actions.workflow(self.path.rsplit("/",1)[1], obj, blob if binary else None, filename))
             if self.path == "/migrate" or self.path.startswith(("/project/","/story/","/shots/","/characters/")):
@@ -425,6 +419,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=="/production":
                 with LOCK:
                     if running: raise ValueError("The manual session is active")
+                    if workflow_manager.busy() and obj.get("action") in ("start","resume","retry"):
+                        raise ValueError("Wait until the Workflow installation finishes.")
                     if not active_workflow and obj.get("action") == "start" and not obj.get("archive"):
                         raise ValueError(workflow_error)
                     return self.send(controller.action(obj))
@@ -450,7 +446,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(dict(project=db, assets=active_assets(db)))
                 elif self.path=="/start":
                     if not active_workflow: raise ValueError(workflow_error)
-                    if production_busy(): raise ValueError("Finish the active production session first.")
+                    if production_busy() or workflow_manager.busy():
+                        raise ValueError("Finish the active production or installation first.")
                     if running: raise ValueError("الجلسة تعمل حالياً")
                     connected=controller.connection.snapshot().get("url")
                     target=controller.connection.target() if connected else None
@@ -461,13 +458,22 @@ class Handler(BaseHTTPRequestHandler):
                     db=project()
                     ep=next(e for e in db["episodes"] if e["id"]==obj["episode"])
                     jobs, skipped = actions.approved_jobs(db, ep)
+                    retry=obj.get("retry")
+                    if retry:
+                        if not valid_id(retry):
+                            raise ValueError("Select a failed shot.")
+                        jobs=[row for row in jobs if row[1]["id"]==retry]
+                        past=sorted((DATA/ep["id"]/retry).glob("*/job.json"),reverse=True)
+                        latest=production.read(past[0],{}) if past else {}
+                        if not jobs or latest.get("status")!="error" or latest.get("revision")!=jobs[0][1]["revision"]:
+                            raise ValueError("Retry is only available for a failed shot of the current revision.")
                     if not jobs:
                         raise ValueError(next((reason for reasons in skipped.values() for reason in reasons), "Approve at least one ready shot."))
                     end=time.time()+60*minutes
-                    session=dict(end=end,episode=ep["id"],submitted=len(jobs),blocked=skipped,
-                                 phase="Preparing ComfyUI",completed=0,failed=0)
-                    running=True
-                    threading.Thread(target=run,args=(url,end,jobs,active_workflow,target),daemon=True).start()
+                    view=dict(end=end,episode=ep["id"],submitted=len(jobs),blocked=skipped,
+                              phase="Preparing ComfyUI",completed=0,failed=0)
+                    direct_session.start(view,jobs,active_workflow,target,url,retry=bool(retry))
+                    run_direct(url,active_workflow,target)
                     return self.send({"ok":True,"submitted":len(jobs),"blocked":skipped})
                 else: return self.send({},status=404)
             self.send({"ok":True})

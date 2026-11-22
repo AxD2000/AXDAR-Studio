@@ -5,7 +5,9 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.parse import urlsplit
+import re
 
 from production import digest
 
@@ -84,14 +86,57 @@ def install_nodes(root,missing):
                 with_repo.rename(dest)
         if requirements:
             if not py.is_file():raise ValueError("Set COMFY_PYTHON to the template's Python executable")
-            subprocess.run([str(py),"-m","pip","install","--only-binary=:all:","--index-url","https://pypi.org/simple",*requirements],check=True,timeout=900)
+            pip=[str(py),"-m","pip","install","--only-binary=:all:","--index-url","https://pypi.org/simple"]
+            freeze=subprocess.check_output([str(py),"-m","pip","list","--format=json"],text=True,timeout=60)
+            protected=("torch","torchvision","torchaudio","triton","xformers")
+            with tempfile.TemporaryDirectory() as temp:
+                constraints=Path(temp)/"gpu-constraints.txt"
+                constraints.write_text("".join(f"{item['name']}=={item['version']}\n" for item in json.loads(freeze)
+                                               if item["name"].lower() in protected or item["name"].lower().startswith("nvidia-")),"utf-8")
+                subprocess.run([*pip,"--constraint",str(constraints),*requirements],check=True,timeout=900)
         installed.update(kinds & missing)
     return installed
 
 
-def install_models(root, required):
+class ModelRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected and urlsplit(req.full_url).netloc != urlsplit(newurl).netloc:
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+def model_sources():
     lock=json.loads(Path(__file__).with_name("model-lock.json").read_text("utf-8"))
-    known={Path(m["file"]).name:m for m in lock}
+    return {Path(item["file"]).name:item for item in lock}
+
+
+def download_weight(url, tmp, expected):
+    offset=tmp.stat().st_size if tmp.exists() else 0
+    if offset == expected:
+        return
+    headers={}
+    if token:=os.environ.get("HF_TOKEN"):
+        headers["Authorization"]="Bearer "+token
+    if offset:
+        headers["Range"]=f"bytes={offset}-"
+    with build_opener(ModelRedirect()).open(Request(url,headers=headers),timeout=90) as src:
+        if src.status==206:
+            match=re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",src.headers.get("Content-Range",""))
+            if not match or int(match[1])!=offset or int(match[3])!=expected:
+                raise ValueError("The model server returned an invalid resume range.")
+        else:
+            offset=0
+        with tmp.open("ab" if offset else "wb") as out:
+            while chunk:=src.read(1024*1024):
+                offset+=len(chunk)
+                if offset>expected:
+                    raise ValueError("The download exceeds the verified model size.")
+                out.write(chunk)
+
+
+def install_models(root, required):
+    known=model_sources()
     changed=False
     for name in required:
         m=known.get(name.replace("\\","/").split("/")[-1])
@@ -101,12 +146,15 @@ def install_models(root, required):
         if dest.exists():
             if dest.stat().st_size!=m["bytes"] or digest(dest)!=m["sha256"]:raise ValueError("Existing model failed verification: "+str(dest))
             continue
-        if shutil.disk_usage(dest.parent).free<m["bytes"]+256*1024**2:raise ValueError("Insufficient disk space for "+name)
         tmp=dest.with_suffix(".axdar-part")
+        partial=tmp.stat().st_size if tmp.exists() else 0
+        if shutil.disk_usage(dest.parent).free<max(0,m["bytes"]-partial)+256*1024**2:
+            raise ValueError("Insufficient disk space for "+name)
         url="https://huggingface.co/"+m["repo"]+"/resolve/"+m["revision"]+"/"+m["file"]
-        with urlopen(url,timeout=90) as src,tmp.open("wb") as out:
-            shutil.copyfileobj(src,out,1024*1024)
-        if tmp.stat().st_size!=m["bytes"] or digest(tmp)!=m["sha256"]:
+        download_weight(url,tmp,m["bytes"])
+        if tmp.stat().st_size!=m["bytes"]:
+            raise ValueError("Model download incomplete. Retry to resume: "+name)
+        if digest(tmp)!=m["sha256"]:
             tmp.unlink()
             raise ValueError("Downloaded model failed verification: "+name)
         tmp.replace(dest)

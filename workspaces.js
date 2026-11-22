@@ -1,6 +1,6 @@
-const spaces=['Story & Scenes','Shot Lab','Asset Vault','Production','Video Editor','Economics','Settings'];
+const spaces=['Story & Scenes','Shot Lab','Asset Vault','Production','Video Editor','Economics','Settings','Workflow'];
 const symbols=['▤','▣','▧','◈','▥','∑','⚙'];
-const descriptions=['Script, scene breakdown and continuity','Prompts, character references and shot approvals','Project reference photos and voices','Workflow, generation queue and take history','Assemble and review the episode','Estimate GPU time and retry costs','Local preferences and workflow configuration'];
+const descriptions=['Script, scene breakdown and continuity','Prompts, character references and shot approvals','Project reference photos and voices','Workflow, generation queue and take history','Assemble and review the episode','Estimate GPU time and retry costs','Local preferences and workflow configuration','Install, validate and monitor ComfyUI workflows'];
 let storyTab='Script', selectedId='', estimateEpisode='';
 let estimate={shots:1,failure:10,rate:.55,minutes:6};
 function selectedShot(){return ep.shots.find(s=>s.id===selectedId)||ep.shots[0]}
@@ -38,7 +38,7 @@ function render(){
     $('#episodeMenu').innerHTML=db.episodes.map((e,i)=>option(e.id,(i+1)+'. '+(e.title||'Untitled episode'),ep.id)).join('');
     $('#projectTitle').textContent=ep.title||'Untitled episode';
     $('#projectCount').textContent=(ep.scenes||[]).length+' scenes · '+ep.shots.length+' shots · '+ep.shots.filter(s=>s.approved).length+' approved';
-    $('#app').innerHTML=[renderStory,renderShots,()=>characterRegistry()+libraryView(),sessionView,renderEditor,renderEconomics,renderSettings][page]();
+    $('#app').innerHTML=[renderStory,renderShots,()=>characterRegistry()+libraryView(),sessionView,renderEditor,renderEconomics,renderSettings,workflowWorkspace][page]();
 }
 document.addEventListener('click',e=>{
     const b=e.target.closest('button');if(!b)return;

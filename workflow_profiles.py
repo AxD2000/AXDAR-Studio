@@ -44,6 +44,22 @@ def _parse(raw):
     return graph
 
 
+def editor_graph(raw):
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Expected a ComfyUI JSON object.")
+    graph = data.get("workflow", data.get("graph", data))
+    if not isinstance(graph, dict) or "nodes" not in graph:
+        return None
+    nodes = graph["nodes"]
+    if not isinstance(nodes, list) or not nodes or any(
+        not isinstance(node, dict) or not isinstance(node.get("id"), (int, str))
+        or not isinstance(node.get("type"), str) or not node["type"] for node in nodes
+    ) or len({str(node["id"]) for node in nodes}) != len(nodes):
+        raise ValueError("Malformed ComfyUI editor workflow nodes.")
+    return {str(node["id"]): node["type"] for node in nodes}
+
+
 def _upstream(graph, roots):
     seen, pending = set(), list(roots)
     while pending:
@@ -532,7 +548,8 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix):
 
 
 def public_profile(wf):
-    return {key:wf[key] for key in ("version","name","adapter","mapping","fields","outputs","issues")}
+    return {key:wf[key] for key in ("version","name","adapter","mapping","fields","outputs","issues",
+                                    "format","nodeCount","executable")}
 
 
 class WorkflowStore:
@@ -550,11 +567,21 @@ class WorkflowStore:
         finally:
             temp.unlink(missing_ok=True)
 
-    def _persist(self, name, raw, info, mapping, select):
-        wf = inspect_workflow(name,raw,info,mapping)
+    def _persist(self, name, raw, info, mapping, select, executable=None):
+        editor = editor_graph(raw.decode("utf-8-sig"))
+        if editor is not None and executable is None:
+            version = _digest(_json([_digest(raw), "editor"]))
+            wf = dict(version=version, name=name, adapter="UI workflow", mapping={}, fields=[],
+                      outputs=[], issues=["Attach a ComfyUI API export of this workflow before production."],
+                      graph={})
+        else:
+            wf = inspect_workflow(name,executable or raw,info,mapping)
+            wf["version"] = _digest(_json([_digest(raw),wf["version"]]))
+        wf.update(format="ComfyUI UI JSON" if editor is not None else "ComfyUI API JSON",
+                  nodeCount=len(editor if editor is not None else wf["graph"]),
+                  executable=bool(wf["graph"]))
         source = _digest(raw)
         # Two differently formatted imports retain separate originals even if the graphs are equal.
-        wf["version"] = _digest(_json([source,wf["version"]]))
         source_path = self.directory/"originals"/(source+".json")
         if not source_path.exists():
             self._write(source_path,raw)
@@ -562,7 +589,11 @@ class WorkflowStore:
         if not path.exists():
             classes = {n["class_type"] for n in wf["graph"].values()}
             meta = {k:v for k,v in (info or {}).items() if k in classes}
-            self._write(path,_json(dict(name=name,source=source,mapping=mapping,metadata=meta)))
+            rec = dict(name=name,source=source,mapping=mapping,metadata=meta)
+            if executable is not None:
+                rec["executable"] = _digest(executable)
+                self._write(self.directory/"executable"/(rec["executable"]+".json"),executable)
+            self._write(path,_json(rec))
         if select and not wf["issues"]:
             self._write(self.directory/"active.json",_json(wf["version"]))
         return wf
@@ -589,9 +620,41 @@ class WorkflowStore:
 
     def get(self,version):
         rec = self._record(version)
-        wf = inspect_workflow(rec["name"],self.original(version),rec["metadata"],rec["mapping"])
-        wf["version"] = version
+        raw = self.original(version)
+        editor = editor_graph(raw.decode("utf-8-sig"))
+        executable = self._executable(rec)
+        if editor is not None and executable is None:
+            return dict(version=version,name=rec["name"],adapter="UI workflow",mapping={},fields=[],outputs=[],
+                        issues=["Attach a ComfyUI API export of this workflow before production."],
+                        graph={},format="ComfyUI UI JSON",nodeCount=len(editor),executable=False)
+        wf = inspect_workflow(rec["name"],executable or raw,rec["metadata"],rec["mapping"])
+        wf.update(version=version,format="ComfyUI UI JSON" if editor is not None else "ComfyUI API JSON",
+                  nodeCount=len(editor if editor is not None else wf["graph"]),executable=True)
         return wf
+
+    def _executable(self, rec):
+        if "executable" in rec:
+            data = (self.directory/"executable"/(rec["executable"]+".json")).read_bytes()
+            if _digest(data)!=rec["executable"]:
+                raise ValueError("The attached executable graph failed its checksum.")
+            return data
+        return None
+
+    def attach(self, version, raw):
+        rec = self._record(version)
+        original = self.original(version)
+        editor = editor_graph(original.decode("utf-8-sig"))
+        if not editor:
+            raise ValueError("Select the original ComfyUI UI profile first.")
+        graph = _parse(raw)
+        shared = {key for key in editor if key in graph}
+        if not shared or any(editor[key] != graph[key]["class_type"] for key in shared):
+            raise ValueError("The API export does not match identifiable nodes in this UI workflow.")
+        outputs = {item["id"] for item in _outputs(graph,{})}
+        if not outputs & shared:
+            raise ValueError("The API export does not include a video output from this UI workflow.")
+        wf = self.get(version)
+        return self._persist(rec["name"],original,{},wf["mapping"] or None,False,raw)
 
     def active(self):
         pointer = self.directory/"active.json"
@@ -606,11 +669,16 @@ class WorkflowStore:
 
     def remap(self,version,mapping,object_info=None,select=True):
         rec = self._record(version)
-        return self._persist(rec["name"], self.original(version), rec["metadata"] if object_info is None else object_info, mapping,select)
+        if not self.get(version)["executable"]:
+            raise ValueError("Attach the workflow's executable API export first.")
+        return self._persist(rec["name"], self.original(version), rec["metadata"] if object_info is None else object_info,
+                             mapping,select,self._executable(rec))
 
     def inspect_metadata(self,version,metadata):
         rec = self._record(version)
-        return self._persist(rec["name"],self.original(version),metadata,rec["mapping"],False)
+        if not self.get(version)["executable"]:
+            raise ValueError("Attach the workflow's executable API export first.")
+        return self._persist(rec["name"],self.original(version),metadata,rec["mapping"],False,self._executable(rec))
 
     def select(self,version):
         wf = self.get(version)

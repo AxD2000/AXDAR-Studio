@@ -22,7 +22,7 @@ from production_services import webhook_url
 import take_quality
 
 STORE="/workspace/axdar-studio"
-SOURCES=("worker.py","production.py","vast_worker.py","vast_deploy.py","studio.pyw","studio_actions.py","story_engine.py","workflow_profiles.py","provision.py","model-lock.json","vast_connection.py","vast_ssh_setup.py","drive_archive.py","production_services.py","take_quality.py","editor_media.py","episode_editor.py")
+SOURCES=("worker.py","production.py","vast_worker.py","vast_deploy.py","studio.pyw","studio_actions.py","story_engine.py","workflow_profiles.py","provision.py","model-lock.json","vast_connection.py","vast_ssh_setup.py","drive_archive.py","production_services.py","take_quality.py","editor_media.py","episode_editor.py","freecut_bridge.py","workflow_manager.py","workflow_install_remote.py","direct_session.py")
 TERMINAL={"finished","needs attention","stopped","paused","waiting","limit reached"}
 
 
@@ -152,7 +152,7 @@ def deploy_files(target, planned):
         put(target,dst,planned[dst])
 
 
-def prepare_direct(ctx, target, jobs, workflow, timeout):
+def prepare_direct(ctx, target, jobs, workflow, timeout, repair=True):
     from vast_worker import runtime_requirements
     base = ctx["BASE"]
     requirements = runtime_requirements(ctx, {"jobs":jobs}, workflow)
@@ -164,7 +164,7 @@ def prepare_direct(ctx, target, jobs, workflow, timeout):
             "from urllib.request import urlopen\n"
             "def api(url, path):\n"
             " with urlopen(url + path, timeout=15) as response: return json.load(response)\n"
-            "try: ready({'json_api':api}, json.load(sys.stdin))\n"
+            f"try: ready({{'json_api':api}}, json.load(sys.stdin), repair={repair})\n"
             "except Exception as exc: sys.exit(str(exc))")
     try:
         ssh(target, f"cd {release} && python3 -c {shlex.quote(code)}",

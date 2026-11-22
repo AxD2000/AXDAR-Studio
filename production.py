@@ -198,6 +198,9 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
             poll_deadline=max(deadline,time.time()+8) if not admit else deadline
             while time.time()<poll_deadline:
                 notify()
+                if ctx.get("cancel_prompt") and ctx["cancel_prompt"](j["ticket"]):
+                    j.pop("error",None)
+                    return finish("cancelled")
                 try:
                     h=ctx["json_api"](url,"/history/"+j["ticket"]).get(j["ticket"])
                 except (ValueError,AttributeError) as exc:
@@ -207,6 +210,8 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
                     if h.get("status",{}).get("status_str")=="error":
                         details=next((m[1] for m in h["status"].get("messages",[]) if m[0]=="execution_error"),{})
                         raise ValueError(str(details.get("node_type","Render"))+": "+str(details.get("exception_message","ComfyUI execution failed"))[:800])
+                    if h.get("status",{}).get("completed") is False:
+                        raise Uncertain("The original ComfyUI prompt has no completed execution history.")
                     ctx["download_output"](url,folder,h,j)
                     if "audioRequired" not in j:
                         graph = read(folder/"graph.json", wf.get("graph",{}))

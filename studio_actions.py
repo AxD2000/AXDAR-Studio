@@ -97,6 +97,8 @@ class StudioActions:
             return {"profiles":entries, "active":active.get("version") if active else None}
         if route == "import":
             wf = self.store.import_workflow(filename or "workflow.json", raw)
+        elif route == "attach":
+            wf = self.store.attach(obj["version"], raw)
         elif route == "select":
             wf = self.store.select(obj["version"])
         elif route == "map":

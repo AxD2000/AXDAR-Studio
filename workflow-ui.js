@@ -12,10 +12,13 @@ function mappingField(field){return field.label+' ('+field.id+')'}
 function workflowPanel(){
     const p=currentProfile(editingProfile),active=currentProfile();
     return '<section class="panel"><h2>ComfyUI workflow</h2><p>Active workflow · <strong>'+esc(active?profileLabel(active):'None selected')+'</strong></p>'+
-        '<div class="row"><button data-wf="import">Import API JSON</button><button data-tools="open">Terminal &amp; HF Token</button></div>'+
+        '<div class="row"><button data-wf="import">Import Workflow JSON</button><button data-tools="open">Terminal &amp; HF Token</button></div>'+
         (p?'<label>Stored workflow version<select id="profileChoice">'+workflowCatalog.profiles.map(x=>option(x.version,profileLabel(x),p.version)).join('')+'</select></label>'+
-        '<div class="row"><button data-wf="select" '+(p.version===workflowCatalog.active?'disabled':'')+'>Use this version</button></div>'+
-        '<details id="workflowFields" '+(mappingOpen?'open':'')+'><summary>Review input and output mapping</summary>'+workflowMappingForm(p)+'</details>':'')+'</section>';
+        '<p>'+esc(p.format)+' · '+p.nodeCount+' nodes · '+(p.issues.length?'Needs review':'Ready')+'</p>'+
+        (p.executable?'':'<p class="danger">'+esc(p.issues.join(' '))+'</p>'+
+            (page===7?'<button data-wm="attach">Attach executable API JSON</button>':''))+
+        '<div class="row"><button data-wf="select" '+(!p.executable||p.issues.length||p.version===workflowCatalog.active?'disabled':'')+'>Use this version</button></div>'+
+        (p.executable?'<details id="workflowFields" '+(mappingOpen?'open':'')+'><summary>Review input and output mapping</summary>'+workflowMappingForm(p)+'</details>':'' ):'')+'</section>';
 }
 const roleLabels={positive:'Positive prompt',negative:'Negative prompt',duration:'Duration in seconds',frames:'Frame count'};
 const numberLabels={fps:'Frames per second',fixedSeconds:'Fixed duration (seconds)',minSeconds:'Minimum seconds',maxSeconds:'Maximum seconds',minFrames:'Minimum frames',maxFrames:'Maximum frames',frameStep:'Frame count step',frameBase:'Frame count base'};
