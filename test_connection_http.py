@@ -3,7 +3,6 @@ import json
 import runpy
 import threading
 import unittest
-from http.server import ThreadingHTTPServer
 from urllib.request import Request,urlopen
 from urllib.error import HTTPError
 from unittest.mock import Mock,patch
@@ -13,7 +12,7 @@ class HttpTests(unittest.TestCase):
     def setUpClass(cls):
         cls.ctx=runpy.run_path('studio.pyw')
         cls.g=cls.ctx['Handler'].do_POST.__globals__
-        cls.server=ThreadingHTTPServer(('127.0.0.1',0),cls.ctx['Handler'])
+        cls.server=cls.ctx['StudioServer'](('127.0.0.1',0),cls.ctx['Handler'])
         cls.g['PORT']=cls.server.server_port
         cls.url='http://127.0.0.1:'+str(cls.server.server_port)
         cls.thread=threading.Thread(target=cls.server.serve_forever,daemon=True);cls.thread.start()
@@ -85,5 +84,9 @@ class HttpTests(unittest.TestCase):
     def test_status_contains_shared_state(self):
         with urlopen(self.url+'/status') as response:status=json.load(response)
         self.assertIn('connection',status);self.assertEqual(status['running'],False)
+
+    def test_second_studio_cannot_listen_on_the_same_address(self):
+        with self.assertRaises(OSError):
+            self.ctx['StudioServer'](self.server.server_address,self.ctx['Handler'])
 
 if __name__=='__main__':unittest.main()

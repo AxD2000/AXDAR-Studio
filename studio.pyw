@@ -1,5 +1,5 @@
 from pathlib import Path
-import copy, json, mimetypes, os, re, secrets, shutil, threading, time, uuid, webbrowser
+import copy, json, mimetypes, os, re, secrets, shutil, socket, threading, time, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlencode, urlsplit, unquote, parse_qs
 from urllib.request import Request, urlopen
@@ -523,9 +523,17 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e: self.send({"error":str(e)},status=400)
     def log_message(self,*args): pass
 
+class StudioServer(ThreadingHTTPServer):
+    def server_bind(self):
+        if hasattr(socket,"SO_EXCLUSIVEADDRUSE"):
+            self.allow_reuse_address=False
+            self.socket.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
+        super().server_bind()
+
+
 if __name__=="__main__":
     address=f"http://127.0.0.1:{PORT}"
-    try: server=ThreadingHTTPServer(("127.0.0.1",PORT),Handler)
+    try: server=StudioServer(("127.0.0.1",PORT),Handler)
     except OSError:
         with urlopen(address+"/api",timeout=3) as response:
             if "project" not in json.load(response): raise
