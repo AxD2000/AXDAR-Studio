@@ -223,7 +223,7 @@ class WorkflowManager:
                     state.setdefault("status","running")
                     with self.lock:
                         self.save(message="",**state)
-                        if state["status"] in TERMINAL:
+                        if state["status"] in ("ready","needs attention") and state.get("report"):
                             version=self.record["version"]
                             profiles=self.profile(version).get("instances",{})
                             profiles[self.record["instance"]]={k:self.record.get(k) for k in ("status","report","finished")}
@@ -241,16 +241,18 @@ class WorkflowManager:
         if monitor and self.telemetry_lock.acquire(blocking=False):
             threading.Thread(target=self.refresh_telemetry,daemon=True).start()
         with self.lock:
-            view={key:self.record.get(key) for key in ("version","status","rate","started","finished","mode","stages",
+            view={key:self.record.get(key) for key in ("version","instance","status","rate","started","finished","mode","stages",
                                                        "report","log","message","exitCode","bashExitCode")}
             if self.record:
                 view["elapsed"]=(self.record.get("finished") or time.time())-self.record["started"]
+            version=version if isinstance(version,str) and re.fullmatch(r"[0-9a-f]{64}",version) else None
             previous=self.profile(version) if version else {}
             try:
                 target=identity(self.connection.target())
             except ValueError:
                 target=None
-            return dict(installation=view,phases=PHASES,savedScript=previous.get("script",""),
+            return dict(installation=view,phases=PHASES,selectedVersion=version,connectedInstance=target,
+                        savedScript=previous.get("script",""),
                         verification=previous.get("instances",{}).get(target),telemetry=self.telemetry)
 
     def refresh_telemetry(self):

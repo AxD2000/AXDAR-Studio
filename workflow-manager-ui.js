@@ -1,67 +1,119 @@
-let workflowTab='Setup', workflowLive=null, workflowPolling=false, workflowLogOpen=false, workflowTerminalOpen=false, workflowSavedFor='';
+let workflowTab='Setup', workflowLive=null, workflowPolling=false, workflowLogOpen=false, workflowTerminalOpen=false;
 const workflowTabs=['Setup','Dependencies','Installation Monitor','Production Monitor'];
-const workflowCall=obj=>post('/workflow-manager',{version:editingProfile,...obj});
-const timeLabel=s=>s==null?'—':(s<60?Math.round(s)+' s':Math.floor(s/60)+'m '+Math.round(s%60)+'s');
+const terminalWorkflowStates=['ready','needs attention','failed','cancelled','timed out'];
+const workflowDrafts=new Map();
+const selectedWorkflow=()=>currentProfile(editingProfile)||currentProfile();
+const workflowCall=obj=>post('/workflow-manager',{version:selectedWorkflow()?.version??null,...obj});
+const timeLabel=s=>!Number.isFinite(s)?'—':(s<60?Math.round(s)+' s':Math.floor(s/60)+'m '+Math.round(s%60)+'s');
 const moneyLabel=value=>'$'+Number(value).toFixed(3);
+const workflowStatus=()=>workflowLive?.version===(selectedWorkflow()?.version??null)?workflowLive.data:null;
+
+function installReason(){
+    const p=selectedWorkflow(),operation=workflowStatus()?.installation;
+    if(!p)return 'Import a ComfyUI workflow first.';
+    if(!p.executable)return 'Prepare the original JSON on the connected ComfyUI instance first.';
+    if(!p.mapping?.output)return 'Select the final MP4 output in Setup.';
+    if(state.connection?.state!=='Ready')return 'Connect to Vast to install dependencies.';
+    if(state.running||['running','deploying','starting worker','checking ComfyUI and requirements'].includes(state.production?.status))
+        return 'Wait for the current production session.';
+    if(operation?.status&&!terminalWorkflowStates.includes(operation.status))
+        return operation.mode==='scan'?'Checking dependencies…':'An installation is already running.';
+    return '';
+}
+
+function installActions(){
+    const reason=installReason();
+    return '<div class="row"><button class="primary" data-wm="preview" '+(reason?'disabled':'')+'>Start Installation</button></div>'+
+        '<p id="wmActionNote" class="muted" '+(reason?'':'hidden')+'>'+esc(reason)+'</p>';
+}
+
+function storedInstallDraft(data=workflowStatus()){
+    const version=selectedWorkflow()?.version;
+    return workflowDrafts.get(version)||{script:data?.savedScript||'',timeout:30,restart:false};
+}
+
+function saveInstallDraft(){
+    const p=selectedWorkflow(),field=$('#wmScript');
+    if(p&&field)workflowDrafts.set(p.version,{script:field.value,timeout:$('#wmTimeout').value,restart:$('#wmRestart').checked});
+}
 
 function workflowWorkspace(){
     const subnav='<div class="toolbar">'+workflowTabs.map(label=>'<button data-wm-tab="'+label+'" aria-pressed="'+(workflowTab===label)+'">'+label+'</button>').join('')+'</div>';
     let content='';
     if(workflowTab==='Setup'){
+        const draft=storedInstallDraft();
         content=workflowPanel()+
+        '<section class="panel"><h2>Workflow installation</h2>'+installActions()+'</section>'+
         '<section class="panel"><h2>Hugging Face</h2><label>Hugging Face Access Token<input id="wmToken" type="password" autocomplete="off" placeholder="hf_…"></label>'+
         '<div class="row"><button data-wm="showToken" aria-controls="wmToken">Show</button><button data-wm="token">Test Token</button></div></section>'+
-        '<section class="panel"><h2>Custom Installation Commands (Bash)</h2><label>Optional script<textarea id="wmScript" rows="10" spellcheck="false"></textarea></label>'+
+        '<section class="panel"><h2>Custom Installation Commands (Bash)</h2><label>Optional script<textarea id="wmScript" rows="10" spellcheck="false">'+esc(draft.script)+'</textarea></label>'+
         '<label>Import .sh file<input id="wmScriptFile" type="file" accept=".sh,text/x-shellscript"></label>'+
-        '<div class="form-pair"><label>Timeout (minutes)<input id="wmTimeout" type="number" min="1" max="180" value="30" required></label>'+
-        '<label><input id="wmRestart" type="checkbox"> Restart ComfyUI after this script even if all nodes are registered</label></div>'+
-        '<p>Scripts run over SSH on the connected instance. Use the HF_TOKEN environment variable for authenticated downloads.</p>'+
-        '<button class="primary" data-wm="preview">Preview installation</button></section>'+
-        '<dialog id="wmConfirm"></dialog>';
-        workflowSavedFor='';
+        '<div class="form-pair"><label>Timeout (minutes)<input id="wmTimeout" type="number" min="1" max="180" value="'+esc(draft.timeout)+'" required></label>'+
+        '<label><input id="wmRestart" type="checkbox" '+(draft.restart?'checked':'')+'> Restart ComfyUI after this script even if all nodes are registered</label></div>'+
+        '<p>Scripts run over SSH on the connected instance. Use the HF_TOKEN environment variable for authenticated downloads.</p></section>';
     }
     if(workflowTab==='Dependencies'){
-        content='<section class="panel"><h2>Dependency verification</h2><button data-wm="scan">Check current instance</button> <button data-wm-tab="Setup">Open Setup</button>'+
+        content='<section class="panel"><h2>Dependency verification</h2>'+installActions()+
+            '<button data-wm="scan">Check current instance</button> <button data-wm-tab="Setup">Open Setup</button>'+
             '<div id="wmLive">'+dependencyView()+'</div></section>';
     }
     if(workflowTab==='Installation Monitor'){
-        content='<section class="panel"><h2>Installation monitor</h2><div id="wmLive">'+installationView()+'</div></section>';
+        content='<section class="panel"><h2>Installation monitor</h2>'+installActions()+'<div id="wmLive">'+installationView()+'</div></section>';
     }
     if(workflowTab==='Production Monitor'){
         content='<section class="panel"><h2>Video production monitor</h2><div id="wmLive">'+productionMonitorView()+'</div>'+
             '<details id="wmShotLogs" '+(workflowLogOpen?'open':'')+' hidden><summary>Shot logs</summary><pre class="preserve-lines" id="wmShotLogText"></pre></details></section>';
     }
-    return subnav+content;
+    return subnav+content+'<dialog id="wmConfirm"></dialog>';
+}
+
+function dependencyReport(){
+    const data=workflowStatus(),op=data?.installation;
+    const live=op?.version===selectedWorkflow()?.version&&op?.instance===data?.connectedInstance?op?.report:null;
+    return Array.isArray(live?.models)?live:data?.verification?.report;
 }
 
 function dependencyView(){
-    const i=workflowLive?.data?.installation,v=workflowLive?.data?.verification;
-    const report=v?.report||(i?.version===editingProfile?i.report:null);
-    if(!report?.models)return '<p>Run a scan on the connected instance to verify the selected version.</p>';
+    const p=selectedWorkflow(),report=dependencyReport();
+    if(!p)return '<p>Import a workflow in Setup to see its dependencies.</p>';
+    if(!p.executable)return '<p>Prepare this workflow to check its dependencies.</p>';
+    if(!Array.isArray(report?.models))return '<p>Check the connected instance to verify '+esc(p.name)+'.</p>';
+    const nodes=Array.isArray(report.nodes)?report.nodes:[];
+    const outstanding=report.models.filter(m=>m.status!=='Installed');
     const space=report.diskFreeBytes!=null&&report.downloadBytes!=null?
         '<p>'+((report.downloadBytes||0)/1e9).toFixed(2)+' GB verified downloads · '+
         (report.diskFreeBytes/1e9).toFixed(2)+' GB available'+
         (report.downloadBytes>report.diskFreeBytes?' · Insufficient disk space':'')+'</p>':'';
-    return '<p>Verification · '+esc(v?.status||i?.status||'Pending')+'</p><h3>Custom nodes</h3>'+
-        (report.nodes.length?'<ul class="danger">'+report.nodes.map(node=>'<li>'+esc(node)+'</li>').join('')+'</ul>':'<p>All required classes registered.</p>')+
+    return '<p>'+esc(p.name)+'</p><p>'+(nodes.length||outstanding.length?
+        nodes.length+' node classes and '+outstanding.length+' model files need attention on this instance.':
+        'All required dependencies are available on this instance.')+'</p><h3>Custom nodes</h3>'+
+        (nodes.length?'<ul>'+nodes.map(node=>'<li>'+esc(node)+'</li>').join('')+'</ul>':'<p>All required classes registered.</p>')+
         '<h3>Model files</h3>'+space+'<table><thead><tr><th>File</th><th>Status</th><th>Verified source</th></tr></thead><tbody>'+
-        report.models.map(m=>'<tr><td>'+esc(m.name)+'</td><td>'+esc(m.status)+(m.error?' · '+esc(m.error):'')+'</td><td>'+
-            (m.source?esc(m.source.repo)+' @ '+esc(m.source.revision.slice(0,12)):'—')+'</td></tr>').join('')+'</tbody></table>';
+        report.models.map(m=>'<tr><td>'+esc(m.name||'Unknown file')+'</td><td>'+esc(m.status||'Pending')+(m.error?' · '+esc(m.error):'')+'</td><td>'+
+            (m.source?.repo?esc(m.source.repo)+(m.source.revision?' @ '+esc(String(m.source.revision).slice(0,12)):''):'—')+'</td></tr>').join('')+'</tbody></table>';
 }
 
 function installationView(){
-    const data=workflowLive?.data,i=data?.installation;
+    const data=workflowStatus(),i=data?.installation;
     if(!i?.status)return '<p>No installation started.</p>';
-    const terminal=['ready','needs attention','failed','cancelled','timed out'].includes(i.status);
+    const terminal=terminalWorkflowStates.includes(i.status);
+    const scan=i.mode==='scan';
+    const scanDone=scan&&['ready','needs attention'].includes(i.status);
+    const label=scanDone?(i.status==='ready'?'Dependency scan complete':'Dependency scan complete · items missing'):
+        (scan?'Dependency scan · ':'Installation · ')+i.status;
+    const profile=workflowCatalog.profiles.find(item=>item.version===i.version);
     const cost=i.rate!=null?' · '+moneyLabel(i.elapsed/3600*i.rate)+' estimated':'';
-    return '<p role="status">'+esc(i.status)+' · '+timeLabel(i.elapsed)+cost+(i.exitCode!=null?' · Installer exit '+i.exitCode:'')+(i.bashExitCode!=null?' · Bash exit '+i.bashExitCode:'')+'</p>'+
+    return (profile?'<p>'+esc(profile.name)+'</p>':'')+
+        '<p role="status">'+esc(label)+' · '+timeLabel(i.elapsed)+cost+(!scanDone&&i.exitCode!=null?' · '+(scan?'Scan exit ':'Installer exit ')+i.exitCode:'')+(i.bashExitCode!=null?' · Bash exit '+i.bashExitCode:'')+'</p>'+
+        (scanDone?'<p>Open Dependencies for the results, or choose Start Installation.</p>':'')+
         '<p>'+esc(i.message||'')+'</p>'+
-        (!terminal?'<button data-wm="cancel">Cancel Installation</button>':'')+
+        (!terminal?'<button data-wm="cancel">'+(scan?'Cancel Scan':'Cancel Installation')+'</button>':'')+
         '<table><thead><tr><th>Stage</th><th>Status</th><th>Elapsed</th><th>Progress</th></tr></thead><tbody>'+
-        data.phases.map(name=>{
+        (data.phases||[]).map(name=>{
             const stage=i.stages?.[name]||{},t=(stage.status==='Running'?Date.now()/1000:stage.updated)-stage.started;
-            return '<tr><td>'+esc(name)+'</td><td>'+esc(stage.status||'Pending')+'</td><td>'+timeLabel(Number.isFinite(t)?t:null)+'</td><td>'+
-                (stage.total?'<progress value="'+stage.count+'" max="'+stage.total+'"></progress> '+stage.count+'/'+stage.total:
+            const status=scanDone?(stage.status==='Failed'?'Items missing':stage.status||'Skipped'):stage.status||'Pending';
+            return '<tr><td>'+esc(name)+'</td><td>'+esc(status)+'</td><td>'+timeLabel(t)+'</td><td>'+
+                (stage.total&&Number.isFinite(stage.count)?'<progress value="'+stage.count+'" max="'+stage.total+'"></progress> '+stage.count+'/'+stage.total:
                 stage.status==='Running'?'<progress aria-label="In progress"></progress> ':'')+esc(stage.message||'')+'</td></tr>';
         }).join('')+'</tbody></table>'+
         '<details id="wmTerminalLog" '+(workflowTerminalOpen?'open':'')+'><summary>Live Terminal Logs</summary><pre class="preserve-lines">'+
@@ -117,19 +169,28 @@ function productionMonitorView(){
 async function pollWorkflow(){
     if(!document.querySelector('[data-wm-tab]')||workflowPolling)return;
     workflowPolling=true;
-    const version=editingProfile,tab=workflowTab;
+    const version=selectedWorkflow()?.version??null,tab=workflowTab;
+    const sameView=()=>version===(selectedWorkflow()?.version??null)&&tab===workflowTab&&document.querySelector('[data-wm-tab]');
     try{
         const data=await workflowCall({action:'status',monitor:tab==='Production Monitor'});
-        if(editingProfile!==version||workflowTab!==tab||!document.querySelector('[data-wm-tab]'))return;
+        if(!sameView())return;
         workflowLive={version,data};
         const live=$('#wmLive');
         if(live)live.innerHTML=tab==='Dependencies'?dependencyView():tab==='Installation Monitor'?installationView():productionMonitorView();
-        const field=$('#wmScript');
-        if(field&&workflowSavedFor!==version&&document.activeElement!==field&&!field.value){
-            field.value=data.savedScript;
-            workflowSavedFor=version;
+        const install=document.querySelector('[data-wm="preview"]'),notice=$('#wmActionNote');
+        if(install&&notice){
+            const reason=installReason();
+            install.disabled=Boolean(reason);
+            notice.textContent=reason;
+            notice.hidden=!reason;
         }
-    }catch(error){if($('#wmLive'))$('#wmLive').textContent=error.message}
+        const field=$('#wmScript');
+        if(field&&version&&!workflowDrafts.has(version)&&document.activeElement!==field&&!field.value){
+            field.value=data.savedScript||'';
+        }
+    }catch(error){
+        if(sameView()&&$('#wmLive'))$('#wmLive').textContent='Unable to read this workflow status. '+error.message;
+    }
     finally{workflowPolling=false}
 }
 setInterval(pollWorkflow,2200);
@@ -141,12 +202,17 @@ document.addEventListener('toggle',event=>{
 
 document.addEventListener('change',async event=>{
     const input=event.target;
+    if(input.id==='wmRestart')saveInstallDraft();
     if(input.id!=='wmScriptFile'||!input.files.length)return;
     const file=input.files[0];input.value='';
     try{
         if(file.size>256000)throw Error('Choose a Bash file under 256 KB.');
         $('#wmScript').value=(await file.text()).replace(/^\uFEFF/,'');
+        saveInstallDraft();
     }catch(error){reportError(error)}
+});
+document.addEventListener('input',event=>{
+    if(['wmScript','wmTimeout'].includes(event.target.id))saveInstallDraft();
 });
 
 let pendingInstall=null;
@@ -167,20 +233,27 @@ document.addEventListener('click',async event=>{
             reportStatus('Hugging Face accepted the token. Saved in Windows Credential Manager.');
         }
         if(action==='preview'){
-            if(!currentProfile(editingProfile)?.executable)throw Error('Prepare the original workflow first.');
-            if(state.connection?.state!=='Ready')throw Error('Select and connect a Vast instance first.');
-            const time=$('#wmTimeout');
-            if(!time.checkValidity())throw Error('Choose a timeout from 1 to 180 minutes.');
-            pendingInstall={version:editingProfile,action:'install',confirmed:true,script:$('#wmScript').value,
-                timeout:time.valueAsNumber,instance:state.connection.instance??null,restart:$('#wmRestart').checked};
+            const reason=installReason();
+            if(reason)throw Error(reason);
+            saveInstallDraft();
+            const profile=selectedWorkflow();
+            const data=workflowStatus()||await workflowCall({action:'status'});
+            const draft=storedInstallDraft(data),timeout=Number(draft.timeout);
+            if(!Number.isInteger(timeout)||timeout<1||timeout>180)throw Error('Choose a timeout from 1 to 180 minutes in Setup.');
+            pendingInstall={version:profile.version,action:'install',confirmed:true,script:draft.script,
+                timeout,instance:state.connection.instance??null,restart:draft.restart};
+            const bytes=dependencyReport()?.downloadBytes;
             const dialog=$('#wmConfirm');
-            dialog.innerHTML='<h2>Review remote installation</h2><p>Vast instance '+esc(state.connection.instance||'connected via SSH')+' · '+pendingInstall.timeout+
-                ' minute timeout</p><pre class="preserve-lines">'+esc(pendingInstall.script||'Only install verified missing dependencies.')+
+            dialog.innerHTML='<h2>Review remote installation</h2><p>'+esc(profile.name)+'</p>'+
+                '<p>Vast instance '+esc(state.connection.instance||'connected via SSH')+' · '+timeout+' minute timeout'+
+                (Number.isFinite(bytes)?' · '+(bytes/1e9).toFixed(2)+' GB verified downloads':'')+'</p>'+
+                '<pre class="preserve-lines">'+esc(pendingInstall.script||'Only install verified missing dependencies.')+
                 '</pre><div class="row"><button data-wm="install">Confirm Installation</button><button data-wm="close">Back</button></div>';
             dialog.showModal();
         }
         if(action==='close'){$('#wmConfirm').close();pendingInstall=null}
         if(action==='install'){
+            if(!pendingInstall||pendingInstall.version!==selectedWorkflow()?.version)throw Error('Review the current workflow before installing.');
             await workflowCall(pendingInstall);pendingInstall=null;$('#wmConfirm').close();
             workflowTab='Installation Monitor';render();await pollWorkflow();
         }
@@ -208,5 +281,5 @@ document.addEventListener('click',async event=>{
             state=await(await fetch('/status')).json();await pollWorkflow();
         }
     }catch(error){reportError(error)}
-    finally{if(button.isConnected)button.disabled=false}
+    finally{if(button.isConnected)button.disabled=action==='preview'&&Boolean(installReason())}
 });

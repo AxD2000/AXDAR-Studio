@@ -261,6 +261,29 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertTrue(any("touch" in call.args[1] for call in mock.call_args_list))
         self.assertTrue(all("b"*32 in call.args[1] for call in mock.call_args_list))
 
+    def test_status_treats_unselected_workflow_as_empty(self):
+        manager,version=self.manager()
+        for placeholder in (None,"","undefined","null"):
+            view=manager.status(placeholder)
+            self.assertIsNone(view["selectedVersion"])
+            self.assertIsNone(view["verification"])
+            self.assertEqual(view["savedScript"],"")
+        self.assertEqual(manager.status(version)["selectedVersion"],version)
+
+    def test_failed_install_preserves_last_successful_dependency_scan(self):
+        manager,version=self.manager()
+        report={"nodes":["A missing node"],"models":[]}
+        manager.save_profile(version,instances={"42":{"status":"needs attention","report":report}})
+        manager.record=dict(id="c"*32,version=version,instance="42",status="running",
+                            dispatched=True,started=time.time(),timeout=60)
+        manager.save()
+        terminal={"started":True,"status":"failed","report":{},"exitCode":1,"finished":time.time()}
+        with patch.object(workflow_manager.vast_deploy,"ssh",return_value=json.dumps(terminal).encode()),patch.object(workflow_manager.time,"sleep"):
+            manager.reconcile("c"*32)
+        view=manager.status(version)
+        self.assertEqual(view["installation"]["status"],"failed")
+        self.assertEqual(view["verification"]["report"],report)
+
     def test_install_cancellation_signals_child_process_group(self):
         production.atomic(self.root/"spec.json",{"timeout":60})
         child=Mock(pid=4242)
