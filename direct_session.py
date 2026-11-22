@@ -16,14 +16,57 @@ class DirectSession:
         self.ctx=ctx
         self.path=ctx["DATA"]/"production"/"direct-session.json"
         self.plan=production.read(self.path,{})
+        self.interrupted=False
         if self.plan:
             view=self.plan["view"]
             if view["phase"] in ("Preparing ComfyUI","Rendering","Waiting for connection","Verifying original workflow"):
+                self.interrupted=True
                 view.update(phase="Needs attention",error="Resume to reconcile the saved shot before submitting another.")
             ctx["session"]=view
 
     def save(self):
         production.atomic(self.path,self.plan)
+
+    def archive_for_new_session(self):
+        if self.plan:
+            archive=self.path.parent/"session-history"
+            archive.mkdir(exist_ok=True)
+            production.atomic(archive/(uuid.uuid4().hex+".json"),self.plan)
+            production.atomic(self.path,{})
+        self.plan={}
+        self.interrupted=False
+        self.ctx["session"]={}
+
+    def resume_interrupted(self):
+        with self.ctx["LOCK"]:
+            if not self.interrupted or self.plan.get("control")!="run":
+                return
+            plan=self.plan
+        view=plan["view"]
+        connection=self.ctx["controller"].connection
+        while time.time()<view["end"]-10:
+            with self.ctx["LOCK"]:
+                if self.plan is not plan or self.ctx["running"] or plan.get("control")!="run":
+                    return
+                if not self.ctx["production_busy"]() and not self.ctx["workflow_manager"].busy():
+                    try:
+                        target=connection.target() if plan["instance"] else None
+                    except ValueError:
+                        target=None
+                    if not plan["instance"] or target and identity(target)==plan["instance"]:
+                        try:
+                            workflow=self.ctx["actions"].store.get(plan["version"])
+                        except ValueError:
+                            return
+                        url=connection.snapshot()["url"] if target else plan["url"]
+                        if url:
+                            self.interrupted=False
+                            view["phase"]="Preparing ComfyUI"
+                            view.pop("error",None)
+                            self.save()
+                            self.ctx["run_direct"](url,workflow,target)
+                            return
+            time.sleep(2)
 
     def start(self, view, jobs, workflow, target, url, retry=False):
         saved=self.plan.get("view",{})
@@ -32,6 +75,7 @@ class DirectSession:
         self.plan=dict(id=uuid.uuid4().hex,view=view,jobs=jobs,version=workflow["version"],index=0,control="run",
                        instance=identity(target) if target else None,url=url if not target else None,
                        retry=retry)
+        self.interrupted=False
         view.update(rate=(target or {}).get("rate"),started=time.time())
         self.ctx["session"]=view
         self.save()
@@ -69,6 +113,7 @@ class DirectSession:
         view.pop("finished",None)
         self.plan.pop("validated",None)
         self.plan["control"]="run"
+        self.interrupted=False
         self.save()
         ctx["run_direct"](connection.snapshot().get("url") if target else self.plan["url"],wf,target)
         return {"ok":True}

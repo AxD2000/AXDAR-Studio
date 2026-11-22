@@ -691,3 +691,13 @@ class Controller:
             self.view=dict(status="reconnecting",episode=spec["episode"])
             self.watch(spec,False)
 
+    def archive_for_new_session(self):
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                raise ValueError("Pause the active production before opening a new session.")
+            spec=prod.read(self.ptr,{})
+            if spec and not spec.get("abandoned"):
+                spec["abandoned"]=True
+                self.save_run(spec)
+            self.view={}
+

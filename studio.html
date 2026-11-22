@@ -134,7 +134,10 @@ document.addEventListener('click',async e=>{
     state=await(await fetch('/status')).json();
     if(!migrationNeeded()&&!ep){await projectAction('/project/episode',{title:'New episode'});ep=db.episodes.at(-1)}
     if(!migrationNeeded())await loadWorkflows();
+    await chooseWorkspaceSession();
+    state=await(await fetch('/status')).json();
     render();
+    rememberWorkspace();
     setInterval(async()=>{
         try{
             const next=await(await fetch('/status')).json(),changed=JSON.stringify(state)!==JSON.stringify(next);

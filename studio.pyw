@@ -161,12 +161,21 @@ def production_busy():
         "checking ComfyUI and requirements","running")
 
 
+workspace_started=threading.Event()
+
+
 def discover_vast():
+    workspace_started.wait()
     while True:
-        if controller.connection.snapshot()["state"] not in ("Ready","Connecting","ComfyUI Starting","Reconnecting"):
+        connection=controller.connection
+        view=connection.snapshot()
+        if view.get("auto",True) and view["state"] not in ("Ready","Connecting","ComfyUI Starting","Reconnecting"):
             with LOCK:
                 if not running:
-                    controller.connection.refresh(keep_active=production_busy() and controller.connection.thread is not None)
+                    if view.get("ssh"):
+                        connection.reconnect()
+                    else:
+                        connection.refresh(keep_active=production_busy() and connection.thread is not None)
         time.sleep(30)
 
 
@@ -182,6 +191,27 @@ editor=Editor(globals())
 freecut=FreecutBridge(editor)
 workflow_manager=WorkflowManager(globals())
 direct_session=DirectSession(globals())
+
+
+def open_workspace_session(mode):
+    if mode not in ("new","resume"):
+        raise ValueError("Choose a new session or resume the previous one.")
+    with LOCK:
+        if mode=="new":
+            if running:
+                raise ValueError("Pause the current production before opening a new session.")
+            controller.archive_for_new_session()
+            direct_session.archive_for_new_session()
+            controller.connection.reconnect(discover_new=True)
+        elif not workspace_started.is_set():
+            controller.connection.reconnect()
+            controller.reconnect()
+            if direct_session.interrupted:
+                threading.Thread(target=direct_session.resume_interrupted,daemon=True).start()
+        workspace_started.set()
+        workflow_manager.watch()
+        return {"episode":session.get("episode") or controller.current().get("episode")}
+
 
 class Handler(BaseHTTPRequestHandler):
     def send(self, data, mime="application/json", status=200):
@@ -354,6 +384,9 @@ class Handler(BaseHTTPRequestHandler):
             filename = unquote(self.headers.get("X-Filename",""))
             binary = self.path in ("/workflow/import","/workflow/attach") or self.path == "/story/parse" and filename
             obj = {} if binary else json.loads(blob)
+            if self.path=="/workspace-session":
+                if self.headers.get("Host") != f"127.0.0.1:{PORT}": return self.send({},status=403)
+                return self.send(open_workspace_session(obj.get("mode")))
             if self.path=="/workflow-manager":
                 return self.send(workflow_manager.action(obj))
             if self.path=="/direct-production":
@@ -413,6 +446,9 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send(connection.refresh(keep_active=running or production_busy()))
                 if action=="connect": return self.send(connection.connect(obj.get("instance"),obj.get("auto",False)))
                 if action=="connect-ssh": return self.send(connection.connect_ssh(obj.get("ssh"),obj.get("auto",False)))
+                if action=="reconnect":
+                    with LOCK:
+                        return self.send(connection.reconnect())
                 if action=="disconnect": return self.send(connection.disconnect())
                 if action=="command": return self.send({"output":connection.command(obj.get("command"))})
                 raise ValueError("Unknown connection action")
@@ -492,6 +528,5 @@ if __name__=="__main__":
         webbrowser.open(address)
     else:
         webbrowser.open(address)
-        controller.reconnect()
         threading.Thread(target=discover_vast,daemon=True).start()
         server.serve_forever()

@@ -217,10 +217,11 @@ class Connection:
                 if all(self.settings.get(key)==settings.get(key) for key in ("instance","ssh")):
                     return self.snapshot()
                 raise ValueError('Disconnect before selecting a different instance')
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp=self.path.with_suffix('.tmp')
-            tmp.write_text(json.dumps(settings),encoding='utf-8')
-            tmp.replace(self.path)
+            if settings != self.settings or not self.path.is_file():
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp=self.path.with_suffix('.tmp')
+                tmp.write_text(json.dumps(settings),encoding='utf-8')
+                tmp.replace(self.path)
             self.settings=settings
             self.endpoint=None
             self.stop.clear()
@@ -251,8 +252,20 @@ class Connection:
             if thread.is_alive():
                 raise ValueError('Connection is still closing; retry shortly')
         self._cleanup()
+        self.endpoint = None
         self._state('Disconnected')
         self._indicate(api='grey', ssh='grey', comfy='grey', gpu='grey')
+        return self.snapshot()
+
+    def reconnect(self, discover_new=False):
+        with self.lock:
+            saved = self.settings.copy()
+        self.disconnect()
+        auto = saved.get('auto', True)
+        if saved.get('ssh') or saved.get('instance') and not (discover_new and auto):
+            return self._start(saved)
+        if auto:
+            return self.refresh()
         return self.snapshot()
 
     def _remote_port(self, target):

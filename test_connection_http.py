@@ -20,8 +20,8 @@ class HttpTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown();cls.server.server_close();cls.thread.join()
-    def post(self,obj,token=True):
-        request=Request(self.url+'/connection',data=json.dumps(obj).encode() if token else b'',headers={'Content-Type':'application/json','X-Studio':self.g['TOKEN'] if token else 'invalid'})
+    def post(self,obj,token=True,route='/connection'):
+        request=Request(self.url+route,data=json.dumps(obj).encode() if token else b'',headers={'Content-Type':'application/json','X-Studio':self.g['TOKEN'] if token else 'invalid'})
         with urlopen(request) as response:return json.load(response)
     def test_authentication_required(self):
         with self.assertRaises(HTTPError) as error:self.post({'action':'connect'},False)
@@ -52,6 +52,30 @@ class HttpTests(unittest.TestCase):
     def test_unknown_action_rejected(self):
         with self.assertRaises(HTTPError) as error:self.post({'action':'unexpected'})
         self.assertEqual(error.exception.code,400);error.exception.close()
+
+    def test_new_workspace_archives_tracking_and_keeps_the_shared_connection(self):
+        controller=Mock()
+        controller.current.return_value={}
+        direct=Mock(interrupted=False)
+        manager=Mock()
+        with patch.dict(self.g,dict(controller=controller,direct_session=direct,workflow_manager=manager,workspace_started=threading.Event())):
+            self.post({'mode':'new'},route='/workspace-session')
+        controller.archive_for_new_session.assert_called_once_with()
+        direct.archive_for_new_session.assert_called_once_with()
+        controller.connection.reconnect.assert_called_once_with(discover_new=True)
+        manager.watch.assert_called_once_with()
+
+    def test_resume_workspace_reuses_previous_tracking(self):
+        controller=Mock()
+        controller.current.return_value={'episode':'saved-episode'}
+        direct=Mock(interrupted=False)
+        with patch.dict(self.g,dict(controller=controller,direct_session=direct,workflow_manager=Mock(),
+                                    workspace_started=threading.Event(),session={})):
+            self.assertEqual(self.post({'mode':'resume'},route='/workspace-session')['episode'],'saved-episode')
+            self.post({'mode':'resume'},route='/workspace-session')
+        controller.connection.reconnect.assert_called_once_with()
+        controller.reconnect.assert_called_once_with()
+        direct.archive_for_new_session.assert_not_called()
     def test_panel_and_static_script_available(self):
         with urlopen(self.url) as response:html=response.read().decode()
         self.assertIn('/connection-ui.js',html)

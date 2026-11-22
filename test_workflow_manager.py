@@ -334,6 +334,29 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertEqual((production.read(row)["status"],production.read(row)["ticket"]),("cancelled",ticket))
         self.assertEqual(session.plan["index"],0)
 
+    def test_interrupted_session_resumes_with_original_deadline_and_can_be_archived(self):
+        folder=self.root/"production"
+        deadline=time.time()+120
+        existing={"control":"run","view":{"episode":"episode","phase":"Rendering","end":deadline},
+                  "instance":"42","version":"a"*64}
+        production.atomic(folder/"direct-session.json",existing)
+        target={"id":42,"host":"fixture","port":22}
+        connection=SimpleNamespace(target=lambda:target,snapshot=lambda:{"url":"http://tunnel"})
+        workflow={"version":"a"*64}
+        run=Mock()
+        ctx={"DATA":self.root,"LOCK":threading.RLock(),"running":False,"run_direct":run,
+             "production_busy":lambda:False,"controller":SimpleNamespace(connection=connection),
+             "actions":SimpleNamespace(store=SimpleNamespace(get=lambda _:workflow)),
+             "workflow_manager":SimpleNamespace(busy=lambda:False)}
+        direct=direct_session.DirectSession(ctx)
+        direct.resume_interrupted()
+        run.assert_called_once_with("http://tunnel",workflow,target)
+        self.assertEqual(ctx["session"]["end"],deadline)
+        direct.archive_for_new_session()
+        [archived]=(folder/"session-history").glob("*.json")
+        self.assertEqual(production.read(archived)["view"]["episode"],"episode")
+        self.assertEqual(production.read(folder/"direct-session.json"),{})
+
     def test_model_download_resumes_range_and_keeps_partial(self):
         partial=self.root/"weight.part"
         partial.write_bytes(b"123")

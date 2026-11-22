@@ -21,6 +21,27 @@ class ConnectionTests(unittest.TestCase):
         self.discover.return_value[0]['port']=5678
         self.assertEqual(self.c.resolve(12)['port'],5678)
 
+    def test_fresh_session_preserves_manual_ssh_and_saved_auto_setting(self):
+        settings={"ssh":{"host":"ssh1.vast.ai","port":1234},"auto":False}
+        self.c.settings=settings.copy()
+        original=json.dumps(settings,indent=2).encode()
+        self.c.path.write_bytes(original)
+        with patch.object(self.c,"_run"),patch.object(self.c,"refresh") as discover:
+            self.c.reconnect(discover_new=True)
+            self.c.thread.join()
+        self.assertEqual(self.c.path.read_bytes(),original)
+        self.assertEqual(self.c.settings,settings)
+        discover.assert_not_called()
+
+    def test_fresh_automatic_vast_session_discoveries_do_not_use_old_endpoint(self):
+        self.c.settings={"instance":12,"auto":True}
+        self.c.endpoint={"id":12,"host":"ssh1.vast.ai","port":1111}
+        with patch.object(self.c,"refresh") as refresh:
+            self.c.reconnect(discover_new=True)
+        refresh.assert_called_once_with()
+        self.assertIsNone(self.c.endpoint)
+        self.assertTrue(self.c.settings["auto"])
+
     def test_refresh_discovers_newest_running_instance_and_keeps_active_submission(self):
         self.discover.return_value += [
             dict(id=31,host='ssh2.vast.ai',port=22,status='stopped'),

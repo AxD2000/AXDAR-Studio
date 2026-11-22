@@ -8,6 +8,7 @@ function connectionPanel(){
       connectionIndicators(c,['api','ssh','comfy','gpu'])+
       (c.error?'<p class="danger">'+esc(c.error)+'</p>':'')+
       '<div class="row"><button data-connection="refresh">Refresh instances</button>'+
+      '<button data-connection="reconnect">Reconnect from scratch</button>'+
       '<button data-tools="open">Terminal &amp; HF Token</button></div>'+
       '<details '+(c.indicators?.api==='red'?'open':'')+'><summary>Vast API key</summary>'+
       '<label for="vastApiKey">Vast API key</label><input id="vastApiKey" type="password" autocomplete="off" dir="ltr">'+
@@ -52,3 +53,59 @@ function connectionIndicators(c,keys){
 }
 
 document.addEventListener('close',e=>{if(e.target.id==='workflowTools')document.getElementById('hfToken').value=''},true);
+
+const workspaceLayoutKey='axdar.lastWorkspace';
+
+function rememberWorkspace(){
+    if(!ep)return;
+    try{localStorage.setItem(workspaceLayoutKey,JSON.stringify({episode:ep.id,page}))}catch{}
+}
+
+function restoreWorkspace(previous){
+    let saved=null;
+    try{saved=JSON.parse(localStorage.getItem(workspaceLayoutKey))}catch{}
+    ep=db.episodes.find(item=>item.id===(previous.episode||saved?.episode))||ep;
+    if(Number.isInteger(saved?.page)&&saved.page>=0&&saved.page<spaces.length)page=saved.page;
+}
+
+function chooseWorkspaceSession(){
+    const dialog=document.createElement('dialog');
+    dialog.id='workspaceSession';
+    dialog.setAttribute('aria-labelledby','workspaceSessionTitle');
+    dialog.innerHTML='<h2 id="workspaceSessionTitle">Open AXDAR Studio</h2>'+
+        '<p>Start a fresh connection or pick up your previous workspace. Saved keys and automatic connection settings stay available.</p>'+
+        '<p id="workspaceSessionError" class="danger" role="alert" hidden></p>'+
+        '<div class="row"><button class="primary" data-session-mode="new">New session</button>'+
+        '<button data-session-mode="resume" autofocus>Resume previous session</button></div>';
+    document.body.append(dialog);
+    dialog.addEventListener('cancel',event=>event.preventDefault());
+    dialog.showModal();
+    return new Promise(resolve=>{
+        dialog.addEventListener('click',async event=>{
+            const mode=event.target.closest('button[data-session-mode]')?.dataset.sessionMode;
+            if(!mode)return;
+            const buttons=[...dialog.querySelectorAll('button')];
+            buttons.forEach(button=>button.disabled=true);
+            const message=dialog.querySelector('#workspaceSessionError');
+            message.hidden=true;
+            try{
+                const previous=await post('/workspace-session',{mode});
+                if(mode==='resume')restoreWorkspace(previous);
+                dialog.close();
+                dialog.remove();
+                resolve();
+            }catch(error){
+                message.textContent=error.message;
+                message.hidden=false;
+                buttons.forEach(button=>button.disabled=false);
+            }
+        });
+    });
+}
+
+document.addEventListener('change',event=>{
+    if(event.target.id==='episodeMenu')queueMicrotask(rememberWorkspace);
+});
+document.addEventListener('click',event=>{
+    if(event.target.closest('button[data-page],button[data-shot],button[data-open-shot]'))queueMicrotask(rememberWorkspace);
+});
