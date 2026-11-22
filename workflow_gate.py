@@ -1,24 +1,24 @@
-"""Run a ComfyUI UI workflow's captured graph without changing its inputs."""
+"""Verify the first production take of a workflow imported from the ComfyUI editor."""
 import re
 
 import editor_media
 import production
-from workflow_install_remote import scan
-from workflow_profiles import _upstream
 
 
 LORA_MISMATCH = re.compile(r"\blora\b[^\r\n]*(?:invalid for input|size mismatch|incompatible shape|shape mismatch)", re.I)
+LORA_FAILURE = "ComfyUI reported a LoRA weight mismatch during the first shot. Review the LoRA and base model combination."
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def verify_authoring_workflow(ctx, url, deadline, batch, wf):
+def verify_first_shot(ctx, url, deadline, batch, wf, row, retry_failed=False):
+    episode, shot, rules = row
     root=ctx["DATA"]/"production"/"workflow-checks"
     folder=root/batch
     folder.mkdir(parents=True,exist_ok=True)
-    report_path=folder/"verification.json"
+    report_path=folder/"first-shot.json"
     report=production.read(report_path,{})
     if report.get("status")=="passed":
-        return "passed"
+        return "done"
     if report.get("status")=="failed":
         raise ValueError(report["message"])
 
@@ -41,12 +41,15 @@ def verify_authoring_workflow(ctx, url, deadline, batch, wf):
         q=api("/queue")
         if q["queue_running"] or q["queue_pending"]:
             raise ValueError("Wait for the ComfyUI queue to be empty before verifying this workflow.")
-        graph={key:wf["graph"][key] for key in _upstream(wf["graph"],[wf["output"]])}
-        deps=scan(graph,api("/object_info"))
-        missing=[m["name"] for m in deps["models"] if m["status"]!="Installed"]
-        if deps["nodes"] or missing:
-            names=deps["nodes"]+missing
-            raise ValueError("Resolve workflow dependencies before submitting a prompt: "+", ".join(names))
+        # Older Studio builds stored an independent test prompt here. Check that it ended before starting the real shot.
+        legacy=next(iter(sorted((folder/"original").glob("*/job.json"),reverse=True)),None)
+        previous=production.read(legacy,{}) if legacy else {}
+        if previous.get("status") in ("submitting","queued","waiting","uncertain"):
+            ticket=previous.get("ticket") or production.lookup(ctx["json_api"],url,previous.get("marker") or "legacy-no-marker")
+            history=api("/history/"+ticket).get(ticket,{}) if ticket else {}
+            state=history.get("status",{})
+            if state.get("completed") is not True and state.get("status_str")!="error":
+                raise ValueError("The earlier workflow check is unresolved. Check its history on the original ComfyUI server before resuming.")
         report.update(cursor=logs()[-1]["t"],mismatches=0,gap=False)
         production.atomic(report_path,report)
 
@@ -64,33 +67,33 @@ def verify_authoring_workflow(ctx, url, deadline, batch, wf):
         production.atomic(report_path,report)
         return True
 
-    output=str(wf["output"])
-    shot={"id":"original","revision":wf["version"],"seconds":0,"prompt":""}
-    def download(server, dest, history, job):
-        ctx["download_output"](server,dest,history,job)
-        info=editor_media.probe(dest/"video.part")
-        job["playback_seconds"]=info["duration"]
+    def verify_quality(path, job):
+        quality=ctx["technical_qc"](path,job)
+        if quality.get("technical")!="passed":
+            return quality
+        complete_logs=observe()
+        if report["mismatches"]:
+            return dict(quality,technical="failed",reason=LORA_FAILURE)
+        if not complete_logs or report["gap"]:
+            return dict(quality,technical="failed",reason="ComfyUI did not retain a continuous terminal log for this test. Review its terminal before starting the batch.")
+        if job.get("audioRequired") and not quality.get("audioStreams"):
+            return dict(quality,technical="failed",reason="The mapped final MP4 is missing its expected audio.")
+        return quality
 
-    settings=dict(ctx,DATA=root,prepare_shot=lambda *_:wf["graph"],
-                  download_output=download,prompt=lambda *_:"",direct=True)
-    result=production.render(settings,url,deadline,batch,shot,[],{"name":wf["name"],"output":output},
-                             2,observe)
+    settings=dict(ctx,technical_qc=verify_quality)
+    result=production.render(settings,url,deadline,episode,shot,rules,wf,2,observe,retry_failed)
     if result in ("waiting","uncertain","cancelled"):
         return result
-    last=next(iter(sorted((folder/"original").glob("*/job.json"),reverse=True)),None)
-    attempt=production.read(last,{}) if last else {}
-    complete_logs=observe()
+    attempts=(ctx["DATA"]/episode/shot["id"]).glob("*/job.json")
+    attempt=next((record for path in sorted(attempts,reverse=True)
+                  if (record:=production.read(path,{})).get("revision")==shot["revision"]),{})
     message=None
-    if report["mismatches"]:
-        message="ComfyUI reported a LoRA weight mismatch during the original workflow test. Review the LoRA and base model combination."
-    elif result!="done" or attempt.get("quality",{}).get("technical")!="passed":
-        message="Original workflow verification failed. "+(attempt.get("error") or "The mapped MP4 or required media could not be verified.")
-    elif not complete_logs or report["gap"]:
-        message="ComfyUI did not retain a continuous terminal log for this test. Review its terminal before starting the batch."
-    elif attempt.get("audioRequired") and not attempt["quality"].get("audioStreams"):
-        message="The mapped final MP4 is missing its expected audio."
+    if result!="done" or attempt.get("quality",{}).get("technical")!="passed":
+        observe()
+        message=LORA_FAILURE if report["mismatches"] else "First shot verification failed. "+(
+            attempt.get("error") or "The mapped MP4 or required media could not be verified.")
     report.update(status="failed" if message else "passed",message=message,prompt=attempt.get("ticket"))
     production.atomic(report_path,report)
     if message:
         raise ValueError(message)
-    return "passed"
+    return "done"

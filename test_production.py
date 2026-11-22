@@ -255,6 +255,7 @@ class QueueTests(unittest.TestCase):
                 if inner.path.startswith("/history/"):
                     t=inner.path.rsplit("/",1)[1]
                     inner.reply({t:{"status":{"status_str":"success"},"outputs":{"141":{"gifs":[{"filename":"video.mp4","type":"output"}]}}}})
+                elif inner.path.startswith("/object_info/"):inner.reply({})
                 elif inner.path.startswith("/view?"):inner.reply(movie_bytes)
                 else:inner.send_error(404)
             def do_POST(inner):
@@ -321,6 +322,7 @@ class QueueTests(unittest.TestCase):
         for name in [shot["image"],*shot["refs"]]:
             path=self.dir/(name+".source");path.write_bytes(b"x");ctx["files"][name]=path
         ctx["upload"]=lambda url,f,name:f.name
+        ctx["json_api"]=lambda *_:{}
         graph=ctx["prepare_shot"]("",self.dir,self.eid,shot,wf,dict(prompt=ctx["prompt"](shot,[])))
         refs=graph[wf["reference"]]["inputs"]
         self.assertEqual(graph[refs["ref_audios.ref_audio_0"][0]]["inputs"]["audio"],"tom.mp3")

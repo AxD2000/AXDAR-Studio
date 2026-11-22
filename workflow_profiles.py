@@ -7,6 +7,8 @@ import re
 import uuid
 from pathlib import Path
 
+from provision import MODEL_SUFFIXES, model_choice
+
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -484,7 +486,22 @@ def validate_shot(wf, shot, images, voices):
     return issues
 
 
-def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix):
+def _resolve_model_choices(nodes, model_info):
+    contracts = {}
+    for node in nodes:
+        kind = node["class_type"]
+        inputs = node["inputs"]
+        for key, value in inputs.items():
+            if not isinstance(value, str) or not value.lower().endswith(MODEL_SUFFIXES) or not any(c in value for c in "/\\"):
+                continue
+            if kind not in contracts:
+                contracts[kind] = _contract(model_info(kind), kind)
+            options = contracts[kind].get(key, {}).get("options")
+            if options and (registered := model_choice(value, options)) is not None:
+                inputs[key] = registered
+
+
+def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, model_info=None):
     """Build only the selected output's graph. Imported graphs and reference samples stay immutable."""
     errors = validate_shot(wf,shot,images,voices)
     if not str(positive_prompt or "").strip():
@@ -494,6 +511,7 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix):
     graph = copy.deepcopy(wf["graph"])
     fields = {f["id"]:f for f in wf["fields"]}
     m = wf["mapping"]
+    output = m["output"]
     next_id = max((int(i) for i in graph if i.isdigit()), default=0)+1
     def set_field(field_id, value):
         f = fields[field_id]
@@ -517,6 +535,8 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix):
         set_field(m["duration"],int(value) if fields[m["duration"]]["type"]=="INT" else value)
     if m.get("frames"):
         set_field(m["frames"],timing(wf,shot["seconds"])["frames"])
+    if model_info:
+        _resolve_model_choices((graph[key] for key in _upstream(graph, [output])), model_info)
     for role,assets in (("images",list(images)),("audio",list(voices))):
         group,stem,kind,slot,_ = _H3_GROUPS[role]
         selected = [fields[key] for key in m[role]]
@@ -540,7 +560,6 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix):
             else:
                 for dest,key in field["consumers"]:
                     graph[dest]["inputs"].pop(key,None)
-    output = m["output"]
     if "filename_prefix" in graph[output]["inputs"]:
         graph[output]["inputs"]["filename_prefix"] = prefix
     keep = _upstream(graph,[output])

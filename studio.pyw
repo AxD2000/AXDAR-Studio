@@ -1,7 +1,7 @@
 from pathlib import Path
 import copy, json, mimetypes, os, re, secrets, shutil, socket, threading, time, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlencode, urlsplit, unquote, parse_qs
+from urllib.parse import urlencode, urlsplit, unquote, parse_qs, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -146,7 +146,8 @@ def prepare_shot(url, folder, eid, s, wf, record):
         shutil.copy2(files[name], folder/name)
     return workflow_profiles.runtime_graph(wf, s, record["prompt"], images, voices,
         lambda name: upload(url, folder/name, uuid.uuid4().hex + Path(name).suffix),
-        "AXDAR/" + eid + "/" + s["id"] + "/" + folder.name)
+        "AXDAR/" + eid + "/" + s["id"] + "/" + folder.name,
+        model_info=lambda kind: json_api(url, "/object_info/" + quote(kind, safe="")))
 
 def download_output(url,folder,h,record):
     outputs=h.get("outputs",{}).get(str(record["output_node"]),{})

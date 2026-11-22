@@ -16,7 +16,6 @@ import provision
 
 PHASES = ("Vast connection","Workflow analysis","Custom node scan","Custom node installation",
           "Model verification","ComfyUI restart","Final validation")
-WEIGHTS = (".safetensors",".gguf",".ckpt",".pt",".pth",".bin",".onnx",".sft")
 
 
 def redact(text, token=""):
@@ -37,14 +36,14 @@ def scan(graph, info, exists=None):
         kind = node["class_type"]
         schema = info.get(kind,{}).get("input",{})
         for field, value in node["inputs"].items():
-            if not isinstance(value,str) or not value.lower().endswith(WEIGHTS):
+            if not isinstance(value,str) or not value.lower().endswith(provision.MODEL_SUFFIXES):
                 continue
-            name = value.replace("\\","/")
+            name = provision.model_path(value)
             source = verified.get(name)
             spec = schema.get("required",{}).get(field) or schema.get("optional",{}).get(field)
             options = spec[0] if spec and isinstance(spec[0],list) else (
                 spec[1].get("options") if spec and len(spec)>1 and isinstance(spec[1],dict) else None)
-            listed = isinstance(options,list) and name in {str(item).replace("\\","/") for item in options}
+            listed = isinstance(options,list) and provision.model_choice(value, options) is not None
             on_disk = exists(name) if exists else False
             if listed or on_disk and options is None and kind in info:
                 status = "Installed"

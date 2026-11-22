@@ -11,6 +11,8 @@ import re
 
 from production import digest
 
+
+MODEL_SUFFIXES = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".onnx", ".sft")
 SAGE_REVISION = "eb615cf6cf4d221338033340ee2de1c37fbdba4a"
 SAGE_CHECK = """import torch
 from sageattention import sageattn
@@ -20,6 +22,18 @@ if torch.cuda.get_device_capability() == (12, 0):
     from sageattention.core import sm89_compile
     assert hasattr(sm89_compile, 'qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf')
 """
+
+
+def model_path(name):
+    return re.sub(r"[\\/]+", "/", name)
+
+
+def model_choice(name, options):
+    if name in options:
+        return name
+    path = model_path(name)
+    matches = [option for option in options if isinstance(option, str) and model_path(option) == path]
+    return matches[0] if len(matches) == 1 else None
 
 
 def comfy_python():

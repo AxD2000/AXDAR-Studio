@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 
 import direct_session
 from test_production import movie
-from workflow_gate import verify_authoring_workflow
+from workflow_gate import verify_first_shot
 import editor_media
 import production
 import provision
@@ -170,15 +170,15 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertEqual(store.original(converted),original)
         operation.assert_called_once_with({"action":"scan","version":converted})
 
-    def test_original_gate_detects_lora_error_even_with_successful_mp4(self):
+    def test_first_shot_gate_detects_lora_error_even_with_successful_mp4(self):
         graph={"1":node("DocumentedFixture"),"141":node("VHS_VideoCombine",audio=["1",0],images=["1",0])}
-        wf=dict(version="f"*64,name="Fixture",output="141",graph=graph)
+        wf=dict(name="Fixture",output="141",graph=graph)
+        shot=dict(id="shot-one",revision="approved",seconds=2,prompt="Shot prompt")
         for mismatch in (True,False):
             sent=[]
             rows=[{"t":"2026-11-22T10:01:00","m":"Old unrelated ERROR lora incompatible shape\n"}]
             def api(_url,path,obj=None):
                 if path=="/queue":return {"queue_running":[],"queue_pending":[]}
-                if path=="/object_info":return {"DocumentedFixture":{},"VHS_VideoCombine":{}}
                 if path=="/internal/logs/raw":return {"entries":list(rows)}
                 if path=="/prompt":
                     sent.append(obj["prompt"])
@@ -191,21 +191,25 @@ class WorkflowManagerTests(unittest.TestCase):
             def download(_url,dest,history,job):
                 self.assertEqual(job["output_node"],"141")
                 (dest/"video.part").write_bytes(movie(2))
-            ctx=dict(DATA=self.root,json_api=api,download_output=download,
-                     technical_qc=lambda *_:{"technical":"passed","audioStreams":1})
+            ctx=dict(DATA=self.root,json_api=api,download_output=download,prepare_shot=lambda *_:graph,
+                     prompt=lambda s,_:s["prompt"],technical_qc=lambda *_:{"technical":"passed","audioStreams":1})
             batch=uuid.uuid4().hex
-            with patch("workflow_gate.editor_media.probe",return_value={"duration":2}),patch("workflow_gate.editor_media.tool"):
+            row=[batch,shot,[]]
+            with patch("workflow_gate.editor_media.tool"):
                 if mismatch:
                     with self.assertRaisesRegex(ValueError,"LoRA weight mismatch"):
-                        verify_authoring_workflow(ctx,"http://fixture",time.time()+60,batch,wf)
+                        verify_first_shot(ctx,"http://fixture",time.time()+60,batch,wf,row)
                     with self.assertRaisesRegex(ValueError,"LoRA weight mismatch"):
-                        verify_authoring_workflow(ctx,"http://fixture",time.time()+60,batch,wf)
+                        verify_first_shot(ctx,"http://fixture",time.time()+60,batch,wf,row)
                 else:
-                    self.assertEqual(verify_authoring_workflow(ctx,"http://fixture",time.time()+60,batch,wf),"passed")
+                    self.assertEqual(verify_first_shot(ctx,"http://fixture",time.time()+60,batch,wf,row),"done")
+            [attempt]=(self.root/batch/shot["id"]).glob("*/job.json")
+            self.assertEqual(production.read(attempt)["status"],"error" if mismatch else "done")
+            self.assertEqual((attempt.parent/"video.mp4").is_file(),not mismatch)
             self.assertEqual(sent,[graph])
             self.assertEqual(wf["graph"],graph)
 
-    def test_direct_batch_waits_for_original_ui_workflow_verification(self):
+    def test_direct_batch_waits_for_first_shot_workflow_verification(self):
         eid=str(uuid.uuid4())
         jobs=[[eid,dict(id=str(uuid.uuid4()),revision="approved",seconds=2,prompt="Original"),[]]]
         ctx={"DATA":self.root,"LOCK":threading.RLock(),"json_api":Mock(),"prepare_shot":Mock(),
@@ -214,10 +218,82 @@ class WorkflowManagerTests(unittest.TestCase):
         view=dict(end=time.time()+60,episode=eid,submitted=1,phase="Preparing ComfyUI",completed=0,failed=0)
         session=direct_session.DirectSession(ctx)
         session.start(view,jobs,wf,None,"http://fixture")
-        with patch.object(direct_session,"verify_authoring_workflow",side_effect=ValueError("LoRA mismatch")), patch.object(production,"render") as batch:
+        session.plan["validated"]=True
+        with patch.object(direct_session,"verify_first_shot",side_effect=ValueError("LoRA mismatch")), patch.object(production,"render") as batch:
             session.run("http://fixture",wf)
         batch.assert_not_called()
         self.assertEqual((view["phase"],view["error"],session.plan["index"]),("Needs attention","LoRA mismatch",0))
+
+    def test_ui_batch_submits_each_shots_prompt_and_only_its_references(self):
+        graph=dict(self.graph)
+        graph["56"]=node("MiniMaxH3ReferenceToVideo",length=124,prompt=["84",0],vae=["65",0],
+                         **{"ref_images.ref_image_3":["169",0]})
+        graph["65"]=node("VAELoader",vae_name=r"Minimax\minimax_h3_video_vae_fp16.safetensors")
+        graph["84"]=node("PrimitiveStringMultiline",value="Template text")
+        graph["169"]=node("LoadImage",image="template-only.png")
+        linux_vae="Minimax/minimax_h3_video_vae_fp16.safetensors"
+        wf=workflow_profiles.inspect_workflow("H3 fixture",graph)
+        wf["format"]="ComfyUI UI JSON"
+        self.assertEqual(wf["mapping"]["positive"],"84.value")
+        self.assertFalse(wf["issues"])
+        eid=uuid.uuid4().hex
+        jobs=[[eid, dict(id="one",revision="approved",seconds=2,frozenPrompt="Tom and Jack talk.",
+                        image="Tom.png",refs=["Jack.png","Tom.wav","Jack.wav"]), []],
+              [eid, dict(id="two",revision="approved",seconds=2,frozenPrompt="Jack walks silently.",
+                        image="Jack.png",refs=[]), []]]
+        ctx=runpy.run_path("studio.pyw")["prepare_shot"].__globals__
+        ctx["DATA"]=self.root
+        ctx["running"]=True
+        ctx["files"]={}
+        for name in ("Tom.png","Jack.png","Tom.wav","Jack.wav"):
+            path=self.root/name
+            path.write_text("fixture",encoding="utf-8")
+            ctx["files"][name]=path
+        uploaded=[]
+        def upload(_url,path,_filename):
+            uploaded.append(path.name)
+            return path.name
+        ctx["upload"]=upload
+        nodes={n["class_type"]:{} for n in graph.values()}
+        nodes.update(LoadAudio={},VAELoader={"input":{"required":{"vae_name":[[linux_vae],{}]}}})
+        prompts=[]
+        def api(_url,path,body=None):
+            if path=="/object_info":return nodes
+            if path=="/object_info/VAELoader":return {"VAELoader":nodes["VAELoader"]}
+            if path=="/queue":return {"queue_running":[],"queue_pending":[]}
+            if path=="/internal/logs/raw":return {"entries":[{"t":"2026-11-23T01:00:00","m":"Fixture log"}]}
+            if path=="/prompt":
+                prompts.append(body["prompt"])
+                return {"prompt_id":str(len(prompts))}
+            if path.startswith("/history/"):
+                ticket=path.rsplit("/",1)[-1]
+                return {ticket:{"status":{"status_str":"success","completed":True},"outputs":{}}}
+            raise AssertionError(path)
+        ctx["json_api"]=api
+        ctx["download_output"]=lambda _url,dest,*_: (dest/"video.part").write_bytes(movie(2))
+        ctx["take_quality"]=SimpleNamespace(check=lambda *_:{"technical":"passed","audioStreams":1})
+        view=dict(end=time.time()+60,episode=eid,submitted=2,phase="Preparing ComfyUI",completed=0,failed=0)
+        session=direct_session.DirectSession(ctx)
+        session.start(view,jobs,wf,None,"http://fixture")
+        previous=self.root/"production"/"workflow-checks"/session.plan["id"]
+        (previous/"original"/"attempt").mkdir(parents=True)
+        production.atomic(previous/"original"/"attempt"/"job.json",{"status":"error"})
+        production.atomic(previous/"verification.json",{"status":"failed","message":"Old template rejected"})
+        with patch("workflow_gate.editor_media.tool"):
+            session.run("http://fixture",wf)
+        self.assertEqual((view["phase"],view["completed"]),("Finished",2),view.get("error"))
+        self.assertEqual([p["84"]["inputs"]["value"] for p in prompts],
+                         ["Tom and Jack talk.","Jack walks silently."])
+        self.assertEqual(uploaded,["Tom.png","Jack.png","Tom.wav","Jack.wav","Jack.png"])
+        for prompt, expected in zip(prompts,(["Tom.png","Jack.png","Tom.wav","Jack.wav"],["Jack.png"]),strict=True):
+            self.assertNotIn("169",prompt)
+            self.assertEqual(prompt["65"]["inputs"]["vae_name"],linux_vae)
+            reference=prompt["56"]["inputs"]
+            actual=[next(iter(prompt[target[0]]["inputs"].values())) for slot,target in reference.items()
+                    if slot.startswith(("ref_images.","ref_audios."))]
+            self.assertEqual(actual,expected)
+        self.assertEqual(wf["graph"]["84"]["inputs"]["value"],"Template text")
+        self.assertEqual(wf["graph"]["65"]["inputs"]["vae_name"],graph["65"]["inputs"]["vae_name"])
 
     def test_unconfirmed_script_and_credentials_in_script_never_reach_ssh(self):
         manager,version=self.manager()
@@ -394,7 +470,8 @@ class WorkflowManagerTests(unittest.TestCase):
         view=dict(end=time.time()+60,episode=eid,submitted=2,phase="Preparing ComfyUI",completed=0,failed=0)
         session=direct_session.DirectSession(ctx)
         session.start(view,jobs,wf,None,"http://fixture")
-        with patch.object(workflow_profiles,"timing",return_value={"playback_seconds":2}):
+        with patch("vast_worker.runtime_requirements",return_value={"graph":wf["graph"]}), \
+             patch.object(workflow_profiles,"timing",return_value={"playback_seconds":2}):
             session.run("http://fixture",wf)
         self.assertEqual(view["phase"],"Stopped")
         self.assertEqual(calls,["/object_info","/prompt",f"/api/jobs/{ticket}/cancel"])

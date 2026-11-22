@@ -38,7 +38,6 @@ def runtime_requirements(ctx,spec,wf):
 def ready(ctx, wf, repair=True):
     configured=os.environ.get("COMFY_PORT","")
     ports=(int(configured),18188,8188) if configured.isdecimal() and 1024<=int(configured)<=65535 else (18188,8188)
-    weights=(".safetensors",".gguf",".ckpt",".pt",".pth",".bin",".onnx",".sft")
     for port in dict.fromkeys(ports):
         url=f"http://127.0.0.1:{port}"
         try:
@@ -57,16 +56,16 @@ def ready(ctx, wf, repair=True):
             missing.append(kind)
             # A freshly installed custom node cannot enumerate its model choices yet.
             models.update(value for value in node["inputs"].values()
-                          if isinstance(value, str) and value.lower().endswith(weights))
+                          if isinstance(value, str) and value.lower().endswith(provision.MODEL_SUFFIXES))
             continue
         schema=nodes[kind].get("input",{})
         for key,value in node["inputs"].items():
-            if not isinstance(value,str) or not value.lower().endswith(weights):
+            if not isinstance(value,str) or not value.lower().endswith(provision.MODEL_SUFFIXES):
                 continue
             field=schema.get("required",{}).get(key) or schema.get("optional",{}).get(key)
             if field:
                 choices=field[0] if isinstance(field[0],list) else (field[1].get("options") if len(field)>1 else None)
-                if isinstance(choices,list) and value.replace("\\","/") not in [str(c).replace("\\","/") for c in choices]:
+                if isinstance(choices,list) and provision.model_choice(value, choices) is None:
                     models.add(value)
     sage_required = any(node["class_type"] == "MiniMaxH3MemoryEfficientSageAttentionPatch"
                         for node in wf["graph"].values())

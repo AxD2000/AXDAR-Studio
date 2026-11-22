@@ -8,7 +8,7 @@ import production
 import vast_deploy
 from vast_connection import identity
 from workflow_install_remote import redact, scan
-from workflow_gate import verify_authoring_workflow
+from workflow_gate import verify_first_shot
 
 
 class DirectSession:
@@ -19,7 +19,7 @@ class DirectSession:
         self.interrupted=False
         if self.plan:
             view=self.plan["view"]
-            if view["phase"] in ("Preparing ComfyUI","Rendering","Waiting for connection","Verifying original workflow"):
+            if view["phase"] in ("Preparing ComfyUI","Rendering","Waiting for connection","Verifying original workflow","Verifying first shot"):
                 self.interrupted=True
                 view.update(phase="Needs attention",error="Resume to reconcile the saved shot before submitting another.")
             ctx["session"]=view
@@ -165,7 +165,7 @@ class DirectSession:
         def on_current(fn):
             def call(_old_url,*args):
                 current=self.target_url(deadline,target,url)
-                view["phase"]="Verifying original workflow" if self.plan.get("verifying") else "Rendering"
+                view["phase"]="Verifying first shot" if self.plan.get("verifying") else "Rendering"
                 return fn(current,*args)
             return call
         render_ctx["json_api"]=on_current(ctx["json_api"])
@@ -192,22 +192,6 @@ class DirectSession:
         render_ctx["cancel_prompt"]=cancel_prompt
         try:
             jobs=self.plan["jobs"]
-            if wf.get("format")=="ComfyUI UI JSON" and self.plan["index"]==0 and not self.plan.get("sampleVerified"):
-                self.plan.setdefault("id",uuid.uuid4().hex)
-                view["phase"]="Verifying original workflow"
-                self.plan["verifying"]=True
-                self.save()
-                try:
-                    result=verify_authoring_workflow(render_ctx,url,deadline,self.plan["id"],wf)
-                finally:
-                    self.plan.pop("verifying",None)
-                if result=="cancelled":
-                    view["phase"]="Stopped"
-                    return
-                if result!="passed":
-                    raise RuntimeError("The original verification prompt is unresolved. Resume to check the same prompt.")
-                self.plan["sampleVerified"]=True
-                self.save()
             # An already-submitted attempt must be reconciled before dependency
             # validation. Reconnecting only changes the tunnel, not its owner.
             for i in range(self.plan["index"],len(jobs)):
@@ -233,14 +217,26 @@ class DirectSession:
                     if target:
                         vast_deploy.prepare_direct(render_ctx,target,jobs[i:],wf,lambda:deadline-time.time(),repair=False)
                     else:
-                        info=ctx["json_api"](url,"/object_info")
-                        from workflow_profiles import _upstream
-                        graph={k:wf["graph"][k] for k in _upstream(wf["graph"],[wf["output"]])}
+                        from vast_worker import runtime_requirements
+                        info=render_ctx["json_api"](url,"/object_info")
+                        graph=runtime_requirements(ctx,{"jobs":jobs[i:]},wf)["graph"]
                         dependencies=scan(graph,info)
                         if dependencies["nodes"] or any(m["status"]!="Installed" for m in dependencies["models"]):
                             raise ValueError("Resolve the missing workflow dependencies before production.")
                     self.plan["validated"]=True
-                result=production.render(render_ctx,url,deadline,eid,shot,rules,wf,2,lambda:None,self.plan["retry"])
+                if wf.get("format")=="ComfyUI UI JSON" and i==0 and not self.plan.get("sampleVerified"):
+                    self.plan.setdefault("id",uuid.uuid4().hex)
+                    self.plan["verifying"]=True
+                    view["phase"]="Verifying first shot"
+                    self.save()
+                    try:
+                        result=verify_first_shot(render_ctx,url,deadline,self.plan["id"],wf,jobs[i],self.plan["retry"])
+                    finally:
+                        self.plan.pop("verifying",None)
+                    if result=="done":
+                        self.plan["sampleVerified"]=True
+                else:
+                    result=production.render(render_ctx,url,deadline,eid,shot,rules,wf,2,lambda:None,self.plan["retry"])
                 if result in ("waiting","uncertain"):
                     raise RuntimeError("The original prompt is unresolved. Resume on the same instance to reconcile it.")
                 if result=="cancelled":
