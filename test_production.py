@@ -81,6 +81,16 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(p.render(ctx,"http://new-tunnel",self.spec["end"],*args),"done")
         self.assertEqual(len(self.requests),1)
 
+    def test_direct_upgrade_reconciles_legacy_numeric_instance_id(self):
+        eid,shot,rules=self.jobs(1)[0]
+        prior=dict(self.ctx,direct=True,instance=12)
+        args=(eid,shot,rules,self.workflow,0,lambda:None)
+        self.network=1
+        self.assertEqual(p.render(prior,"http://old-tunnel",self.spec["end"],*args),"waiting")
+        updated=dict(prior,instance="12")
+        self.assertEqual(p.render(updated,"http://new-tunnel",self.spec["end"],*args),"done")
+        self.assertEqual(len(self.requests),1)
+
     def test_atomic_retries_when_windows_reader_holds_destination(self):
         error=PermissionError("sharing violation")
         error.winerror=32

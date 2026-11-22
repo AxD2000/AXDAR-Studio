@@ -136,7 +136,7 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
                 inspect_take(folder/"video.mp4", j)
             return "done"
         if j["status"] in ("queued","waiting","submitting","uncertain") or j.get("ticket") and j["status"]!="error":
-            same_target = j["instance"] == ctx.get("instance") if j.get("instance") else j.get("url") == url
+            same_target = str(j["instance"]) == str(ctx.get("instance")) if j.get("instance") else j.get("url") == url
             if not same_target:
                 raise Uncertain("Prior submission belongs to another server; reconcile it before generating again.")
             break
