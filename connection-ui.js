@@ -1,12 +1,12 @@
 function connectionPanel(){
     const c=state.connection||{};
-    const details=c.instance&&!['Waiting for Vast','Unavailable'].includes(c.state)?
+    const details=c.instance&&!['Vast starting','Waiting for Vast','Unavailable'].includes(c.state)?
       ' · Instance #'+esc(c.instance)+(c.gpu?' · '+esc(c.gpu):''):'';
     return '<section class="panel" aria-labelledby="vastConnectionTitle">'+
       '<h2 id="vastConnectionTitle">Vast connection</h2>'+
       '<p role="status">'+esc(c.state||'Looking for an instance')+details+'</p>'+
       connectionIndicators(c,['api','ssh','comfy','gpu'])+
-      (c.error?'<p class="danger">'+esc(c.error)+'</p>':'')+
+      (c.error?'<p class="'+(c.state==='Vast starting'?'muted':'danger')+'">'+esc(c.error)+'</p>':'')+
       '<div class="row"><button data-connection="refresh">Refresh instances</button>'+
       '<button data-connection="reconnect">Reconnect from scratch</button>'+
       '<button data-tools="open">Terminal &amp; HF Token</button></div>'+

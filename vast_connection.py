@@ -6,6 +6,7 @@ import shlex
 import socket
 import subprocess
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import urlopen
@@ -191,7 +192,12 @@ class Connection:
                 continue
         if not candidates:
             if self.state != 'Ready':
-                self._state('Waiting for Vast', 'No running Vast instance with an SSH endpoint.')
+                starting = [row for row in rows if row.get('status') in ('loading', 'creating', 'created', 'starting')]
+                if starting:
+                    newest = max(starting, key=lambda row: int(row['id']))
+                    self._state('Vast starting', f"Instance #{newest['id']} is starting on Vast. Waiting for SSH and ComfyUI.")
+                else:
+                    self._state('Waiting for Vast', 'No running Vast instance with an SSH endpoint.')
             return self.snapshot()
         target = max(candidates, key=lambda row: int(row['id']))
         if self.thread and self.thread.is_alive():
@@ -308,11 +314,16 @@ class Connection:
         if not result:
             self._state('ComfyUI Starting')
             # Reuse the existing supervisor service, only if its stopped state is verified.
-            self.remote(target, 's=$(supervisorctl status comfyui 2>/dev/null); '
-                        'case "$s" in *" STOPPED "*) supervisorctl start comfyui;; esac', timeout=12)
-            if self.stop.wait(2):
-                raise ValueError('Connection cancelled')
-            result = self.remote(target, command, timeout=12).strip()
+            service = self.remote(target, 's=$(supervisorctl status comfyui 2>/dev/null); '
+                'case "$s" in *" STOPPED "*) supervisorctl start comfyui >/dev/null && printf pending;; '
+                '*" RUNNING "*|*" STARTING "*) printf pending;; esac', timeout=12).strip()
+            deadline = time.monotonic() + 60
+            while True:
+                if self.stop.wait(2):
+                    raise ValueError('Connection cancelled')
+                result = self.remote(target, command, timeout=12).strip()
+                if result or service != b'pending' or time.monotonic() >= deadline:
+                    break
         port = int(result or 0)
         if not 1024 <= port <= 65535:
             self._indicate(comfy='red')

@@ -63,6 +63,26 @@ class ConnectionTests(unittest.TestCase):
             trust.assert_called_once_with(target)
             attach.assert_called_once_with(target)
 
+    def test_running_comfyui_service_gets_time_to_expose_its_api(self):
+        self.remote.side_effect=[b'',b'pending',b'',b'',b'18188']
+        with patch.object(self.c.stop,"wait",return_value=False) as wait:
+            self.assertEqual(self.c._remote_port(self.discover.return_value[0]),18188)
+        self.assertEqual(wait.call_count,3)
+        service=self.remote.call_args_list[1].args[1]
+        self.assertIn('RUNNING',service)
+        self.assertIn('STARTING',service)
+
+    def test_discovery_reports_loading_instance_and_connects_when_it_runs(self):
+        self.discover.return_value=[dict(id=23,host='ssh2.vast.ai',port=5678,status='loading')]
+        with patch.object(self.c,"connect") as connect:
+            waiting=self.c.refresh()
+            self.assertEqual(waiting['state'],'Vast starting')
+            self.assertIn('Instance #23',waiting['error'])
+            connect.assert_not_called()
+            self.discover.return_value[0]['status']='running'
+            self.c.refresh()
+            connect.assert_called_once_with(23,auto=True)
+
     def test_changed_host_is_not_replaced(self):
         self.remote.side_effect = OSError("REMOTE HOST IDENTIFICATION HAS CHANGED: Host key verification failed.")
         with patch("vast_ssh_setup.trust_host") as trust, self.assertRaises(OSError):
