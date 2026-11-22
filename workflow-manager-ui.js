@@ -7,6 +7,8 @@ const workflowCall=obj=>post('/workflow-manager',{version:selectedWorkflow()?.ve
 const timeLabel=s=>!Number.isFinite(s)?'—':(s<60?Math.round(s)+' s':Math.floor(s/60)+'m '+Math.round(s%60)+'s');
 const moneyLabel=value=>'$'+Number(value).toFixed(3);
 const workflowStatus=()=>workflowLive?.version===(selectedWorkflow()?.version??null)?workflowLive.data:null;
+const hfTokenStatus=saved=>saved===true?'Token saved in Windows Credential Manager.':
+    saved===false?'No Hugging Face token saved.':'Checking Windows Credential Manager…';
 
 function installReason(){
     const p=selectedWorkflow(),operation=workflowStatus()?.installation;
@@ -44,8 +46,10 @@ function workflowWorkspace(){
         const draft=storedInstallDraft();
         content=workflowPanel()+
         '<section class="panel"><h2>Workflow installation</h2>'+installActions()+'</section>'+
-        '<section class="panel"><h2>Hugging Face</h2><label>Hugging Face Access Token<input id="wmToken" type="password" autocomplete="off" placeholder="hf_…"></label>'+
-        '<div class="row"><button data-wm="showToken" aria-controls="wmToken">Show</button><button data-wm="token">Test Token</button></div></section>'+
+        '<section class="panel"><h2>Hugging Face</h2><p id="wmTokenStatus" role="status">'+hfTokenStatus(workflowStatus()?.hfTokenSaved)+'</p>'+
+        '<label>Hugging Face Access Token<input id="wmToken" type="password" autocomplete="off" placeholder="hf_…"></label>'+
+        '<div class="row"><button data-wm="showToken" aria-controls="wmToken">Show</button><button class="primary" data-wm="save-token">Save Token</button>'+
+        '<button data-wm="token">Test Token</button></div></section>'+
         '<section class="panel"><h2>Custom Installation Commands (Bash)</h2><label>Optional script<textarea id="wmScript" rows="10" spellcheck="false">'+esc(draft.script)+'</textarea></label>'+
         '<label>Import .sh file<input id="wmScriptFile" type="file" accept=".sh,text/x-shellscript"></label>'+
         '<div class="form-pair"><label>Timeout (minutes)<input id="wmTimeout" type="number" min="1" max="180" value="'+esc(draft.timeout)+'" required></label>'+
@@ -178,6 +182,7 @@ async function pollWorkflow(){
         const data=await workflowCall({action:'status',monitor:tab==='Production Monitor'});
         if(!sameView())return;
         workflowLive={version,data};
+        if($('#wmTokenStatus'))$('#wmTokenStatus').textContent=hfTokenStatus(data.hfTokenSaved);
         const live=$('#wmLive');
         if(live)live.innerHTML=tab==='Dependencies'?dependencyView():tab==='Installation Monitor'?installationView():productionMonitorView();
         const install=document.querySelector('[data-wm="preview"]'),notice=$('#wmActionNote');
@@ -231,9 +236,10 @@ document.addEventListener('click',async event=>{
             button.textContent=field.type==='password'?'Show':'Hide';return;
         }
         button.disabled=true;
-        if(action==='token'){
+        if(action==='token'||action==='save-token'){
             const field=$('#wmToken');await workflowCall({action,token:field.value});field.value='';
-            reportStatus('Hugging Face accepted the token. Saved in Windows Credential Manager.');
+            $('#wmTokenStatus').textContent=hfTokenStatus(true);
+            reportStatus(action==='token'?'Hugging Face accepted the saved token.':'Hugging Face token saved.');
         }
         if(action==='preview'){
             const reason=installReason();
@@ -243,21 +249,27 @@ document.addEventListener('click',async event=>{
             const data=workflowStatus()||await workflowCall({action:'status'});
             const draft=storedInstallDraft(data),timeout=Number(draft.timeout);
             if(!Number.isInteger(timeout)||timeout<1||timeout>180)throw Error('Choose a timeout from 1 to 180 minutes in Setup.');
-            pendingInstall={version:profile.version,action:'install',confirmed:true,script:draft.script,
-                timeout,instance:state.connection.instance??null,restart:draft.restart};
+            const preview=await workflowCall({action:'install-preview',script:draft.script});
+            pendingInstall={script:preview.script,request:{version:profile.version,action:'install',confirmed:true,
+                script:draft.script,timeout,instance:state.connection.instance??null,restart:draft.restart}};
             const bytes=dependencyReport()?.downloadBytes;
             const dialog=$('#wmConfirm');
             dialog.innerHTML='<h2>Review remote installation</h2><p>'+esc(profile.name)+'</p>'+
                 '<p>Vast instance '+esc(state.connection.instance||'connected via SSH')+' · '+timeout+' minute timeout'+
                 (Number.isFinite(bytes)?' · '+(bytes/1e9).toFixed(2)+' GB verified downloads':'')+'</p>'+
-                '<pre class="preserve-lines">'+esc(pendingInstall.script||'Only install verified missing dependencies.')+
+                (preview.willSaveHfToken?'<p>Confirmation saves the supplied Hugging Face token in Windows Credential Manager.</p>':
+                    preview.hfTokenSaved?'<p>This installation uses the saved Hugging Face token.</p>':'')+
+                '<pre class="preserve-lines">'+esc(preview.script||'Only install verified missing dependencies.')+
                 '</pre><div class="row"><button data-wm="install">Confirm Installation</button><button data-wm="close">Back</button></div>';
             dialog.showModal();
         }
         if(action==='close'){$('#wmConfirm').close();pendingInstall=null}
         if(action==='install'){
-            if(!pendingInstall||pendingInstall.version!==selectedWorkflow()?.version)throw Error('Review the current workflow before installing.');
-            await workflowCall(pendingInstall);pendingInstall=null;$('#wmConfirm').close();
+            if(!pendingInstall||pendingInstall.request.version!==selectedWorkflow()?.version)throw Error('Review the current workflow before installing.');
+            const {request,script}=pendingInstall;
+            await workflowCall(request);
+            workflowDrafts.set(request.version,{script,timeout:request.timeout,restart:request.restart});
+            pendingInstall=null;$('#wmConfirm').close();
             workflowTab='Installation Monitor';render();await pollWorkflow();
         }
         if(action==='scan'||action==='cancel'){

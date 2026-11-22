@@ -224,9 +224,52 @@ class WorkflowManagerTests(unittest.TestCase):
         with patch.object(workflow_manager.vast_deploy,"ssh") as ssh:
             with self.assertRaisesRegex(ValueError,"confirm"):
                 manager.action({"action":"install","version":version,"script":"echo hi"})
-            with self.assertRaisesRegex(ValueError,"environment"):
-                manager.action({"action":"install","version":version,"script":"export HF_TOKEN=hf_secretabcdefgh","confirmed":True})
+            with self.assertRaisesRegex(ValueError,"Save your Hugging Face token"):
+                manager.action({"action":"install","version":version,"script":"echo hf_secretabcdefgh","confirmed":True})
         ssh.assert_not_called()
+
+    def test_install_adopts_a_pasted_hf_assignment_without_persisting_it_in_the_script(self):
+        manager,version=self.manager()
+        fixture="hf_fixtureabcdefghijkl"
+        script=f"export HF_TOKEN='{fixture}'\necho installing\n"
+        stored=[]
+        def vault(value=None):
+            if value:
+                stored.append(value)
+            return stored[-1] if stored else None
+        launched=threading.Event()
+        with patch.object(workflow_manager,"hf_token",side_effect=vault), \
+             patch.object(manager,"launch",side_effect=lambda *_:launched.set()) as launch:
+            preview=manager.action({"action":"install-preview","script":script})
+            self.assertEqual(stored,[])
+            self.assertTrue(preview["willSaveHfToken"])
+            self.assertNotIn(fixture,json.dumps(preview))
+            manager.action({"action":"install","version":version,"script":script,"confirmed":True})
+            self.assertTrue(launched.wait(2))
+            self.assertEqual(stored,[fixture])
+            self.assertEqual(launch.call_args.args[-1],preview["script"])
+            reopened=workflow_manager.WorkflowManager(manager.ctx)
+            self.assertTrue(reopened.status(version)["hfTokenSaved"])
+            self.assertEqual(reopened.profile(version)["script"],'export HF_TOKEN="$HF_TOKEN"\necho installing\n')
+
+    def test_save_and_test_hf_token_reuses_the_persistent_vault(self):
+        manager,version=self.manager()
+        fixture="hf_fixtureabcdefghijkl"
+        stored=[]
+        def vault(value=None):
+            if value:
+                stored.append(value)
+            return stored[-1] if stored else None
+        with patch.object(workflow_manager,"hf_token",side_effect=vault), \
+             patch.object(workflow_manager,"build_opener") as opener:
+            self.assertFalse(manager.status(version)["hfTokenSaved"])
+            self.assertTrue(manager.action({"action":"save-token","token":fixture})["saved"])
+            opener.assert_not_called()
+            opener.return_value.open.return_value.__enter__.return_value.status=200
+            self.assertTrue(manager.action({"action":"token","token":""})["valid"])
+            self.assertEqual(opener.return_value.open.call_args.args[0].headers["Authorization"],"Bearer "+fixture)
+            self.assertEqual(stored,[fixture])
+            self.assertNotIn(fixture,json.dumps(manager.status(version)))
 
     def test_ssh_dispatch_sends_credential_on_stdin_only(self):
         manager,version=self.manager()

@@ -19,10 +19,41 @@ from workflow_profiles import _parse, _upstream, public_profile
 INSTALL_ROOT = vast_deploy.STORE + "/installations"
 TERMINAL = {"ready","needs attention","failed","cancelled","timed out"}
 FILES = ("workflow_install_remote.py","production.py","provision.py","model-lock.json")
+HF_VALUE = r"hf_[A-Za-z0-9]{8,256}"
+HF_ASSIGNMENT = re.compile(
+    rf"^(?P<indent>[ \t]*)(?P<export>export[ \t]+)?"
+    rf"(?P<name>HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HUGGINGFACEHUB_API_TOKEN|HUGGINGFACE_TOKEN|HF_API_TOKEN|HF_ACCESS_TOKEN)="
+    rf"(?P<quote>['\"]?)(?P<token>{HF_VALUE})(?P=quote)(?P<tail>[ \t]*(?:#[^\r\n]*)?)(?=\r?$)",
+    re.M,
+)
 
 
 def identity(target):
     return str(target.get("id") or (str(target["host"])+":"+str(target["port"])))
+
+
+def prepare_install_script(script):
+    if not isinstance(script,str) or len(script)>256000:
+        raise ValueError("The optional Bash script must be under 256 KB.")
+    tokens=set()
+    heredoc=script.find("<<")
+    def replace(match):
+        if heredoc!=-1 and match.start()>heredoc:
+            return match[0]
+        tokens.add(match["token"])
+        export=match["export"] or ""
+        return f'{match["indent"]}{export}{match["name"]}="$HF_TOKEN"{match["tail"]}'
+    cleaned=HF_ASSIGNMENT.sub(replace,script)
+    if redact(cleaned)!=cleaned or len(tokens)>1:
+        raise ValueError("Save your Hugging Face token in Workflow Setup and use $HF_TOKEN wherever the script needs it.")
+    return cleaned,next(iter(tokens),None)
+
+
+def saved_hf_token():
+    try:
+        return bool(hf_token())
+    except Exception:
+        return None
 
 
 class WorkflowManager:
@@ -79,10 +110,17 @@ class WorkflowManager:
 
     def action(self, request):
         mode=request.get("action")
-        if mode=="token":
-            token=request.get("token","").strip()
-            if not re.fullmatch(r"hf_[A-Za-z0-9]{8,256}",token):
+        if mode in ("token","save-token"):
+            supplied=request.get("token","")
+            if not isinstance(supplied,str):
                 raise ValueError("Enter a Hugging Face access token.")
+            supplied=supplied.strip()
+            token=supplied or (hf_token() if mode=="token" else "")
+            if not token or not re.fullmatch(HF_VALUE,token):
+                raise ValueError("Enter a Hugging Face access token.")
+            if mode=="save-token":
+                hf_token(token)
+                return {"saved":True}
             try:
                 with build_opener(ModelRedirect()).open(Request("https://huggingface.co/api/whoami-v2",
                                      headers={"Authorization":"Bearer "+token}),timeout=12) as response:
@@ -92,8 +130,13 @@ class WorkflowManager:
                 raise ValueError(f"Hugging Face token check returned HTTP {exc.code}.") from None
             except OSError:
                 raise ValueError("Could not reach Hugging Face to verify the token.") from None
-            hf_token(token)
-            return {"valid":True}
+            if supplied:
+                hf_token(token)
+            return {"valid":True,"saved":True}
+        if mode=="install-preview":
+            script,token=prepare_install_script(request.get("script",""))
+            saved=saved_hf_token()
+            return {"script":script,"hfTokenSaved":saved,"willSaveHfToken":bool(token and not saved)}
         if mode=="prepare":
             return self.prepare(request.get("version"))
         if mode=="status":
@@ -116,13 +159,9 @@ class WorkflowManager:
             raise ValueError("Prepare the original workflow on the connected ComfyUI instance first.")
         if not wf["output"] or wf["output"] not in wf["graph"]:
             raise ValueError("Map the final MP4 output node first.")
-        script=request.get("script","") if mode=="install" else ""
-        if not isinstance(script,str) or len(script)>256000:
-            raise ValueError("The optional Bash script must be under 256 KB.")
-        if redact(script)!=script:
-            raise ValueError("Use the HF_TOKEN environment variable in Bash instead of inserting a token.")
         if mode=="install" and request.get("confirmed") is not True:
             raise ValueError("Preview and confirm execution on the selected Vast instance.")
+        script,embedded_token=prepare_install_script(request.get("script","")) if mode=="install" else ("",None)
         timeout=int(request.get("timeout",30))
         if not 1<=timeout<=180:
             raise ValueError("Choose an installation timeout of 1–180 minutes.")
@@ -137,6 +176,8 @@ class WorkflowManager:
                 raise ValueError("The selected instance changed. Review the installation again.")
             plan={k:wf["graph"][k] for k in _upstream(wf["graph"],[wf["output"]])}
             if mode=="install":
+                if embedded_token and not saved_hf_token():
+                    hf_token(embedded_token)
                 self.save_profile(version,script=script)
             record=dict(id=uuid.uuid4().hex,version=version,instance=instance,
                              rate=target.get("rate"),status="starting",started=time.time(),mode=mode,
@@ -277,6 +318,7 @@ class WorkflowManager:
                         otherInstallations=sum(key!=target and record.get("status") not in TERMINAL
                                                for key,record in self.records.items()),
                         savedScript=previous.get("script",""),
+                        hfTokenSaved=saved_hf_token(),
                         verification=previous.get("instances",{}).get(target),telemetry=self.telemetry)
 
     def refresh_telemetry(self):
