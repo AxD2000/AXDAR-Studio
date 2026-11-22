@@ -13,6 +13,12 @@ from urllib.request import urlopen
 
 SERVICE = 'AXDAR Studio Vast'
 VAST_IDENTITY = Path.home() / '.ssh' / 'id_axdar_vast'
+SSH_CONNECT_SECONDS = 30
+SSH_CHECK_SECONDS = 45
+
+
+def identity(target):
+    return str(target.get('id') or f"{target['host']}:{target['port']}")
 
 
 def identity_options(target):
@@ -253,17 +259,20 @@ class Connection:
                 pass
 
     def disconnect(self):
-        self.stop.set()
-        thread = self.thread
+        with self.lock:
+            self.stop.set()
+            thread = self.thread
         if thread and thread.is_alive():
-            thread.join(timeout=45)
+            thread.join(timeout=SSH_CHECK_SECONDS + 10)
             if thread.is_alive():
                 raise ValueError('Connection is still closing; retry shortly')
-        self._cleanup()
-        self.endpoint = None
-        self._state('Disconnected')
-        self._indicate(api='grey', ssh='grey', comfy='grey', gpu='grey')
-        return self.snapshot()
+        with self.lock:
+            if self.thread is thread:
+                self._cleanup()
+                self.endpoint = None
+                self._state('Disconnected')
+                self._indicate(api='grey', ssh='grey', comfy='grey', gpu='grey')
+            return self.snapshot()
 
     def reconnect(self, discover_new=False):
         with self.lock:
@@ -276,6 +285,16 @@ class Connection:
             return self.refresh()
         return self.snapshot()
 
+    def retry_saved(self, instance):
+        with self.lock:
+            if self.state != 'Failed' or self.stop.is_set() or self.thread and self.thread.is_alive():
+                return
+            selected = self.settings.get('instance')
+            if self.settings.get('ssh'):
+                selected = identity(self.settings['ssh'])
+            if selected is not None and str(selected) == instance:
+                self._start(self.settings)
+
     def _remote_port(self, target):
         code = ('import urllib.request,json,os\n'
                 'candidate=os.environ.get("COMFY_PORT","")\n'
@@ -287,8 +306,13 @@ class Connection:
                 ' except Exception: pass\n')
         import shlex
         command = 'python3 -c ' + shlex.quote(code)
+        def check_port():
+            if self.stop.is_set():
+                raise ValueError('Connection cancelled')
+            return self.remote(target, command, timeout=SSH_CHECK_SECONDS).strip()
+
         try:
-            result = self.remote(target, command, timeout=12).strip()
+            result = check_port()
         except OSError as exc:
             if not target.get('id'):
                 raise
@@ -297,31 +321,31 @@ class Connection:
             if 'host key verification failed' in message and 'remote host identification has changed' not in message:
                 trust_host(target)
                 try:
-                    result = self.remote(target, command, timeout=12).strip()
+                    result = check_port()
                 except OSError as retry:
                     if 'permission denied (publickey' not in str(retry).lower():
                         raise
                     attach_key(target)
-                    result = self.remote(target, command, timeout=12).strip()
+                    result = check_port()
             elif 'permission denied (publickey' in message:
                 attach_key(target)
-                result = self.remote(target, command, timeout=12).strip()
+                result = check_port()
             else:
                 raise
         with self.lock:
             self.endpoint=target
         self._indicate(ssh='green')
         if not result:
-            self._state('ComfyUI Starting')
+            self._state('ComfyUI Starting', 'SSH is connected. Waiting for ComfyUI to answer /system_stats.')
             # Reuse the existing supervisor service, only if its stopped state is verified.
             service = self.remote(target, 's=$(supervisorctl status comfyui 2>/dev/null); '
                 'case "$s" in *" STOPPED "*) supervisorctl start comfyui >/dev/null && printf pending;; '
-                '*" RUNNING "*|*" STARTING "*) printf pending;; esac', timeout=12).strip()
+                '*" RUNNING "*|*" STARTING "*) printf pending;; esac', timeout=SSH_CHECK_SECONDS).strip()
             deadline = time.monotonic() + 60
             while True:
                 if self.stop.wait(2):
                     raise ValueError('Connection cancelled')
-                result = self.remote(target, command, timeout=12).strip()
+                result = check_port()
                 if result or service != b'pending' or time.monotonic() >= deadline:
                     break
         port = int(result or 0)
@@ -335,7 +359,7 @@ class Connection:
             listener.bind(('127.0.0.1', 0))
             local = listener.getsockname()[1]
         args = ['ssh', '-N', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
-                '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=8',
+                '-o', 'ExitOnForwardFailure=yes', '-o', f'ConnectTimeout={SSH_CONNECT_SECONDS}',
                 '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2',
                 *identity_options(target),
                 '-L', f'127.0.0.1:{local}:127.0.0.1:{port}', '-p', str(target['port']),
@@ -366,43 +390,54 @@ class Connection:
 
     def _run(self):
         try:
-            # Three tunnel lifetimes per explicit Connect, including successful reconnects.
-            for attempt in range(3):
-                if self.stop.is_set():
-                    return
-                self._state('Reconnecting' if attempt else 'Connecting')
+            failures = 0
+            state = 'Connecting'
+            while failures < 3 and not self.stop.is_set():
+                self._state(state, 'Checking the selected Vast endpoint.')
                 stage = 'api'
+                connected = False
                 try:
                     target = self.settings.get('ssh') or self.resolve(self.settings['instance'])
                     stage = 'ssh'
+                    self._state(state, 'Waiting for SSH login.')
                     port = self._remote_port(target)
-                    stage = 'comfy'
                     if self.stop.is_set():
                         return
+                    self._state('ComfyUI Starting', 'Opening the SSH tunnel to ComfyUI.')
                     self._open(target, port)
-                    for _ in range(8):
-                        if self._probe():
-                            break
+                    ready_by = time.monotonic() + SSH_CHECK_SECONDS
+                    while not self._probe():
+                        if not self.process or self.process.poll() is not None:
+                            raise ValueError('SSH tunnel closed before forwarding to ComfyUI.')
+                        if time.monotonic() >= ready_by:
+                            raise ValueError('ComfyUI did not answer /system_stats through the SSH tunnel.')
                         if self.stop.wait(1):
                             return
-                    else:
-                        raise ValueError('SSH tunnel or ComfyUI readiness failed; verify SSH key and trusted host')
                     with self.lock:
                         self.endpoint = target
                         self._state('Ready')
+                    connected = True
                     checks = 0
+                    missed = 0
                     while not self.stop.wait(5):
-                        if not self._probe():
-                            break
+                        if self._probe():
+                            missed = 0
+                            self._state('Ready')
+                        else:
+                            if not self.process or self.process.poll() is not None:
+                                raise ValueError('SSH tunnel ended during the session.')
+                            missed += 1
+                            if missed >= 3:
+                                raise ValueError('ComfyUI did not answer three checks during the session.')
+                            self._state('ComfyUI Starting', 'Checking ComfyUI again on the existing SSH tunnel.')
+                            continue
                         checks += 1
                         if self.settings.get('instance') and checks % 6 == 0:
                             try:
                                 self.resolve(self.settings['instance'])
                             except Exception:
                                 pass  # An API outage does not close a working SSH tunnel.
-                    if self.stop.is_set():
-                        return
-                    raise ValueError('SSH or ComfyUI connection interrupted')
+                    return
                 except Exception as exc:
                     # Do not expose remote output or API response bodies containing credentials.
                     message = connection_error(exc)
@@ -411,7 +446,11 @@ class Connection:
                     self._state('Reconnecting', message)
                 finally:
                     self._cleanup()
-                if attempt < 2 and self.stop.wait(2 ** attempt):
+                    with self.lock:
+                        self.endpoint = None
+                state = 'Reconnecting'
+                failures = 0 if connected else failures + 1
+                if failures < 3 and self.stop.wait(2 ** max(0, failures - 1)):
                     return
             self._state('Failed', self.error)
         finally:
@@ -432,7 +471,7 @@ class Connection:
             command = ('HF_TOKEN=$(cat); export HF_TOKEN; HUGGING_FACE_HUB_TOKEN=$HF_TOKEN; '
                        'export HUGGING_FACE_HUB_TOKEN; timeout 25s bash -lc ' +
                        shlex.quote(text) + ' 2>&1 | head -c 65536')
-            output = self.remote(target, command, timeout=30, data=token.encode()).decode('utf-8', errors='replace')
+            output = self.remote(target, command, timeout=SSH_CONNECT_SECONDS + 30, data=token.encode()).decode('utf-8', errors='replace')
             return output.replace(token, '[REDACTED]') if token else output
         finally:
             self.command_lock.release()

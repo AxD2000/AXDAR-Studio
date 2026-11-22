@@ -108,12 +108,12 @@ def request_instance_stop(target):
 
 
 def ssh(target,command,*,data=None,stream=None,out=None,timeout=70):
-    from vast_connection import identity_options
+    from vast_connection import SSH_CONNECT_SECONDS, identity_options
     host=str(target["host"])
     port=int(target["port"])
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}",host) or not 1<=port<=65535:
         raise ValueError("Invalid SSH host or port")
-    args=["ssh","-T","-o","BatchMode=yes","-o","StrictHostKeyChecking=yes","-o","ConnectTimeout=8",
+    args=["ssh","-T","-o","BatchMode=yes","-o","StrictHostKeyChecking=yes","-o",f"ConnectTimeout={SSH_CONNECT_SECONDS}",
           "-o","ServerAliveInterval=15","-o","ServerAliveCountMax=2",*identity_options(target),"-p",str(port),"root@"+host,command]
     p=subprocess.run(args,input=data,stdin=stream,stdout=out or subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
     if p.returncode:
@@ -616,7 +616,9 @@ class Controller:
             state_checked=False
             while not stop.is_set():
                 try:
-                    if failures or target.get("id") and not state_checked:
+                    if failures and target.get("id"):
+                        target=self.connection.resolve(spec["target"]["id"])
+                    elif target.get("id") and not state_checked:
                         target=self.resolve_target(spec)
                     state,jobs=snapshot(target,spec)
                     state_checked=True
@@ -675,6 +677,8 @@ class Controller:
                 except Exception as e:
                     if stop.is_set():return
                     failures+=1
+                    from vast_connection import identity
+                    self.connection.retry_saved(identity(target))
                     self.view.update(healthy=False,error=str(e)[:600],status="reconnecting")
                     if failures>=6:
                         self.view.update(status="connection lost")

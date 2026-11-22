@@ -11,7 +11,7 @@ from urllib.request import Request, build_opener
 import production
 from provision import ModelRedirect
 import vast_deploy
-from vast_connection import hf_token
+from vast_connection import SSH_CHECK_SECONDS, hf_token, identity
 from workflow_install_remote import PHASES, redact
 from workflow_profiles import _parse, _upstream, public_profile
 
@@ -26,10 +26,6 @@ HF_ASSIGNMENT = re.compile(
     rf"(?P<quote>['\"]?)(?P<token>{HF_VALUE})(?P=quote)(?P<tail>[ \t]*(?:#[^\r\n]*)?)(?=\r?$)",
     re.M,
 )
-
-
-def identity(target):
-    return str(target.get("id") or (str(target["host"])+":"+str(target["port"])))
 
 
 def prepare_install_script(script):
@@ -249,7 +245,7 @@ class WorkflowManager:
                      "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN; export HUGGING_FACE_HUB_TOKEN; "
                      f"umask 077; nohup python3 {folder}/workflow_install_remote.py {folder}"
                      " </dev/null >/dev/null 2>&1 &")
-            vast_deploy.ssh(target,command,data=(token+"\n").encode(),timeout=15)
+            vast_deploy.ssh(target,command,data=(token+"\n").encode(),timeout=SSH_CHECK_SECONDS)
         except Exception:
             if not record.get("dispatched"):
                 self.save(record,status="failed",finished=time.time(),message="Remote setup could not be uploaded over SSH.")
@@ -276,8 +272,8 @@ class WorkflowManager:
                 if identity(target)!=instance:
                     raise ValueError("Select the original instance to reconcile installation.")
                 if record.get("cancel"):
-                    vast_deploy.ssh(target,f"umask 077; touch {folder}/cancel",timeout=10)
-                data=vast_deploy.ssh(target,f"python3 {folder}/workflow_install_remote.py {folder} snapshot",timeout=10)
+                    vast_deploy.ssh(target,f"umask 077; touch {folder}/cancel",timeout=SSH_CHECK_SECONDS)
+                data=vast_deploy.ssh(target,f"python3 {folder}/workflow_install_remote.py {folder} snapshot",timeout=SSH_CHECK_SECONDS)
                 state=json.loads(data)
                 if not state.get("started"):
                     self.save(record,status="reconnecting",message="Remote process is not yet confirmed. It will not be restarted automatically.")
@@ -287,7 +283,8 @@ class WorkflowManager:
                     state.pop("started")
                     state.setdefault("status","running")
                     with self.lock:
-                        self.save(record,message="",**state)
+                        message="Remote installer stopped before recording a result." if state["status"]=="failed" and state.get("exitCode") is None else ""
+                        self.save(record,message=message,**state)
                         if state["status"] in ("ready","needs attention") and state.get("report"):
                             version=record["version"]
                             profiles=self.profile(version).get("instances",{})
@@ -297,6 +294,7 @@ class WorkflowManager:
                 message=("Reconnect the original Vast instance to check this installation."
                          if isinstance(exc,ValueError) else "SSH interrupted. Checking the same remote installation.")
                 self.save(record,status="reconnecting",message=message)
+                self.connection.retry_saved(instance)
             time.sleep(2)
 
     def status(self, version=None, monitor=False):

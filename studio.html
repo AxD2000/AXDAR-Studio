@@ -27,7 +27,7 @@ const statuses={submitting:'Submitting',uncertain:'Check original submission',do
 function results(s){
     return versions(s).map((v,i)=>{
         const playable=v.video||(page===3&&v.preview);
-        return '<div><hr><strong>Take '+(i+1)+' · '+esc(statuses[v.status])+'</strong>'+
+        return '<div><hr><strong>Take '+(i+1)+' · '+esc(v.artifactPending?'Rendered · Waiting for video':statuses[v.status])+'</strong>'+
           (v.error?'<p class="danger">'+esc(localize(v.error))+'</p>':'')+
           (playable?'<video controls preload="metadata" src="'+esc(playable)+'"></video>':'')+
           (page===3?'':(v.video?'<button data-review-retake="'+esc(s.id)+'">Retake shot</button>':'')+takeReview(v))+'</div>';

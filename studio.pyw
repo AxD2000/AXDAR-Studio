@@ -152,8 +152,47 @@ def download_output(url,folder,h,record):
     outputs=h.get("outputs",{}).get(str(record["output_node"]),{})
     video=next((v for group in outputs.values() if isinstance(group,list) for v in group if isinstance(v,dict) and v.get("filename","").lower().endswith(".mp4")),None)
     if not video: raise ValueError("No MP4 returned from the final output node.")
-    query=urlencode({k:video[k] for k in ("filename","subfolder","type") if k in video})
-    with remote(url,"/view?"+query) as src, (folder/"video.part").open("wb") as out: shutil.copyfileobj(src,out)
+    path="/view?"+urlencode({k:video[k] for k in ("filename","subfolder","type") if k in video})
+    part=folder/"video.part"
+    resume=folder/"video.resume.json"
+    previous=production.read(resume,{})
+    tag=previous.get("etag") if previous.get("path")==path else None
+    offset=part.stat().st_size if tag and part.is_file() else 0
+    headers={"Range":f"bytes={offset}-","If-Range":tag} if offset else None
+    try:
+        src=remote(url,path,headers=headers)
+    except ValueError as exc:
+        if not offset or not isinstance(exc.__cause__,HTTPError) or exc.__cause__.code!=416:
+            raise
+        src=remote(url,path)
+
+    expected=None
+    if src.status==206:
+        match=re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",src.headers.get("Content-Range",""))
+        if offset and src.headers.get("ETag")==tag and match:
+            start,end,total=map(int,match.groups())
+            if start==offset and start<=end==total-1:
+                expected=total
+        if expected is None:
+            src.close()
+            src=remote(url,path)
+    with src:
+        if expected is None:
+            if src.status!=200:
+                raise ConnectionError("ComfyUI did not return a complete video or a valid resume range.")
+            offset=0
+            length=src.headers.get("Content-Length","")
+            expected=int(length) if length.isdecimal() else None
+        with part.open("ab" if offset else "wb") as out:
+            tag=src.headers.get("ETag","")
+            if tag.startswith('"'):
+                production.atomic(resume,{"path":path,"etag":tag})
+            else:
+                resume.unlink(missing_ok=True)
+            shutil.copyfileobj(src,out)
+    size=part.stat().st_size
+    if not size or expected is not None and size!=expected:
+        raise ConnectionError("The ComfyUI video download ended before all bytes arrived.")
 
 def production_busy():
     return controller.current().get("status") in (
@@ -171,11 +210,12 @@ def discover_vast():
         view=connection.snapshot()
         if view.get("auto",True) and view["state"] not in ("Ready","Connecting","ComfyUI Starting","Reconnecting"):
             with LOCK:
-                if not running:
+                resuming = direct_session.interrupted and time.time() < direct_session.plan["view"]["end"] - 10
+                if not (running or production_busy() or workflow_manager.busy() or resuming):
                     if view.get("ssh"):
                         connection.reconnect()
                     else:
-                        connection.refresh(keep_active=production_busy() and connection.thread is not None)
+                        connection.refresh()
         time.sleep(30)
 
 
@@ -339,6 +379,7 @@ class Handler(BaseHTTPRequestHandler):
                                    duration=j.get("duration"),
                                    quality=j.get("quality"),renderSeconds=j.get("renderSeconds"),
                                    remote=bool(j.get("remote_run")),video="/video/"+relative if video else "",
+                                   artifactPending=bool(j.get("artifact_pending")),
                                    preview="/take-preview/"+relative if preview and review else ""))
             return self.send(dict(production=controller.current(),running=running,session=session,results=result,workflow=active_workflow["name"] if active_workflow else "Workflow blocked",workflowError=workflow_error,connection=controller.connection.snapshot()))
         p=files.get(route[7:]) if route.startswith("/asset/") else None
@@ -445,7 +486,7 @@ class Handler(BaseHTTPRequestHandler):
                 if action=="instances": return self.send(connection.discover_instances())
                 if action=="refresh":
                     with LOCK:
-                        return self.send(connection.refresh(keep_active=running or production_busy()))
+                        return self.send(connection.refresh(keep_active=running or production_busy() or workflow_manager.busy()))
                 if action=="connect": return self.send(connection.connect(obj.get("instance"),obj.get("auto",False)))
                 if action=="connect-ssh": return self.send(connection.connect_ssh(obj.get("ssh"),obj.get("auto",False)))
                 if action=="reconnect":

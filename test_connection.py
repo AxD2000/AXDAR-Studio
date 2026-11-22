@@ -137,6 +137,7 @@ class ConnectionTests(unittest.TestCase):
         process=Mock();process.poll.return_value=None
         opened=[];observed=[]
         def open_tunnel(target,port):
+            process.poll.return_value=None
             opened.append(target['port']);self.c.process=process;self.c.url='http://127.0.0.1:22222'
         self.c._open=open_tunnel
         self.c._probe=Mock(side_effect=[True,False,True])
@@ -145,6 +146,7 @@ class ConnectionTests(unittest.TestCase):
                 observed.append(self.c.state)
                 if len(observed)==1:
                     self.discover.return_value[0]['port']=5678
+                    process.poll.return_value=1
                 else:self.c.stop.set();return True
             return False
         self.c.stop.wait=wait
@@ -154,12 +156,40 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(self.c.state,'Disconnected')
         self.assertTrue(all('prompt' not in str(call) for call in self.remote.call_args_list))
 
+    def test_one_missed_comfy_check_keeps_the_tunnel_alive(self):
+        process=Mock();process.poll.return_value=None
+        self.c.process=process
+        self.c._open=Mock()
+        self.c._probe=Mock(side_effect=[True,False,True])
+        states=[]
+        def wait(seconds):
+            self.assertEqual(seconds,5)
+            states.append(self.c.state)
+            return len(states)==3
+        self.c.stop.wait=wait
+        self.c._run()
+        self.assertEqual(states,['Ready','ComfyUI Starting','Ready'])
+        self.c._open.assert_called_once()
+        process.terminate.assert_called_once()
+
+    def test_retry_only_restarts_the_saved_instance(self):
+        self.c._state('Failed')
+        with patch.object(self.c,'_start') as start:
+            self.c.retry_saved('13')
+            start.assert_not_called()
+            self.c.retry_saved('12')
+            start.assert_called_once_with(self.c.settings)
+            self.c.stop.set()
+            self.c.retry_saved('12')
+            start.assert_called_once()
+
     def test_tunnel_security_and_local_binding(self):
         with patch('vast_connection.subprocess.Popen') as popen:
             self.c._open(self.discover.return_value[0],8188)
             args=popen.call_args.args[0]
             self.assertIn('StrictHostKeyChecking=yes',args)
             self.assertIn('ExitOnForwardFailure=yes',args)
+            self.assertEqual(args[args.index('ConnectTimeout=30')-1],'-o')
             self.assertRegex(args[args.index('-L')+1],r'^127\.0\.0\.1:\d+:127\.0\.0\.1:8188$')
             self.c._cleanup();popen.return_value.terminate.assert_called_once()
 
@@ -212,6 +242,14 @@ class ConnectionTests(unittest.TestCase):
             vault.return_value.set_password.assert_called_once()
 
 class DiagnosticTests(unittest.TestCase):
+    def test_ssh_sets_thirty_second_login_timeout(self):
+        from vast_deploy import ssh
+        with patch('vast_deploy.subprocess.run',return_value=subprocess.CompletedProcess([],0,b'18188',b'')) as run:
+            self.assertEqual(ssh({'host':'fixture','port':22},'probe',timeout=45),b'18188')
+        args=run.call_args.args[0]
+        self.assertEqual(args[args.index('ConnectTimeout=30')-1],'-o')
+        self.assertEqual(run.call_args.kwargs['timeout'],45)
+
     def test_direct_mapping_and_proxy_fallback(self):
         from vast_deploy import instance_target
         row=dict(id=1,ssh_host='ssh5.vast.ai',ssh_port=123,actual_status='running',public_ipaddr='192.0.2.1',ports={'22/tcp':[{'HostPort':'50860'}]})

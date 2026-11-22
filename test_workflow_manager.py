@@ -302,6 +302,8 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertEqual(reopened.status(version)["installation"]["status"],"cancelled")
         self.assertTrue(any("touch" in call.args[1] for call in mock.call_args_list))
         self.assertTrue(all("b"*32 in call.args[1] for call in mock.call_args_list))
+        self.assertTrue(all(call.kwargs["timeout"]==45 for call in mock.call_args_list))
+        reopened.connection.retry_saved.assert_called_once_with("42")
 
     def test_status_treats_unselected_workflow_as_empty(self):
         manager,version=self.manager()
@@ -423,6 +425,26 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertEqual(production.read(archived)["view"]["episode"],"episode")
         self.assertEqual(production.read(folder/"direct-session.json"),{})
 
+    def test_retry_releases_only_verified_video_on_missing_original_instance(self):
+        path=self.root/"job.json"
+        job={"instance":"42","ticket":"one", "status":"waiting","artifact_pending":True}
+        production.atomic(path,job)
+        partial=self.root/"video.part"
+        partial.write_bytes(b"original partial")
+        history=self.root/"history.json"
+        production.atomic(history,{"status":{"status_str":"success","completed":True}})
+        connection=Mock()
+        ctx={"DATA":self.root,"controller":SimpleNamespace(connection=connection)}
+        session=direct_session.DirectSession(ctx)
+        connection.discover_instances.return_value=[{"id":42,"status":"exited"}]
+        session.release_unavailable_video(path,job,{"id":73})
+        self.assertEqual(production.read(path)["status"],"waiting")
+        connection.discover_instances.return_value=[]
+        session.release_unavailable_video(path,job,{"id":73})
+        self.assertEqual(production.read(path)["status"],"error")
+        self.assertEqual(partial.read_bytes(),b"original partial")
+        self.assertTrue(history.exists())
+
     def test_model_download_resumes_range_and_keeps_partial(self):
         partial=self.root/"weight.part"
         partial.write_bytes(b"123")
@@ -460,17 +482,23 @@ class WorkflowManagerTests(unittest.TestCase):
         jobs=[[eid,dict(id=str(uuid.uuid4()),revision="approved",seconds=2,prompt="Original"),[]] for _ in range(3)]
         submitted=[]
         downloaded=[]
+        payload=src.read_bytes()
+        partial_size=len(payload)//2
         class MediaServer(BaseHTTPRequestHandler):
             def do_GET(handler):
                 if "filename=real.mp4" not in handler.path:
                     handler.send_error(404)
                     return
-                downloaded.append(handler.path)
-                payload=src.read_bytes()
-                handler.send_response(200)
-                handler.send_header("Content-Length",str(len(payload)))
+                sent_range=handler.headers.get("Range")
+                downloaded.append((handler.path,sent_range,handler.headers.get("If-Range")))
+                offset=partial_size if sent_range==f"bytes={partial_size}-" else 0
+                handler.send_response(206 if offset else 200)
+                handler.send_header("Content-Length",str(len(payload)-offset))
+                handler.send_header("ETag",'"fixture-mp4"')
+                if offset:
+                    handler.send_header("Content-Range",f"bytes {offset}-{len(payload)-1}/{len(payload)}")
                 handler.end_headers()
-                handler.wfile.write(payload)
+                handler.wfile.write(payload[:partial_size] if len(downloaded)==1 else payload[offset:])
             def log_message(self,*args):
                 pass
         media=ThreadingHTTPServer(("127.0.0.1",0),MediaServer)
@@ -481,13 +509,21 @@ class WorkflowManagerTests(unittest.TestCase):
         new_url=f"http://127.0.0.1:{media.server_port}"
         tunnel=["http://old-tunnel"]
         target={"id":42,"host":"fixture","port":2222,"rate":1}
-        connection=SimpleNamespace(target=lambda:target,snapshot=lambda:{"url":tunnel[0]})
+        def current_target():
+            if not tunnel[0]:
+                raise ValueError("SSH disconnected")
+            return target
+        def reopen(instance):
+            self.assertEqual(instance,"42")
+            tunnel[0]=new_url
+        connection=SimpleNamespace(target=current_target,snapshot=lambda:{"url":tunnel[0]},
+                                   lock=threading.RLock(),retry_saved=Mock(side_effect=reopen))
         def api(url,path,obj=None):
             self.assertEqual(url,tunnel[0])
             if path=="/prompt":
                 submitted.append(obj)
                 if len(submitted)==1:
-                    tunnel[0]=new_url
+                    tunnel[0]=None
                     raise ConnectionError("Lost POST acknowledgement")
                 return {"prompt_id":str(len(submitted))}
             if path=="/queue":
@@ -512,7 +548,9 @@ class WorkflowManagerTests(unittest.TestCase):
             session.run(tunnel[0],wf,target)
         self.assertEqual((view["phase"],view["completed"]),("Finished",3),view.get("error"))
         self.assertEqual([x["prompt"]["id"] for x in submitted],[shot["id"] for _,shot,_ in jobs])
-        self.assertEqual(len(downloaded),3)
+        connection.retry_saved.assert_called_once_with("42")
+        self.assertEqual(len(downloaded),4)
+        self.assertEqual(downloaded[1][1:],(f"bytes={partial_size}-",'"fixture-mp4"'))
         for _,shot,_ in jobs:
             record=next((self.root/eid/shot["id"]).glob("*/job.json"))
             job=production.read(record)

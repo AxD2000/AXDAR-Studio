@@ -6,7 +6,7 @@ from http.client import HTTPException
 
 import production
 import vast_deploy
-from workflow_manager import identity
+from vast_connection import identity
 from workflow_install_remote import redact, scan
 from workflow_gate import verify_authoring_workflow
 
@@ -66,6 +66,8 @@ class DirectSession:
                             self.save()
                             self.ctx["run_direct"](url,workflow,target)
                             return
+                    elif plan["instance"]:
+                        connection.retry_saved(plan["instance"])
             time.sleep(2)
 
     def start(self, view, jobs, workflow, target, url, retry=False):
@@ -122,17 +124,37 @@ class DirectSession:
         if not target:
             return original
         connection=self.ctx["controller"].connection
+        instance=identity(target)
         while time.time()<deadline:
-            try:
-                selected=connection.target()
-                url=connection.snapshot().get("url")
-            except ValueError:
-                url=None
-            if url and identity(selected)==identity(target):
-                return url
+            with connection.lock:
+                try:
+                    selected=connection.target()
+                    url=connection.snapshot().get("url")
+                except ValueError:
+                    url=None
+                if url and identity(selected)==instance:
+                    return url
+                connection.retry_saved(instance)
             self.plan["view"]["phase"]="Waiting for connection"
             time.sleep(min(2,max(0,deadline-time.time())))
         raise TimeoutError("Connection unavailable before the session limit. Resume the same prompt.")
+
+    def release_unavailable_video(self, path, job, target):
+        instance=str(job.get("instance", ""))
+        if not target or not instance.isdecimal() or instance==identity(target):
+            return
+        if not job.get("ticket") or job.get("status") not in ("waiting","queued","uncertain"):
+            return
+        history=production.read(path.parent/"history.json",{})
+        status=history.get("status",{})
+        if status.get("status_str")!="success" or status.get("completed") is not True:
+            return
+        rows=self.ctx["controller"].connection.discover_instances()
+        if any(str(row["id"])==instance for row in rows):
+            return
+        job.pop("artifact_pending",None)
+        job.update(status="error",error="The render finished, but its video is on an instance no longer listed on Vast.")
+        production.atomic(path,job)
 
     def run(self, url, wf, target=None):
         ctx=self.ctx
@@ -200,6 +222,8 @@ class DirectSession:
                 latest=next(iter(sorted((ctx["DATA"]/eid/shot["id"]).glob("*/job.json"),reverse=True)),None)
                 prior=production.read(latest,{}) if latest else {}
                 same_revision=prior.get("revision")==shot["revision"]
+                if same_revision and self.plan["retry"]:
+                    self.release_unavailable_video(latest,prior,target)
                 in_flight=same_revision and prior.get("status") in ("submitting","queued","waiting","uncertain")
                 if same_revision and prior.get("status")=="cancelled":
                     queued=render_ctx["json_api"](url,"/queue")

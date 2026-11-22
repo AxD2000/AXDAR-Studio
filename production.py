@@ -198,11 +198,13 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
             poll_deadline=max(deadline,time.time()+8) if not admit else deadline
             while time.time()<poll_deadline:
                 notify()
-                if ctx.get("cancel_prompt") and ctx["cancel_prompt"](j["ticket"]):
+                if not j.get("artifact_pending") and ctx.get("cancel_prompt") and ctx["cancel_prompt"](j["ticket"]):
                     j.pop("error",None)
                     return finish("cancelled")
                 try:
-                    h=ctx["json_api"](url,"/history/"+j["ticket"]).get(j["ticket"])
+                    h=read(folder/"history.json") if j.get("artifact_pending") else None
+                    if not h:
+                        h=ctx["json_api"](url,"/history/"+j["ticket"]).get(j["ticket"])
                 except (ValueError,AttributeError) as exc:
                     raise Uncertain("The recorded prompt ID could not be checked. Reconcile before retrying.") from exc
                 if h:
@@ -212,6 +214,9 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
                         raise ValueError(str(details.get("node_type","Render"))+": "+str(details.get("exception_message","ComfyUI execution failed"))[:800])
                     if h.get("status",{}).get("completed") is False:
                         raise Uncertain("The original ComfyUI prompt has no completed execution history.")
+                    if not j.get("artifact_pending"):
+                        j.update(status="waiting",artifact_pending=True)
+                        atomic(path,j)
                     ctx["download_output"](url,folder,h,j)
                     if "audioRequired" not in j:
                         graph = read(folder/"graph.json", wf.get("graph",{}))
@@ -231,7 +236,9 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
                         else:
                             j["review"]="required"
                     part.replace(folder/"video.mp4")
+                    (folder/"video.resume.json").unlink(missing_ok=True)
                     j.update(duration=duration,sha256=digest(folder/"video.mp4"))
+                    j.pop("artifact_pending",None)
                     j.pop("error",None)
                     return finish("done")
                 missing_checks+=1
@@ -248,7 +255,8 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
             if attempt < retries:
                 time.sleep(min(2**attempt,15))
                 continue
-            j.update(status="waiting" if j.get("ticket") else ("uncertain" if j["status"]=="submitting" else "error"),error=str(exc)[:500])
+            message="ComfyUI finished rendering. Resume to download its video from the original instance." if j.get("artifact_pending") else str(exc)[:500]
+            j.update(status="waiting" if j.get("ticket") else ("uncertain" if j["status"]=="submitting" else "error"),error=message)
         except Uncertain as exc:
             j.update(status="uncertain",error=str(exc))
         except Exception as exc:
@@ -256,6 +264,7 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
         if j["status"]=="error":
             if (folder/"video.part").is_file():
                 (folder/"video.part").replace(folder/"video.failed.mp4")
+            j.pop("artifact_pending",None)
             return finish("error")
         atomic(path,j)
         return j["status"]
