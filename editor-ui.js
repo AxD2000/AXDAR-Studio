@@ -1,5 +1,60 @@
 let editorState=null,editorLoading='',editorClip='',editorMonitor='',editorBusy=false;
 const editorActions=()=>editorState?.episode===ep?.id?editorState:null;
+const freecutStates=new Map(),freecutPending=new Set();
+
+function freecutControls(episode){
+    const state=freecutStates.get(episode)||{};
+    if(state.state==='ready'){
+        return '<div class="row"><a href="'+esc(state.url)+'" target="_blank" rel="noopener">Open Freecut</a>'+
+            (state.subtitles?'<a href="/editor/freecut/srt/'+esc(episode)+'" download="AXDAR-dialogue.srt">Download SRT</a>':'')+
+            '<button type="button" data-freecut-prepare>Refresh approved takes and subtitles</button></div>'+
+            '<p>'+state.clips+' shots'+(state.comparison?' · Assembly comparison in the media bin':'')+'</p>'+
+            '<details><summary>Freecut workspace folder</summary><p class="preserve-lines">'+esc(state.workspace)+'</p></details>'+
+            (state.reviews?.length?'<h3>Subtitle alignment needs review</h3><ul class="danger">'+
+             state.reviews.map(item=>'<li>'+esc(item.clip+' · '+item.message)+'</li>').join('')+'</ul>':'');
+    }
+    if(state.state==='working')return '<p role="status">'+esc(state.message)+'…</p>';
+    return '<button type="button" data-freecut-prepare>Prepare Freecut project</button>'+
+        (state.message?'<p role="alert" class="danger">'+esc(state.message)+'</p>':'');
+}
+
+async function prepareFreecut(episode){
+    if(freecutStates.get(episode)?.state==='working')return;
+    function present(state){
+        freecutStates.set(episode,state);
+        if(ep?.id===episode&&$('#freecutPanel'))$('#freecutPanel').innerHTML=freecutControls(episode);
+    }
+    present({state:'working',message:'Preparing approved takes'});
+    try{
+        let state=await post('/editor',{action:'freecut-prepare',episode});
+        present(state);
+        while(state.state==='working'){
+            await new Promise(resolve=>setTimeout(resolve,1500));
+            state=await post('/editor',{action:'freecut-status',episode});
+            present(state);
+        }
+    }catch(error){present({state:'error',message:error.message})}
+    finally{if(freecutPending.delete(episode))prepareFreecut(episode)}
+}
+
+function prepareFinishedFreecutEpisodes(previous,next){
+    const ready=take=>take.status==='done'&&take.video&&take.quality?.technical!=='failed';
+    const key=take=>[take.episode,take.id,take.version].join('/');
+    const known=new Set(previous.results.filter(ready).map(key));
+    const available=next.results.filter(ready);
+    const updated=new Set(available.filter(take=>!known.has(key(take))).map(take=>take.episode));
+    for(const episode of db.episodes.filter(item=>updated.has(item.id))){
+        const takes=new Set(available.filter(take=>take.episode===episode.id).map(take=>take.id));
+        const approved=episode.shots.filter(shot=>shot.approved);
+        if(!approved.length||!approved.every(shot=>takes.has(shot.id)))continue;
+        if(freecutStates.get(episode.id)?.state==='working')freecutPending.add(episode.id);
+        else prepareFreecut(episode.id);
+    }
+}
+
+document.addEventListener('click',event=>{
+    if(event.target.closest('[data-freecut-prepare]'))prepareFreecut(ep.id);
+});
 
 function editButton(action,label,disabled=false){
     return '<button type="button" data-edit-action="'+action+'" '+(disabled?'disabled':'')+'>'+label+'</button>';
@@ -33,6 +88,7 @@ function renderEditor(){
         }
         return '<section class="panel"><p role="status">Loading the episode’s Takes…</p></section>';
     }
+    if(!freecutStates.has(ep.id)&&d.shots.some(shot=>shot.takes.some(take=>take.ready)))prepareFreecut(ep.id);
     const clip=d.clips.find(c=>c.id===editorClip)||d.clips[0];
     editorClip=clip?.id||'';
     const selected=clip&&editorShot(d,clip.shot);
@@ -54,7 +110,8 @@ function renderEditor(){
                 '<p>No completed Take saved locally for this shot.</p>')+
             '<button type="button" data-open-shot="'+esc(s.id)+'">Open Shot Lab</button></details>';
     }).join('');
-    return '<div class="toolbar">'+editButton('refresh','Refresh Takes')+editButton('assemble','Assemble first cut',!!rendering)+
+    return '<section class="panel"><h2>Freecut</h2><div id="freecutPanel">'+freecutControls(ep.id)+'</div></section>'+
+        '<div class="toolbar">'+editButton('refresh','Refresh Takes')+editButton('assemble','Assemble first cut',!!rendering)+
         editButton('available','Assemble available footage',!!rendering)+
         editButton('draft',d.reviewCut?'Generate Draft Review Cut':'Generate Draft Episode',!!rendering||!d.clips.length)+
         editButton('approve',d.reviewCut?'Approve Review Cut':'Approve Final Episode',!!rendering||!d.currentDraft||d.approved)+

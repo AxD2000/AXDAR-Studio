@@ -138,7 +138,9 @@ document.addEventListener('click',async e=>{
     setInterval(async()=>{
         try{
             const next=await(await fetch('/status')).json(),changed=JSON.stringify(state)!==JSON.stringify(next);
+            const previous=state;
             state=next;
+            if(changed&&!migrationNeeded())prepareFinishedFreecutEpisodes(previous,next);
             if(changed&&!migrationNeeded()&&(page===3&&![...document.querySelectorAll('video')].some(video=>!video.paused)||page===5)&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!document.querySelector('#workflowFields[open]'))render();
         }catch{}
     },4000);

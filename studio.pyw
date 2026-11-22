@@ -133,6 +133,7 @@ import vast_deploy
 import drive_archive
 import take_quality
 from episode_editor import Editor,valid_id
+from freecut_bridge import FreecutBridge
 
 def prepare_shot(url, folder, eid, s, wf, record):
     images, voices = generation_images(s), generation_voices(s)
@@ -210,6 +211,7 @@ def run(url, deadline, jobs, wf, target=None):
 controller=vast_deploy.Controller(globals())
 drive_pending=None
 editor=Editor(globals())
+freecut=FreecutBridge(editor)
 
 class Handler(BaseHTTPRequestHandler):
     def send(self, data, mime="application/json", status=200):
@@ -271,6 +273,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send((BASE/route[1:]).read_bytes(), mime + "; charset=utf-8")
         if route=="/":
             return self.send((BASE/"studio.html").read_text("utf-8").replace("__TOKEN__",TOKEN).encode(),"text/html; charset=utf-8")
+        if route.startswith("/editor/freecut/srt/"):
+            try:
+                subtitles=freecut.subtitles(route.rsplit("/",1)[-1]).encode("utf-8")
+                return self.send(subtitles,"text/plain; charset=utf-8")
+            except ValueError as exc:
+                return self.send({"error":str(exc)},status=404)
         if route.startswith("/editor/files/"):
             parts=route.split("/")
             if len(parts)==6 and valid_id(parts[3]) and valid_id(parts[4]) and parts[5] in ("video.mp4","subtitles.srt","subtitles.vtt","download"):
@@ -383,6 +391,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=="/editor":
                 if self.headers.get("Host") != f"127.0.0.1:{PORT}":
                     return self.send({},status=403)
+                if obj.get("action") in ("freecut-prepare","freecut-status"):
+                    return self.send(freecut.action(obj))
                 return self.send(editor.action(obj))
             if self.path=="/drive/connect":
                 if self.headers.get("Host") != f"127.0.0.1:{PORT}":

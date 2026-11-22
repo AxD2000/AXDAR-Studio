@@ -13,3 +13,9 @@ The archive recovery control restores completed Takes to their original episode 
 AXDAR trims only short boundary spans detected as both silent and static on shots without dialogue or protected sound requirements. It keeps uncertain spans for review. FFmpeg conforms picture and audio, stabilizes the timebase, and decodes the complete result to verify it. Visual continuity, exact dialogue timing and creative framing still need human review.
 
 Install a recent build of FFmpeg with ffprobe, H.264, AAC and libass. AXDAR checks the folder set by `AXDAR_FFMPEG_BIN`, then `tools/ffmpeg/bin/` inside Studio, then PATH. The Windows setup can use a portable build. Run `python -B -m unittest discover -q` from the repository to verify. The media-specific checks run when FFmpeg is available.
+
+## Freecut
+
+Run `setup-freecut.ps1` with Git, Node.js/npm, and Python 3.12 installed. AXDAR prepares a project when approved takes are ready. Open **Video Editor** to see it or choose **Prepare Freecut project** to prepare the takes currently available. Open Freecut and grant Chrome or Edge access to the workspace folder shown by AXDAR. Freecut saves edits in that folder and can export a portable project bundle. The current Assembly draft or latest completed Assembly export appears in the media bin as a comparison clip.
+
+Select a video clip in Freecut and open the subtitle properties to edit its text, timing, and style. AXDAR uses stable-ts locally to align the approved prompt dialogue to each source take. The first alignment downloads the Whisper weights. If a take needs review, its error appears beside the Freecut controls. After saving the project, **Download SRT** reads the saved source trims and clip positions. Freecut's export dialog controls whether subtitles are burned into its MP4.
