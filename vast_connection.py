@@ -117,6 +117,7 @@ class Connection:
         self.process = None
         self.endpoint = None
         self.url = None
+        self.comfy_port = None
         self.state, self.error = 'Disconnected', ''
         self.indicators = dict(api='grey', ssh='grey', comfy='grey', gpu='grey')
         try:
@@ -143,7 +144,7 @@ class Connection:
         with self.lock:
             if self.state != 'Ready' or not self.endpoint:
                 raise ValueError('Connect to Vast and wait for Ready first')
-            return dict(self.endpoint)
+            return dict(self.endpoint, comfy_port=self.comfy_port)
 
     def ssh_target(self):
         with self.lock:
@@ -234,6 +235,7 @@ class Connection:
     def _cleanup(self):
         process, self.process = self.process, None
         self.url = None
+        self.comfy_port = None
         if process is not None:
             try:
                 process.terminate()
@@ -331,6 +333,7 @@ class Connection:
                                         stderr=subprocess.DEVNULL,
                                         creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         self.url = f'http://127.0.0.1:{local}'
+        self.comfy_port = port
 
     def _probe(self):
         if not self.process or self.process.poll() is not None:

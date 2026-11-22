@@ -324,6 +324,8 @@ class Handler(BaseHTTPRequestHandler):
                     save(DB, db)
                 return self.send(dict(project=db, assets=active_assets(db), migration=story_engine.migration_preview(db, DATA)))
         if route=="/status":
+            if workspace_started.is_set():
+                workflow_manager.watch()
             result=[]
             for p in sorted(DATA.glob("*/*/*/job.json")):
                 j=json.loads(p.read_text("utf-8"))
@@ -485,8 +487,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(dict(project=db, assets=active_assets(db)))
                 elif self.path=="/start":
                     if not active_workflow: raise ValueError(workflow_error)
-                    if production_busy() or workflow_manager.busy():
-                        raise ValueError("Finish the active production or installation first.")
+                    if production_busy():
+                        raise ValueError("Finish or pause the active production first.")
+                    if workflow_manager.busy():
+                        raise ValueError("This Vast instance has an active workflow scan or installation. Open Installation Monitor to check it.")
                     if running: raise ValueError("الجلسة تعمل حالياً")
                     connected=controller.connection.snapshot().get("url")
                     target=controller.connection.target() if connected else None

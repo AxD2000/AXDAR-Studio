@@ -95,7 +95,9 @@ function dependencyView(){
 
 function installationView(){
     const data=workflowStatus(),i=data?.installation;
-    if(!i?.status)return '<p>No installation started.</p>';
+    const parked=data?.otherInstallations?
+        '<p class="muted">Unfinished installations on other instances are saved for when you reconnect to those instances.</p>':'';
+    if(!i?.status)return '<p>No installation started on this instance.</p>'+parked;
     const terminal=terminalWorkflowStates.includes(i.status);
     const scan=i.mode==='scan';
     const scanDone=scan&&['ready','needs attention'].includes(i.status);
@@ -107,7 +109,8 @@ function installationView(){
         '<p role="status">'+esc(label)+' · '+timeLabel(i.elapsed)+cost+(!scanDone&&i.exitCode!=null?' · '+(scan?'Scan exit ':'Installer exit ')+i.exitCode:'')+(i.bashExitCode!=null?' · Bash exit '+i.bashExitCode:'')+'</p>'+
         (scanDone?'<p>Open Dependencies for the results, or choose Start Installation.</p>':'')+
         '<p>'+esc(i.message||'')+'</p>'+
-        (!terminal?'<button data-wm="cancel">'+(scan?'Cancel Scan':'Cancel Installation')+'</button>':'')+
+        (!terminal?'<button data-wm="cancel" data-wm-instance="'+esc(i.instance)+'">'+(scan?'Cancel Scan':'Cancel Installation')+'</button>':'')+
+        parked+
         '<table><thead><tr><th>Stage</th><th>Status</th><th>Elapsed</th><th>Progress</th></tr></thead><tbody>'+
         (data.phases||[]).map(name=>{
             const stage=i.stages?.[name]||{},t=(stage.status==='Running'?Date.now()/1000:stage.updated)-stage.started;
@@ -257,7 +260,10 @@ document.addEventListener('click',async event=>{
             await workflowCall(pendingInstall);pendingInstall=null;$('#wmConfirm').close();
             workflowTab='Installation Monitor';render();await pollWorkflow();
         }
-        if(action==='scan'||action==='cancel'){await workflowCall({action});await pollWorkflow()}
+        if(action==='scan'||action==='cancel'){
+            await workflowCall({action,instance:button.dataset.wmInstance});
+            await pollWorkflow();
+        }
         if(action==='start'||action==='retry'){
             await flushEdits();
             const result=await post('/start',{episode:ep.id,retry:button.dataset.wmShot});

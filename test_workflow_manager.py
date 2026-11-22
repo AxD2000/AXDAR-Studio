@@ -139,9 +139,8 @@ class WorkflowManagerTests(unittest.TestCase):
         store=workflow_profiles.WorkflowStore(self.root/"profiles")
         wf=store.import_workflow("API",json.dumps(self.graph).encode())
         connection=Mock()
-        connection.target.return_value={"id":42,"host":"fixture","port":2222,"rate":0.7}
+        connection.target.return_value={"id":42,"host":"fixture","port":2222,"rate":0.7,"comfy_port":18188}
         connection.ssh_target.return_value=connection.target.return_value
-        connection._remote_port.return_value=18188
         ctx={"controller":SimpleNamespace(connection=connection),"BASE":Path.cwd(),"DATA":self.root,
              "actions":SimpleNamespace(store=store),"production_busy":lambda:False,
              "running":False,"LOCK":threading.RLock()}
@@ -231,22 +230,22 @@ class WorkflowManagerTests(unittest.TestCase):
 
     def test_ssh_dispatch_sends_credential_on_stdin_only(self):
         manager,version=self.manager()
-        manager.record=dict(id="a"*32,version=version)
+        record=manager.records["42"]=dict(id="a"*32,version=version,instance="42")
         token="hf_fixtureabcdefghijkl"
         with patch.object(workflow_manager,"hf_token",return_value=token), \
              patch.object(workflow_manager.vast_deploy,"ssh") as ssh, \
              patch.object(workflow_manager.vast_deploy,"deploy_files"), \
              patch.object(workflow_manager.vast_deploy,"put_json"),patch.object(manager,"watch"):
-            manager.launch(manager.connection.target(),{"mode":"install"},"echo ready")
+            manager.launch(record,manager.connection.target(),{"mode":"install"},"echo ready")
         self.assertEqual(ssh.call_args.kwargs["data"],(token+"\n").encode())
         self.assertNotIn(token,ssh.call_args.args[1])
         self.assertNotIn(token,manager.path.read_text("utf-8"))
 
     def test_reopen_reconciles_same_worker_and_sends_cancel_marker(self):
         manager,version=self.manager()
-        manager.record=dict(id="b"*32,version=version,instance="42",status="reconnecting",
+        record=manager.records["42"]=dict(id="b"*32,version=version,instance="42",status="reconnecting",
                             dispatched=True,started=time.time(),timeout=60,cancel=True)
-        manager.save()
+        manager.save(record)
         reopened=workflow_manager.WorkflowManager(manager.ctx)
         replies=iter([b"",OSError("Disconnected"),b"",json.dumps({"started":True,"status":"cancelled",
                         "report":{"nodes":[],"models":[]},"exitCode":-15,"finished":time.time()}).encode()])
@@ -256,7 +255,7 @@ class WorkflowManagerTests(unittest.TestCase):
                 raise result
             return result
         with patch.object(workflow_manager.vast_deploy,"ssh",side_effect=ssh) as mock,patch.object(workflow_manager.time,"sleep"):
-            reopened.reconcile("b"*32)
+            reopened.reconcile(reopened.records["42"])
         self.assertEqual(reopened.status(version)["installation"]["status"],"cancelled")
         self.assertTrue(any("touch" in call.args[1] for call in mock.call_args_list))
         self.assertTrue(all("b"*32 in call.args[1] for call in mock.call_args_list))
@@ -274,15 +273,39 @@ class WorkflowManagerTests(unittest.TestCase):
         manager,version=self.manager()
         report={"nodes":["A missing node"],"models":[]}
         manager.save_profile(version,instances={"42":{"status":"needs attention","report":report}})
-        manager.record=dict(id="c"*32,version=version,instance="42",status="running",
+        record=manager.records["42"]=dict(id="c"*32,version=version,instance="42",status="running",
                             dispatched=True,started=time.time(),timeout=60)
-        manager.save()
+        manager.save(record)
         terminal={"started":True,"status":"failed","report":{},"exitCode":1,"finished":time.time()}
         with patch.object(workflow_manager.vast_deploy,"ssh",return_value=json.dumps(terminal).encode()),patch.object(workflow_manager.time,"sleep"):
-            manager.reconcile("c"*32)
+            manager.reconcile(record)
         view=manager.status(version)
         self.assertEqual(view["installation"]["status"],"failed")
         self.assertEqual(view["verification"]["report"],report)
+
+    def test_interrupted_installation_on_old_instance_does_not_block_new_instance(self):
+        manager,version=self.manager()
+        previous={"id":"d"*32,"version":version,"instance":"41","status":"reconnecting",
+                  "dispatched":True,"cancel":True,"started":time.time(),"timeout":1800}
+        production.atomic(manager.path.with_name("workflow-installation.json"),previous)
+        manager=workflow_manager.WorkflowManager(manager.ctx)
+        with patch.object(manager,"watch"),patch.object(manager,"launch") as launch:
+            self.assertFalse(manager.busy())
+            view=manager.status(version)
+            self.assertIsNone(view["installation"]["status"])
+            self.assertEqual(view["otherInstallations"],1)
+            manager.action({"action":"scan","version":version})
+            self.assertTrue(manager.busy())
+            with self.assertRaisesRegex(ValueError,"already active on this Vast instance"):
+                manager.action({"action":"scan","version":version})
+        self.assertTrue(launch.called)
+        self.assertEqual(production.read(manager.path)["41"],previous)
+        manager.connection.target.return_value={"id":41}
+        self.assertTrue(manager.busy())
+        with patch.object(manager,"watch"):
+            self.assertEqual(manager.status(version)["installation"]["instance"],"41")
+            with self.assertRaisesRegex(ValueError,"selected instance changed"):
+                manager.action({"action":"cancel","instance":"42"})
 
     def test_install_cancellation_signals_child_process_group(self):
         production.atomic(self.root/"spec.json",{"timeout":60})
