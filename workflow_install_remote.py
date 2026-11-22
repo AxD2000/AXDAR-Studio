@@ -3,6 +3,7 @@ import json
 import os
 import re
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
@@ -96,6 +97,9 @@ def execute(folder, config):
                     started=old.get("started",time.time()),updated=time.time(),count=count,total=total)
         production.atomic(folder/"stage.json",state)
     def report(result):
+        result["downloadBytes"]=sum(m["source"]["bytes"] for m in result["models"]
+                                    if m["status"] in ("Missing","Downloading") and m.get("source"))
+        result["diskFreeBytes"]=shutil.disk_usage(models_root if models_root.is_dir() else root).free
         state["report"] = result
         production.atomic(folder/"stage.json",state)
 

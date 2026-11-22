@@ -572,7 +572,7 @@ class WorkflowStore:
         if editor is not None and executable is None:
             version = _digest(_json([_digest(raw), "editor"]))
             wf = dict(version=version, name=name, adapter="UI workflow", mapping={}, fields=[],
-                      outputs=[], issues=["Attach a ComfyUI API export of this workflow before production."],
+                      outputs=[], issues=["Connect ComfyUI to prepare this original workflow before production."],
                       graph={})
         else:
             wf = inspect_workflow(name,executable or raw,info,mapping)
@@ -625,7 +625,7 @@ class WorkflowStore:
         executable = self._executable(rec)
         if editor is not None and executable is None:
             return dict(version=version,name=rec["name"],adapter="UI workflow",mapping={},fields=[],outputs=[],
-                        issues=["Attach a ComfyUI API export of this workflow before production."],
+                        issues=["Connect ComfyUI to prepare this original workflow before production."],
                         graph={},format="ComfyUI UI JSON",nodeCount=len(editor),executable=False)
         wf = inspect_workflow(rec["name"],executable or raw,rec["metadata"],rec["mapping"])
         wf.update(version=version,format="ComfyUI UI JSON" if editor is not None else "ComfyUI API JSON",
@@ -670,14 +670,14 @@ class WorkflowStore:
     def remap(self,version,mapping,object_info=None,select=True):
         rec = self._record(version)
         if not self.get(version)["executable"]:
-            raise ValueError("Attach the workflow's executable API export first.")
+            raise ValueError("Prepare the original workflow on the connected ComfyUI instance first.")
         return self._persist(rec["name"], self.original(version), rec["metadata"] if object_info is None else object_info,
                              mapping,select,self._executable(rec))
 
     def inspect_metadata(self,version,metadata):
         rec = self._record(version)
         if not self.get(version)["executable"]:
-            raise ValueError("Attach the workflow's executable API export first.")
+            raise ValueError("Prepare the original workflow on the connected ComfyUI instance first.")
         return self._persist(rec["name"],self.original(version),metadata,rec["mapping"],False,self._executable(rec))
 
     def select(self,version):

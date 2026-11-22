@@ -17,7 +17,7 @@ function workflowWorkspace(){
         '<label><input id="wmRestart" type="checkbox"> Restart ComfyUI after this script even if all nodes are registered</label></div>'+
         '<p>Scripts run over SSH on the connected instance. Use the HF_TOKEN environment variable for authenticated downloads.</p>'+
         '<button class="primary" data-wm="preview">Preview installation</button></section>'+
-        '<input id="wmExecutable" type="file" accept=".json,application/json" hidden><dialog id="wmConfirm"></dialog>';
+        '<dialog id="wmConfirm"></dialog>';
         workflowSavedFor='';
     }
     if(workflowTab==='Dependencies'){
@@ -38,9 +38,13 @@ function dependencyView(){
     const i=workflowLive?.data?.installation,v=workflowLive?.data?.verification;
     const report=v?.report||(i?.version===editingProfile?i.report:null);
     if(!report?.models)return '<p>Run a scan on the connected instance to verify the selected version.</p>';
+    const space=report.diskFreeBytes!=null&&report.downloadBytes!=null?
+        '<p>'+((report.downloadBytes||0)/1e9).toFixed(2)+' GB verified downloads · '+
+        (report.diskFreeBytes/1e9).toFixed(2)+' GB available'+
+        (report.downloadBytes>report.diskFreeBytes?' · Insufficient disk space':'')+'</p>':'';
     return '<p>Verification · '+esc(v?.status||i?.status||'Pending')+'</p><h3>Custom nodes</h3>'+
         (report.nodes.length?'<ul class="danger">'+report.nodes.map(node=>'<li>'+esc(node)+'</li>').join('')+'</ul>':'<p>All required classes registered.</p>')+
-        '<h3>Model files</h3><table><thead><tr><th>File</th><th>Status</th><th>Verified source</th></tr></thead><tbody>'+
+        '<h3>Model files</h3>'+space+'<table><thead><tr><th>File</th><th>Status</th><th>Verified source</th></tr></thead><tbody>'+
         report.models.map(m=>'<tr><td>'+esc(m.name)+'</td><td>'+esc(m.status)+(m.error?' · '+esc(m.error):'')+'</td><td>'+
             (m.source?esc(m.source.repo)+' @ '+esc(m.source.revision.slice(0,12)):'—')+'</td></tr>').join('')+'</tbody></table>';
 }
@@ -100,6 +104,7 @@ function productionMonitorView(){
         (rate!=null?'<p>'+moneyLabel(rate)+'/hour'+(elapsed!=null?' · '+moneyLabel(elapsed/3600*rate)+' estimated session cost':'')+'</p>':'')+
         (telemetry.gpus||[]).map(g=>'<p>'+esc(g.name||'GPU')+(g.vram_total!=null&&g.vram_free!=null?' · '+((g.vram_total-g.vram_free)/1073741824).toFixed(1)+'/'+(g.vram_total/1073741824).toFixed(1)+' GiB VRAM':'')+
           (g.utilization!=null?' · '+Number(g.utilization)+'% utilization':'')+'</p>').join('')+
+        (currentProfile()?.format==='ComfyUI UI JSON'?'<p>Start Production first verifies the original graph at its authored duration.</p>':'')+
         '<div class="row">'+directControl('Start Production','start',blocked)+
         directControl('Pause After Current Shot','pause',!state.running||!session.episode)+
         directControl('Resume Production','resume',state.running||!['Paused','Needs attention','Stopped'].includes(session.phase))+
@@ -136,19 +141,11 @@ document.addEventListener('toggle',event=>{
 
 document.addEventListener('change',async event=>{
     const input=event.target;
-    if(!['wmScriptFile','wmExecutable'].includes(input.id)||!input.files.length)return;
-    const file=input.files[0]; input.value='';
+    if(input.id!=='wmScriptFile'||!input.files.length)return;
+    const file=input.files[0];input.value='';
     try{
-        if(input.id==='wmScriptFile'){
-            if(file.size>256000)throw Error('Choose a Bash file under 256 KB.');
-            $('#wmScript').value=(await file.text()).replace(/^\uFEFF/,'');return;
-        }
-        const response=await fetch('/workflow/attach',{method:'POST',headers:{
-            'X-Studio':studioToken,'X-Filename':encodeURIComponent(file.name),'X-Workflow-Version':editingProfile},body:file});
-        const result=await response.json();
-        if(!response.ok)throw Error(result.error||response.status);
-        editingProfile=result.profile.version;mappingOpen=true;await loadWorkflows();render();
-        reportStatus('Executable graph attached. Review its mapping and select this version.');
+        if(file.size>256000)throw Error('Choose a Bash file under 256 KB.');
+        $('#wmScript').value=(await file.text()).replace(/^\uFEFF/,'');
     }catch(error){reportError(error)}
 });
 
@@ -160,7 +157,6 @@ document.addEventListener('click',async event=>{
     if(!button)return;
     const action=button.dataset.wm;
     try{
-        if(action==='attach'){$('#wmExecutable').click();return}
         if(action==='showToken'){
             const field=$('#wmToken');field.type=field.type==='password'?'text':'password';
             button.textContent=field.type==='password'?'Show':'Hide';return;
@@ -171,7 +167,7 @@ document.addEventListener('click',async event=>{
             reportStatus('Hugging Face accepted the token. Saved in Windows Credential Manager.');
         }
         if(action==='preview'){
-            if(!currentProfile(editingProfile)?.executable)throw Error('Attach a ComfyUI API export first.');
+            if(!currentProfile(editingProfile)?.executable)throw Error('Prepare the original workflow first.');
             if(state.connection?.state!=='Ready')throw Error('Select and connect a Vast instance first.');
             const time=$('#wmTimeout');
             if(!time.checkValidity())throw Error('Choose a timeout from 1 to 180 minutes.');

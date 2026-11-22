@@ -13,7 +13,7 @@ from provision import ModelRedirect
 import vast_deploy
 from vast_connection import hf_token
 from workflow_install_remote import PHASES, redact
-from workflow_profiles import _upstream
+from workflow_profiles import _parse, _upstream, public_profile
 
 
 INSTALL_ROOT = vast_deploy.STORE + "/installations"
@@ -78,6 +78,8 @@ class WorkflowManager:
                 raise ValueError("Could not reach Hugging Face to verify the token.") from None
             hf_token(token)
             return {"valid":True}
+        if mode=="prepare":
+            return self.prepare(request.get("version"))
         if mode=="status":
             return self.status(request.get("version"),request.get("monitor") is True)
         if mode=="cancel":
@@ -92,7 +94,7 @@ class WorkflowManager:
         version=request.get("version")
         wf=self.ctx["actions"].store.get(version)
         if not wf["executable"]:
-            raise ValueError("Attach a verified executable ComfyUI API export first.")
+            raise ValueError("Prepare the original workflow on the connected ComfyUI instance first.")
         if not wf["output"] or wf["output"] not in wf["graph"]:
             raise ValueError("Map the final MP4 output node first.")
         script=request.get("script","") if mode=="install" else ""
@@ -112,10 +114,6 @@ class WorkflowManager:
             if mode=="install" and request.get("instance") is not None and str(target.get("id"))!=str(request["instance"]):
                 raise ValueError("The selected instance changed. Review the installation again.")
             plan={k:wf["graph"][k] for k in _upstream(wf["graph"],[wf["output"]])}
-            for slot,value in wf["mapping"].get("parameters",{}).items():
-                node,field=slot.split(".",1)
-                if node in plan:
-                    plan[node]["inputs"][field]=value
             if mode=="install":
                 self.save_profile(version,script=script)
             self.record=dict(id=uuid.uuid4().hex,version=version,instance=identity(target),
@@ -125,6 +123,46 @@ class WorkflowManager:
             spec=dict(graph=plan,mode=mode,timeout=timeout*60,restart=request.get("restart") is True)
             threading.Thread(target=self.launch,args=(target,spec,script),daemon=True).start()
         return {"ok":True}
+
+    def prepare(self, version):
+        store=self.ctx["actions"].store
+        wf=store.get(version)
+        starting_active=(self.ctx["active_workflow"] or {}).get("version")
+        capture=self.profile(version).get("capture")
+        if capture:
+            wf=store.get(capture)
+        target=self.connection.target()
+        url=self.connection.snapshot().get("url")
+        if not url:
+            raise ValueError("Connect to ComfyUI to prepare the original workflow.")
+        if not wf["executable"]:
+            raw=store.original(version)
+            ui=json.loads(raw.decode("utf-8-sig"))
+            ui=ui.get("workflow",ui.get("graph",ui))
+            try:
+                capture=self.ctx["json_api"](url,"/workflow/convert",ui)
+                graph=_parse(capture)
+            except (ValueError,OSError):
+                raise ValueError("ComfyUI could not convert this workflow. Check its Workflow to API Converter and use the original JSON again.") from None
+            with self.ctx["LOCK"]:
+                if identity(self.connection.target())!=identity(target):
+                    raise ValueError("The instance changed during conversion. Prepare the workflow on the new connection.")
+                wf=store.attach(version,json.dumps(graph,ensure_ascii=False).encode("utf-8"))
+                self.save_profile(version,capture=wf["version"])
+        with self.ctx["LOCK"]:
+            current_active=(self.ctx["active_workflow"] or {}).get("version")
+            if (current_active==starting_active and not wf["issues"] and not self.ctx["running"]
+                    and not self.ctx["production_busy"]()):
+                self.ctx["actions"].workflow("select",{"version":wf["version"]})
+            active=self.ctx["active_workflow"]
+        message=None
+        previous=self.profile(wf["version"]).get("instances",{}).get(identity(target))
+        if not previous and wf["output"] and not wf["issues"]:
+            try:
+                self.action({"action":"scan","version":wf["version"]})
+            except ValueError as exc:
+                message=str(exc)
+        return dict(profile=public_profile(wf),active=active["version"] if active else None,message=message)
 
     def folder(self):
         return INSTALL_ROOT+"/"+self.record["id"]

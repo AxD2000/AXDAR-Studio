@@ -423,6 +423,9 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("Wait until the Workflow installation finishes.")
                     if not active_workflow and obj.get("action") == "start" and not obj.get("archive"):
                         raise ValueError(workflow_error)
+                    if (obj.get("action")=="start" and not obj.get("archive") and active_workflow
+                            and active_workflow.get("format")=="ComfyUI UI JSON"):
+                        raise ValueError("Start this workflow from Direct ComfyUI submission so AXDAR can verify the original graph first.")
                     return self.send(controller.action(obj))
             with LOCK:
                 if self.path=="/workflow":

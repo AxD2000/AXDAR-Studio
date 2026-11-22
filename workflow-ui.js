@@ -4,7 +4,8 @@ let editingProfile='', mappingOpen=false;
 async function loadWorkflows(){
     workflowCatalog=await post('/workflow/list',{});
     if(!workflowCatalog.profiles.some(p=>p.version===editingProfile))
-        editingProfile=workflowCatalog.active||workflowCatalog.profiles[0]?.version||'';
+        editingProfile=workflowCatalog.profiles.find((p,i)=>i===0&&p.format==='ComfyUI UI JSON'&&!p.executable)?.version||
+            workflowCatalog.active||workflowCatalog.profiles[0]?.version||'';
 }
 function currentProfile(version=workflowCatalog.active){return workflowCatalog.profiles.find(p=>p.version===version)}
 function profileLabel(p){return p.name+' · '+String(p.version).slice(0,12)}
@@ -15,8 +16,8 @@ function workflowPanel(){
         '<div class="row"><button data-wf="import">Import Workflow JSON</button><button data-tools="open">Terminal &amp; HF Token</button></div>'+
         (p?'<label>Stored workflow version<select id="profileChoice">'+workflowCatalog.profiles.map(x=>option(x.version,profileLabel(x),p.version)).join('')+'</select></label>'+
         '<p>'+esc(p.format)+' · '+p.nodeCount+' nodes · '+(p.issues.length?'Needs review':'Ready')+'</p>'+
-        (p.executable?'':'<p class="danger">'+esc(p.issues.join(' '))+'</p>'+
-            (page===7?'<button data-wm="attach">Attach executable API JSON</button>':''))+
+        (p.executable?'':'<p>'+esc(p.issues.join(' '))+'</p>'+
+            '<button data-wf="prepare" '+(state.connection?.state==='Ready'?'':'disabled')+'>Prepare workflow</button>')+
         '<div class="row"><button data-wf="select" '+(!p.executable||p.issues.length||p.version===workflowCatalog.active?'disabled':'')+'>Use this version</button></div>'+
         (p.executable?'<details id="workflowFields" '+(mappingOpen?'open':'')+'><summary>Review input and output mapping</summary>'+workflowMappingForm(p)+'</details>':'' ):'')+'</section>';
 }
@@ -68,7 +69,32 @@ async function updateWorkflow(path,payload,file){
     await loadWorkflows();
     const info=await(await fetch('/api')).json();adoptProject(info.project);
     render();
+    if(path==='/workflow/import'&&response.profile.format==='ComfyUI UI JSON')prepareOriginalWorkflow();
 }
+
+let preparingOriginal=false,prepareKey='';
+async function prepareOriginalWorkflow(force=false){
+    const profile=currentProfile(editingProfile);
+    if(!profile||profile.format!=='ComfyUI UI JSON'||state.connection?.state!=='Ready'||preparingOriginal)return;
+    if(profile.executable&&!force)return;
+    const key=profile.version+'|'+(state.connection.instance||state.connection.url);
+    if(!force&&key===prepareKey)return;
+    prepareKey=key;
+    preparingOriginal=true;
+    try{
+        reportStatus('Preparing the original JSON on ComfyUI…');
+        const result=await post('/workflow-manager',{action:'prepare',version:profile.version});
+        if(editingProfile===profile.version)editingProfile=result.profile.version;
+        await loadWorkflows();
+        render();
+        reportStatus(result.message||(result.profile.issues.length?'Review workflow mapping.':'Workflow prepared. Check Dependencies for the selected instance.'));
+    }catch(error){reportError(error)}
+    finally{preparingOriginal=false}
+}
+setInterval(()=>{
+    if((page===7||page===6)&&typeof state!=='undefined'&&state?.connection&&!state.running)prepareOriginalWorkflow();
+},3000);
+
 document.addEventListener('toggle',e=>{if(e.target.id==='workflowFields')mappingOpen=e.target.open},true);
 document.addEventListener('change',async e=>{
     const t=e.target;
@@ -78,7 +104,7 @@ document.addEventListener('change',async e=>{
         const file=t.files[0];t.value='';mappingOpen=true;
         if(t.id==='workflowInput')await updateWorkflow('/workflow/import',{},file);
         else await updateWorkflow('/workflow/inspect',{version:editingProfile,metadata:JSON.parse((await file.text()).replace(/^\uFEFF/,''))});
-        reportStatus('Workflow version loaded.');
+        if(!preparingOriginal)reportStatus('Workflow version loaded.');
     }catch(err){reportError(err)}
 });
 document.addEventListener('click',async e=>{
@@ -86,6 +112,7 @@ document.addEventListener('click',async e=>{
     const action=b.dataset.wf,version=editingProfile;
     if(action==='import'){$('#workflowInput').click();return}
     if(action==='metadata'){$('#metadataFile').click();return}
+    if(action==='prepare'){await prepareOriginalWorkflow(true);return}
     b.disabled=true;
     try{
         if(action==='select')await updateWorkflow('/workflow/select',{version});

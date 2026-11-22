@@ -14,6 +14,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import direct_session
+from test_production import movie
+from workflow_gate import verify_authoring_workflow
 import editor_media
 import production
 import provision
@@ -51,7 +53,7 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertFalse(profile["executable"])
         self.assertEqual(profile["nodeCount"],7)
         self.assertIsNone(store.active())
-        with self.assertRaisesRegex(ValueError,"Attach"):
+        with self.assertRaisesRegex(ValueError,"prepare"):
             store.select(profile["version"])
         wrong=dict(self.graph, **{"141":node("SaveImage",images=["121",0])})
         with self.assertRaisesRegex(ValueError,"does not match"):
@@ -144,6 +146,79 @@ class WorkflowManagerTests(unittest.TestCase):
              "actions":SimpleNamespace(store=store),"production_busy":lambda:False,
              "running":False,"LOCK":threading.RLock()}
         return workflow_manager.WorkflowManager(ctx),wf["version"]
+
+    def test_ui_json_is_converted_automatically_on_the_selected_connection(self):
+        manager,_=self.manager()
+        store=manager.ctx["actions"].store
+        self.graph["10"]["_meta"]={"title":"Positive Prompt"}
+        ui={"nodes":[{"id":int(k),"type":v["class_type"]} for k,v in self.graph.items()]}
+        original=json.dumps(ui,indent=2).encode()+b"\n"
+        profile=store.import_workflow("Only UI JSON",original)
+        manager.connection.snapshot.return_value={"url":"http://127.0.0.1:18799"}
+        manager.ctx["active_workflow"]=None
+        converter=Mock(return_value=self.graph)
+        manager.ctx["json_api"]=converter
+        def workflow(action,obj):
+            self.assertEqual(action,"select")
+            manager.ctx["active_workflow"]=store.select(obj["version"])
+        manager.ctx["actions"].workflow=workflow
+        with patch.object(manager,"action",wraps=manager.action) as operation,patch.object(manager,"launch"):
+            capture=manager.prepare(profile["version"])
+        converted=capture["profile"]["version"]
+        converter.assert_called_once_with("http://127.0.0.1:18799","/workflow/convert",ui)
+        self.assertEqual(capture["active"],converted)
+        self.assertEqual(store.get(converted)["graph"],self.graph)
+        self.assertEqual(store.original(converted),original)
+        operation.assert_called_once_with({"action":"scan","version":converted})
+
+    def test_original_gate_detects_lora_error_even_with_successful_mp4(self):
+        graph={"1":node("DocumentedFixture"),"141":node("VHS_VideoCombine",audio=["1",0],images=["1",0])}
+        wf=dict(version="f"*64,name="Fixture",output="141",graph=graph)
+        for mismatch in (True,False):
+            sent=[]
+            rows=[{"t":"2026-11-22T10:01:00","m":"Old unrelated ERROR lora incompatible shape\n"}]
+            def api(_url,path,obj=None):
+                if path=="/queue":return {"queue_running":[],"queue_pending":[]}
+                if path=="/object_info":return {"DocumentedFixture":{},"VHS_VideoCombine":{}}
+                if path=="/internal/logs/raw":return {"entries":list(rows)}
+                if path=="/prompt":
+                    sent.append(obj["prompt"])
+                    rows.append({"t":"2026-11-22T10:01:01",
+                                 "m":"ERROR lora blocks weight shape is invalid for input" if mismatch else "Sampling done"})
+                    return {"prompt_id":"ticket"}
+                if path=="/history/ticket":
+                    return {"ticket":{"status":{"status_str":"success","completed":True},"outputs":{"141":{}}}}
+                raise AssertionError(path)
+            def download(_url,dest,history,job):
+                self.assertEqual(job["output_node"],"141")
+                (dest/"video.part").write_bytes(movie(2))
+            ctx=dict(DATA=self.root,json_api=api,download_output=download,
+                     technical_qc=lambda *_:{"technical":"passed","audioStreams":1})
+            batch=uuid.uuid4().hex
+            with patch("workflow_gate.editor_media.probe",return_value={"duration":2}),patch("workflow_gate.editor_media.tool"):
+                if mismatch:
+                    with self.assertRaisesRegex(ValueError,"LoRA weight mismatch"):
+                        verify_authoring_workflow(ctx,"http://fixture",time.time()+60,batch,wf)
+                    with self.assertRaisesRegex(ValueError,"LoRA weight mismatch"):
+                        verify_authoring_workflow(ctx,"http://fixture",time.time()+60,batch,wf)
+                else:
+                    self.assertEqual(verify_authoring_workflow(ctx,"http://fixture",time.time()+60,batch,wf),"passed")
+            self.assertEqual(sent,[graph])
+            self.assertEqual(wf["graph"],graph)
+
+    def test_direct_batch_waits_for_original_ui_workflow_verification(self):
+        eid=str(uuid.uuid4())
+        jobs=[[eid,dict(id=str(uuid.uuid4()),revision="approved",seconds=2,prompt="Original"),[]]]
+        ctx={"DATA":self.root,"LOCK":threading.RLock(),"json_api":Mock(),"prepare_shot":Mock(),
+             "download_output":Mock(),"take_quality":take_quality,"running":True}
+        wf=dict(version="a"*64,name="Fixture",output="141",format="ComfyUI UI JSON",graph={"141":node("Out")})
+        view=dict(end=time.time()+60,episode=eid,submitted=1,phase="Preparing ComfyUI",completed=0,failed=0)
+        session=direct_session.DirectSession(ctx)
+        session.start(view,jobs,wf,None,"http://fixture")
+        with patch.object(direct_session,"verify_authoring_workflow",side_effect=ValueError("LoRA mismatch")), patch.object(production,"render") as batch:
+            session.run("http://fixture",wf)
+        batch.assert_not_called()
+        self.assertEqual((view["phase"],view["error"],session.plan["index"]),("Needs attention","LoRA mismatch",0))
 
     def test_unconfirmed_script_and_credentials_in_script_never_reach_ssh(self):
         manager,version=self.manager()
