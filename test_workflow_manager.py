@@ -231,9 +231,16 @@ class WorkflowManagerTests(unittest.TestCase):
         graph["65"]=node("VAELoader",vae_name=r"Minimax\minimax_h3_video_vae_fp16.safetensors")
         graph["84"]=node("PrimitiveStringMultiline",value="Template text")
         graph["169"]=node("LoadImage",image="template-only.png")
+        upscaler="MinimaxH3LatentUpscaler3D"
+        graph["124"]=node(upscaler,latent=["121",0],device=True,precision="cuda")
+        graph["141"]=node("VHS_VideoCombine",images=["124",0],frame_rate=24,format="video/h264-mp4")
         linux_vae="Minimax/minimax_h3_video_vae_fp16.safetensors"
-        wf=workflow_profiles.inspect_workflow("H3 fixture",graph)
-        wf["format"]="ComfyUI UI JSON"
+        original={"nodes":[{"id":int(k),"type":n["class_type"]} for k,n in graph.items()]}
+        next(n for n in original["nodes"] if n["id"]==124)["widgets_values"]=[True,"cuda","bf16"]
+        store=workflow_profiles.WorkflowStore(self.root/"upscaler-workflow")
+        saved=store.import_workflow("H3 fixture",json.dumps(original).encode())
+        captured=store.attach(saved["version"],json.dumps(graph).encode())
+        wf=store.get(captured["version"])
         self.assertEqual(wf["mapping"]["positive"],"84.value")
         self.assertFalse(wf["issues"])
         eid=uuid.uuid4().hex
@@ -256,10 +263,18 @@ class WorkflowManagerTests(unittest.TestCase):
         ctx["upload"]=upload
         nodes={n["class_type"]:{} for n in graph.values()}
         nodes.update(LoadAudio={},VAELoader={"input":{"required":{"vae_name":[[linux_vae],{}]}}})
+        nodes[upscaler]={"input":{"required":{
+            "device":["COMBO",{"default":"cuda","options":["cuda","rocm","cpu"]}],
+            "precision":["COMBO",{"default":"fp16","options":["fp32","fp16","bf16"]}],
+            "enable_temporal_chunking":["BOOLEAN",{"default":True}],
+            "force_unload":["BOOLEAN",{"default":True}],
+        }}}
         prompts=[]
         def api(_url,path,body=None):
             if path=="/object_info":return nodes
-            if path=="/object_info/VAELoader":return {"VAELoader":nodes["VAELoader"]}
+            if path.startswith("/object_info/"):
+                kind=path.rsplit("/",1)[-1]
+                return {kind:nodes[kind]}
             if path=="/queue":return {"queue_running":[],"queue_pending":[]}
             if path=="/internal/logs/raw":return {"entries":[{"t":"2026-11-23T01:00:00","m":"Fixture log"}]}
             if path=="/prompt":
@@ -279,15 +294,24 @@ class WorkflowManagerTests(unittest.TestCase):
         (previous/"original"/"attempt").mkdir(parents=True)
         production.atomic(previous/"original"/"attempt"/"job.json",{"status":"error"})
         production.atomic(previous/"verification.json",{"status":"failed","message":"Old template rejected"})
+        rejected='ComfyUI 400: {"error": {"type": "prompt_outputs_failed_validation"}}'
+        failed=self.root/eid/"one"/"1"/"job.json"
+        failed.parent.mkdir(parents=True)
+        production.atomic(failed,{"status":"error","revision":"approved","error":rejected})
+        production.atomic(previous/"first-shot.json",{"status":"failed","prompt":None,
+                          "message":"First shot verification failed. "+rejected})
         with patch("workflow_gate.editor_media.tool"):
             session.run("http://fixture",wf)
         self.assertEqual((view["phase"],view["completed"]),("Finished",2),view.get("error"))
         self.assertEqual([p["84"]["inputs"]["value"] for p in prompts],
                          ["Tom and Jack talk.","Jack walks silently."])
         self.assertEqual(uploaded,["Tom.png","Jack.png","Tom.wav","Jack.wav","Jack.png"])
+        self.assertEqual(production.read(failed)["error"],rejected)
         for prompt, expected in zip(prompts,(["Tom.png","Jack.png","Tom.wav","Jack.wav"],["Jack.png"]),strict=True):
             self.assertNotIn("169",prompt)
             self.assertEqual(prompt["65"]["inputs"]["vae_name"],linux_vae)
+            self.assertEqual(prompt["124"]["inputs"],dict(latent=["121",0],device="cuda",precision="bf16",
+                                 enable_temporal_chunking=True,force_unload=True))
             reference=prompt["56"]["inputs"]
             actual=[next(iter(prompt[target[0]]["inputs"].values())) for slot,target in reference.items()
                     if slot.startswith(("ref_images.","ref_audios."))]

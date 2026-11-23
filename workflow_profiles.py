@@ -486,11 +486,28 @@ def validate_shot(wf, shot, images, voices):
     return issues
 
 
-def _resolve_model_choices(nodes, model_info):
+def _resolve_runtime_contracts(graph, keys, model_info, upscaler_precision):
     contracts = {}
-    for node in nodes:
+    for ident in keys:
+        node = graph[ident]
         kind = node["class_type"]
         inputs = node["inputs"]
+        if kind == "MinimaxH3LatentUpscaler3D":
+            if kind not in contracts:
+                contracts[kind] = _contract(model_info(kind), kind)
+            contract = contracts[kind]
+            device = contract.get("device", {})
+            precision = contract.get("precision", {})
+            if type(inputs.get("device")) is bool and inputs.get("precision") in device.get("options", []):
+                if "enable_temporal_chunking" in contract:
+                    inputs.setdefault("enable_temporal_chunking", inputs["device"])
+                inputs["device"] = inputs["precision"]
+                selected = upscaler_precision.get(ident, precision.get("default"))
+                if selected in precision.get("options", []):
+                    inputs["precision"] = selected
+            for key in ("enable_temporal_chunking", "force_unload"):
+                if type(default := contract.get(key, {}).get("default")) is bool:
+                    inputs.setdefault(key, default)
         for key, value in inputs.items():
             if not isinstance(value, str) or not value.lower().endswith(MODEL_SUFFIXES) or not any(c in value for c in "/\\"):
                 continue
@@ -536,7 +553,7 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, 
     if m.get("frames"):
         set_field(m["frames"],timing(wf,shot["seconds"])["frames"])
     if model_info:
-        _resolve_model_choices((graph[key] for key in _upstream(graph, [output])), model_info)
+        _resolve_runtime_contracts(graph, _upstream(graph, [output]), model_info, wf.get("upscaler_precision", {}))
     for role,assets in (("images",list(images)),("audio",list(voices))):
         group,stem,kind,slot,_ = _H3_GROUPS[role]
         selected = [fields[key] for key in m[role]]
@@ -649,6 +666,16 @@ class WorkflowStore:
         wf = inspect_workflow(rec["name"],executable or raw,rec["metadata"],rec["mapping"])
         wf.update(version=version,format="ComfyUI UI JSON" if editor is not None else "ComfyUI API JSON",
                   nodeCount=len(editor if editor is not None else wf["graph"]),executable=True)
+        if editor and "MinimaxH3LatentUpscaler3D" in editor.values():
+            original = json.loads(raw.decode("utf-8-sig"))
+            graph = original.get("workflow", original.get("graph", original))
+            authored = {}
+            for node in graph["nodes"]:
+                widgets = node.get("widgets_values")
+                if node["type"] == "MinimaxH3LatentUpscaler3D" and isinstance(widgets, list) and widgets:
+                    if widgets[-1] in ("fp32", "fp16", "bf16"):
+                        authored[str(node["id"])] = widgets[-1]
+            wf["upscaler_precision"] = authored
         return wf
 
     def _executable(self, rec):

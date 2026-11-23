@@ -20,7 +20,13 @@ def verify_first_shot(ctx, url, deadline, batch, wf, row, retry_failed=False):
     if report.get("status")=="passed":
         return "done"
     if report.get("status")=="failed":
-        raise ValueError(report["message"])
+        message=report["message"]
+        if report.get("prompt") or not (message.startswith("First shot verification failed. ComfyUI 400:")
+                                      and '"prompt_outputs_failed_validation"' in message):
+            raise ValueError(message)
+        # A confirmed validation rejection created no ComfyUI prompt. Keep the old attempt and rebuild its inputs.
+        report={}
+        retry_failed=True
 
     def api(route):
         return ctx["json_api"](url,route)
