@@ -144,10 +144,27 @@ def extract_story(filename, raw_bytes):
     if len(raw_bytes) > 16_000_000:
         raise ValueError("Story import exceeds 16 MB.")
     if ext in (".txt", ".md", ".fountain", ".text"):
-        try:
-            text = raw_bytes.decode("utf-8-sig")
-        except UnicodeDecodeError as err:
-            raise ValueError("Save the script as UTF-8 and import it again.") from err
+        if len(raw_bytes) >= 2 and raw_bytes[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            try:
+                text = raw_bytes.decode("utf-16")
+            except UnicodeDecodeError as err:
+                raise ValueError("Save the script as UTF-8 and import it again.") from err
+        else:
+            try:
+                text = raw_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError as err:
+                # Allow readable Windows Arabic (cp1256) scripts without accepting arbitrary binary bytes.
+                if len(raw_bytes) >= 4 and b"\x00" not in raw_bytes:
+                    try:
+                        candidate = raw_bytes.decode("cp1256")
+                        if re.search(r"[\u0600-\u06ff]", candidate):
+                            text = candidate
+                        else:
+                            raise err
+                    except UnicodeDecodeError:
+                        raise ValueError("Save the script as UTF-8 and import it again.") from err
+                else:
+                    raise ValueError("Save the script as UTF-8 and import it again.") from err
     elif ext == ".docx":
         try:
             with ZipFile(BytesIO(raw_bytes)) as doc:
@@ -191,10 +208,15 @@ def extract_story(filename, raw_bytes):
     return text
 
 
-_HEADING = re.compile(r"^\s*(?:#{1,6}\s*)?(?:(?:EP\s*\d+)\s*[·|:/–—-]\s*)?"
+_HEADING = re.compile(r"^\s*(?:[-*•]\s*)?(?:#{1,6}\s*)?(?:\*{1,2})?(?:(?:EP\s*\d+)\s*[·|:/–—-]\s*)?"
                       r"(?P<kind>scene|shot|sh|sc|(?:ال)?مشهد|(?:ال)?لقط[هة])\s*#?\s*(?P<number>\d+)"
-                      r"(?=\s|$|[.|:：/–—-])(?:\s*[.|:：/–—-]\s*|\s+)?(?P<title>.*?)\s*$", re.I)
-_SCREEN_HEADING = re.compile(r"^\s*(?:INT\.|EXT\.|INT\./EXT\.|I/E\.)\s+\S+", re.I)
+                      r"(?=\s|$|\*|[.|:：/–—-])(?:\s*\*?\s*[.|:：/–—-]\s*|\s+)?(?P<title>.*?)\s*(?:\*{1,2})?\s*$", re.I)
+_SCREEN_HEADING = re.compile(r"^\s*(?:\*{1,2})?(?:INT\.|EXT\.|INT\./EXT\.|I/E\.)\s+\S+", re.I)
+_TIMED_SCENE = re.compile(r"^\s*(?:\*{1,2})?(?:Scene|(?:ال)?مشهد)\s+(\d+)\s*[/(:：-]\s*(\d+(?::\d{2}){1,2})\s*[-–—]\s*(\d+(?::\d{2}){1,2})\s*\)?(?:\*{1,2})?\s*$", re.I)
+_SCENE_KINDS = {"scene", "sc", "مشهد", "المشهد"}
+_SUBJECTS = re.compile(r"^\s*subject[ _]definitions\s*[:：]\s*(.*(?:\n[ \t]*<Picture[^\n]*)*)", re.I | re.M)
+_PICTURE_SUBJECT = re.compile(r"<Picture\s+(\d+)>\s*(?:=|is\b)\s*([^,;.<>\n]+)", re.I)
+_PROMPT_DIALOGUE = re.compile(r"([^\W\d_][\w’'\-]*(?:[ \t]+[\w’'\-]+)*?)(?:\s*[\[(]\s*(?P<off>O\.?S\.?|O\.?C\.?|V\.?O\.?|off[ -]?screen)\s*[\])])?\s*[:：]\s*<d>(?P<text>.*?)</d>", re.I | re.S)
 _OFF = r"(?:O[.\s]?S\.?|O[.\s]?C\.?|V[.\s]?O\.?|off[\s-]?screen|off[\s-]?camera|voice[\s-]?over|خارج (?:الكادر|الشاشة|المشهد|الصورة)|من الخارج)"
 _OFF_MARKER = re.compile(r"(?<!\w)"+_OFF+r"(?!\w)", re.I)
 _TAG = re.compile(r"^\s*(?P<speaker>[\w][\w’'\- .\u064b-\u065f]{0,48}?)"
@@ -325,6 +347,39 @@ def _unique(values):
     return list(dict.fromkeys(values))
 
 
+def _prompt_subjects(text):
+    section = _SUBJECTS.search(text)
+    if not section:
+        return []
+    return _unique(name.strip() for _, name in sorted(
+        _PICTURE_SUBJECT.findall(section[1]), key=lambda entry: int(entry[0])) if name.strip())
+
+
+def _subject_references(subjects, registry, assets, overrides):
+    names = _names(registry)
+    by_id = {character["id"]: character for character in registry}
+    assigned = {_fold(label): cid for label, cid in overrides.get("aliases", {}).items()}
+    library = sorted(assets, key=lambda value: (_fold(Path(value).stem), value))
+    images, audio, missing = [], [], []
+    for subject in subjects:
+        label = _fold(subject)
+        ids = names.get(label, set())
+        character = by_id.get(assigned.get(label) or (next(iter(ids)) if len(ids)==1 else ""), {})
+        aliases = {label, *(_fold(alias) for alias in character.get("aliases", []))}
+        if character.get("name"):
+            aliases.add(_fold(character["name"]))
+        for field, extensions, found in (("images", PHOTOS, images), ("voices", VOICES, audio)):
+            reference = next((name for name in character.get(field, []) if name in assets), "")
+            if not reference:
+                reference = next((name for name in library if Path(name).suffix.lower() in extensions
+                                  and re.sub(r"\s*\(\d+\)$", "", _fold(Path(name).stem)) in aliases), "")
+            if reference:
+                found.append(reference)
+            elif field == "images":
+                missing.append(f"Restore or assign an image reference for '{subject}'.")
+    return images, audio, missing
+
+
 def assignments(shot, characters):
     aliases = _names(characters)
     overrides = shot.get("overrides", {})
@@ -333,7 +388,14 @@ def assignments(shot, characters):
     valid = {c["id"] for c in characters}
     visible, speaking, blockers, ambiguity_choices = [], [], [], []
     text = shot.get("action", shot.get("prompt", ""))
-    dialogue, narrative = _dialogues(text, aliases)
+    subjects = _prompt_subjects(shot.get("prompt", text)) if shot.get("story_managed") else []
+    subject_names = {_fold(name) for name in subjects}
+    if subjects:
+        dialogue = [{"speaker": m[1], "text": m["text"], "offscreen": bool(m["off"])}
+                    for m in _PROMPT_DIALOGUE.finditer(shot["prompt"])]
+        narrative = ", ".join(subjects)
+    else:
+        dialogue, narrative = _dialogues(text, aliases)
     if shot.get("dialogue_override") is not None:
         dialogue = deepcopy(shot["dialogue_override"])
 
@@ -351,7 +413,7 @@ def assignments(shot, characters):
         if len(choices) > 1:
             blockers.append(f"Choose a character ID for ambiguous {'speaker' if speaker else 'name'} '{label}'.")
             ambiguity_choices.append({"label":label, "kind":"speaker" if speaker else "name", "ids":sorted(choices)})
-        elif speaker:
+        elif speaker and key not in subject_names:
             blockers.append(f"Assign a character ID to speaker '{label or '(unattributed dialogue)'}'.")
             ambiguity_choices.append({"label":label,"kind":"speaker","ids":sorted(valid)})
         return ""
@@ -368,7 +430,7 @@ def assignments(shot, characters):
         entry["character_id"] = resolved
         if resolved:
             speaking.append(resolved)
-            if not entry["offscreen"]:
+            if not entry["offscreen"] and not subjects:
                 visible.append(resolved)
     visible = _unique(overrides.get("visible_ids", visible))
     speaking = _unique(overrides.get("speaking_ids", speaking))
@@ -399,8 +461,17 @@ def _shot(body, scene_id, characters, heading=""):
             key = tagged.group(1).casefold()
             shot[_FIELDS.get(key, key)] = tagged.group(2)
     matched = assignments(shot, characters)
+    first_line = next((line for line in body.splitlines() if line.strip()), "")
+    timed = _TIMED_SCENE.match(first_line)
+    duration = _estimate(body, matched["dialogue"])
+    if timed:
+        def seconds(clock):
+            return sum(int(piece)*60**i for i, piece in enumerate(reversed(clock.split(":"))))
+        span = seconds(timed[3]) - seconds(timed[2])
+        if span > 0:
+            duration = span
     shot.update(visible_ids=matched["visible"], speaking_ids=matched["speaking"], dialogue=matched["dialogue"],
-                dialog=bool(matched["dialogue"]), seconds=_estimate(body, matched["dialogue"]))
+                dialog=bool(matched["dialogue"]), seconds=duration)
     return shot
 
 
@@ -443,7 +514,14 @@ def _units(body, aliases):
 def parse_story(text, characters=()):
     if not isinstance(text, str) or not text.strip() or len(text)>MAX_TEXT:
         raise ValueError("Enter a story of up to 2,000,000 characters.")
-    scenes, scene, heading, body = [], None, "", []
+    scenes, scene, heading, inline_title, body = [], None, "", "", []
+    lines = text.splitlines(keepends=True)
+    markers = [_HEADING.match(line) for line in lines]
+    has_shots = any(marker and _fold(marker["kind"]) not in _SCENE_KINDS for marker in markers)
+    nonblank = [i for i, line in enumerate(lines) if line.strip()]
+    timed_shots = any(markers[a] and _fold(markers[a]["kind"]) not in _SCENE_KINDS and _TIMED_SCENE.match(lines[b])
+                      for a, b in zip(nonblank, nonblank[1:]))
+    scene_number = None
     def ensure_scene():
         nonlocal scene
         if scene is None:
@@ -452,28 +530,42 @@ def parse_story(text, characters=()):
         return scene
     def flush():
         nonlocal body
-        value = "\n".join(body).strip()
-        if heading and not value:
-            raise ValueError(f"Missing shot text under '{heading}'.")
-        if value:
+        value = "".join(body).strip("\r\n")
+        if heading and not value.strip():
+            if inline_title.strip():
+                value = inline_title.strip()
+            else:
+                raise ValueError(f"Missing shot text under '{heading}'.")
+        preamble = scene is None and has_shots
+        if value.strip() and (heading or not (preamble or timed_shots)):
             target = ensure_scene()
             for piece in ([value] if heading else _units(value,_names(characters))):
                 target["shots"].append(_shot(piece, target["id"], characters, heading))
         body = []
-    for line in text.splitlines():
-        marker = _HEADING.match(line)
+    for line, marker in zip(lines, markers):
+        timed = _TIMED_SCENE.match(line)
+        if timed and heading and not any(part.strip() for part in body):
+            number = int(timed[1])
+            if scene is None or scene_number != number:
+                scene = {**new_scene(f"Scene {number}"), "shots": []}
+                scenes.append(scene)
+            scene_number = number
+            body.append(line)
+            continue
         if not marker and not _SCREEN_HEADING.match(line):
             body.append(line)
             continue
         flush()
-        label = re.sub(r"^\s*#{1,6}\s*", "", line).strip()
-        if not marker or _fold(marker["kind"]) in {"scene","sc","مشهد","المشهد"}:
+        label = re.sub(r"^\s*(?:[-*•]\s*)?(?:#{1,6}\s*)?", "", line).strip().strip("*").strip()
+        if not marker or _fold(marker["kind"]) in _SCENE_KINDS:
             scene = {**new_scene(label), "shots": []}
             scenes.append(scene)
+            scene_number = int(marker["number"]) if marker else None
             heading = ""
+            inline_title = ""
         else:
-            ensure_scene()
             heading = label
+            inline_title = (marker["title"] or "").strip().strip("*").strip()
     flush()
     if not any(sc["shots"] for sc in scenes):
         raise ValueError("Add narrative text beneath a scene or shot heading.")
@@ -709,7 +801,14 @@ def preview_shot(db, episode, shot, assets, limits=None):
         images = [n for n in selected if Path(n).suffix.lower() in PHOTOS]
         audio = [n for n in selected if Path(n).suffix.lower() in VOICES]
     descriptions = []
-    for cid in _unique(cast["visible"]+cast["speaking"]):
+    subjects = _prompt_subjects(shot.get("prompt", "")) if shot.get("story_managed") else []
+    if subjects:
+        subject_images, subject_audio, missing = _subject_references(
+            subjects, registry, asset_set, shot.get("overrides", {}))
+        images = subject_images + images
+        audio = subject_audio + audio
+        blockers.extend(missing)
+    for cid in ([] if subjects else _unique(cast["visible"]+cast["speaking"])):
         char = by_id.get(cid)
         if char is None:
             continue

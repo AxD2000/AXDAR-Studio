@@ -209,7 +209,11 @@ class StudioActions:
         elif path == "/characters/save":
             story.save_character(db, obj["character"], assets)
         elif path == "/story/commit":
+            if obj.get("newEpisode"):
+                ep = story.new_episode(str(obj["newEpisode"]))
+                db["episodes"].append(ep)
             story.apply_story(db, ep["id"], obj["proposal"], assets)
+            result["episode"] = ep["id"]
         elif path == "/shots/new":
             scene = find_id(ep["scenes"], obj["scene"], "Scene")
             parsed = story.parse_story(obj.get("text") or "New shot", db["characters"])
@@ -221,7 +225,7 @@ class StudioActions:
             ep["shots"].append(shot)
         elif path == "/shots/preview":
             shot = find_id(ep["shots"], obj["shot"], "Shot")
-            return self.preview(db, ep, shot, assets)
+            return self.preview(db, ep, shot, assets, graph=obj.get("graph") is not False)
         elif path == "/shots/update":
             story.update_shot(db, ep, obj["shot"], obj["changes"], assets, limits)
         elif path == "/shots/remove":

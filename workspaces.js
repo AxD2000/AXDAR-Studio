@@ -26,7 +26,8 @@ function renderStory(){
 }
 function renderShots(){
     const shot=selectedShot();
-    return '<div class="lab"><section class="panel"><h2>Shot browser</h2>'+sceneBrowser()+'</section><div>'+(shot?shotPanel(shot):'<section class="panel">Add a scene in Story &amp; Scenes to begin.</section>')+'</div></div>';
+    return '<div class="lab"><section class="panel"><button class="primary" data-story-action="file">Import Episode File</button>'+
+        '<h2>Shot List</h2>'+sceneBrowser()+'</section><div>'+(shot?shotPanel(shot):'<section class="panel">Import an episode to see its shots.</section>')+'</div></div>';
 }
 function costOutput(){
     const attempts=estimate.shots/(1-estimate.failure/100),hours=attempts*estimate.minutes/60,base=estimate.shots*estimate.minutes/60*estimate.rate;
@@ -49,6 +50,7 @@ function render(){
     $('#projectTitle').textContent=ep.title||'Untitled episode';
     $('#projectCount').textContent=(ep.scenes||[]).length+' scenes · '+ep.shots.length+' shots · '+ep.shots.filter(s=>s.approved).length+' approved';
     $('#app').innerHTML=[renderStory,renderShots,()=>characterRegistry()+libraryView(),sessionView,renderEditor,renderEconomics,renderSettings,workflowWorkspace][page]();
+    if(page===1&&selectedShot())loadShotReferences();
 }
 document.addEventListener('click',e=>{
     const b=e.target.closest('button');if(!b)return;

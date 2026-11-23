@@ -34,7 +34,10 @@ async function projectAction(path,body){
 }
 async function uploadContent(path,file){
     const response=await fetch(path,{method:'POST',headers:{'X-Studio':studioToken,'X-Filename':encodeURIComponent(file.name),'Content-Type':'application/octet-stream'},body:file});
-    const data=await response.json();if(!response.ok)throw Error(localize(data.error)||response.status);return data;
+    const data=await response.json().catch(()=>({}));
+    if(response.status===403)throw Error('Studio restarted — reload this page (F5) and try again.');
+    if(!response.ok)throw Error(localize(data.error)||response.status);
+    return data;
 }
 function sceneShots(id){return ep.shots.filter(s=>s.scene_id===id)}
 function titleShot(s){return s.sourceHeading||s.title||('Shot '+(ep.shots.indexOf(s)+1))}
@@ -81,7 +84,6 @@ function characterRegistry(){
         '<div class="form-pair"><label>Image references<select multiple name="images">'+refs(c?.images,false)+'</select></label><label>Voice references<select multiple name="voices">'+refs(c?.voices,true)+'</select></label></div>'+
         '<button class="primary" type="submit">Save character</button></form></section>';
 }
-const textFields={action:'Narrative action',camera:'Camera framing',movement:'Camera movement',lighting:'Lighting',environment:'Environment',motion:'Motion',sound:'Sound requirements',prompt:'Positive prompt',negative_prompt:'Negative prompt',change:'Retake notes'};
 function castEditor(s,kind,label){
     const key=kind+'_ids',overrides=s.overrides||{},manual=Array.isArray(overrides[key]);
     return '<fieldset><legend>'+label+'</legend><label><input type="checkbox" data-cast-enable="'+kind+'" '+(manual?'checked':'')+'> Assign by character ID</label>'+
@@ -98,15 +100,21 @@ function shotPanel(s){
         '<label>Speaker assignment<select data-speaker-id="'+esc(d.speaker)+'">'+option('','Match by name',s.overrides?.speakers?.[d.speaker])+((db.characters||[]).map(c=>option(c.id,c.name,s.overrides?.speakers?.[d.speaker])).join(''))+'</select></label>'+
         '<label><input type="checkbox" data-offscreen="'+i+'" '+(d.offscreen?'checked':'')+'> Off-screen dialogue</label></div>').join('');
     return '<article data-shot-editor="'+esc(s.id)+'"><div class="top"><h2 dir="auto">'+esc(titleShot(s))+'</h2><span class="pill">'+(s.approved?'Approved':'In review')+'</span></div>'+
-        '<small>'+esc((ep.scenes||[]).find(c=>c.id===s.scene_id)?.title)+' · '+esc(s.id)+'</small>'+
-        '<form id="shotForm"><div class="form-pair">'+Object.entries(textFields).map(([key,label])=>'<label>'+label+'<textarea dir="auto" data-shot-field="'+key+'">'+esc(s[key])+'</textarea></label>').join('')+'</div>'+
-        '<div class="form-pair"><label>Duration (seconds)<input type="number" min="0.01" step="any" required data-shot-field="seconds" value="'+esc(s.seconds)+'"></label><label>Production workflow<input readonly value="'+esc(profile?profileLabel(profile):'No workflow selected')+'"></label></div>'+
-        '<div class="form-pair">'+castEditor(s,'visible','Visible characters')+castEditor(s,'speaking','Speaking characters')+'</div>'+
-        (dialogue?'<h3>Original dialogue and attribution</h3>'+dialogue:'')+
-        '<details><summary>Additional shot references</summary><label>Image references<select multiple id="shotImages">'+choices(images().map(f=>[f,name(f)]),manual.images)+'</select></label><label>Audio references<select multiple id="shotAudio">'+choices(assets.filter(audio).map(f=>[f,name(f)]),manual.audio)+'</select></label></details>'+
-        (profile?.fields?.some(f=>f.roles?.includes('parameter'))?'<details><summary>Shot runtime parameters (JSON)</summary><label>Parameter values by workflow field ID<textarea id="shotParameters" placeholder="{}">'+esc(JSON.stringify(s.workflowParameters||{},null,2))+'</textarea></label></details>':'')+
-        '<div id="assignmentIssues">'+ambiguityEditor(s,p)+'</div><div class="actions"><button class="primary" type="submit">Save and preview inputs</button></div></form>'+
-        (p?previewPanel(p):'')+'<div class="actions"><button data-story-action="approve">'+(approvalIsCurrent(s)?'Revoke approval':s.approved?'Re-approve shot':'Approve shot')+'</button><button data-story-action="approve-all">Approve all ready shots</button><button data-page="3">Open Production</button><button data-story-action="shot-remove">Remove draft shot</button></div>'+results(s)+'</article>';
+        '<form id="shotForm"><label>Complete Prompt<textarea dir="auto" rows="16" data-shot-field="prompt">'+esc(s.prompt??s.action??'')+'</textarea></label>'+
+        '<details id="shotSettings"><summary>Advanced shot settings</summary>'+
+        '<label>Duration (seconds)<input type="number" min="0.01" step="any" required data-shot-field="seconds" value="'+esc(s.seconds)+'"></label>'+
+        (!/^\s*subject[ _]definitions\s*:/im.test(s.prompt||'')?
+          '<div class="form-pair">'+castEditor(s,'visible','Visible characters')+castEditor(s,'speaking','Speaking characters')+'</div>':'')+
+        (dialogue?'<h3>Dialogue attribution</h3>'+dialogue:'')+
+        '<label>Additional images<select multiple id="shotImages">'+choices(images().map(f=>[f,name(f)]),manual.images)+'</select></label>'+
+        '<label>Additional voices<select multiple id="shotAudio">'+choices(assets.filter(audio).map(f=>[f,name(f)]),manual.audio)+'</select></label>'+
+        (profile?.fields?.some(f=>f.roles?.includes('parameter'))?'<label>Shot runtime parameters (JSON)<textarea id="shotParameters">'+esc(JSON.stringify(s.workflowParameters||{},null,2))+'</textarea></label>':'')+
+        '<div id="assignmentIssues">'+ambiguityEditor(s,p)+'</div>'+
+        '<label>Retake notes<textarea dir="auto" data-shot-field="change">'+esc(s.change)+'</textarea></label>'+
+        '<button type="button" data-story-action="shot-remove">Remove draft shot</button></details>'+
+        '<div class="actions"><button class="primary" type="submit">Save Prompt</button></div></form>'+
+        '<section id="shotReferences"><h3>Character References</h3>'+referenceContents(p,s)+'</section>'+
+        '<div class="actions"><button data-story-action="approve">'+(approvalIsCurrent(s)?'Revoke approval':s.approved?'Re-approve shot':'Approve shot')+'</button><button data-story-action="approve-all">Approve all ready shots</button><button data-page="3">Generate in Production</button></div>'+results(s)+'</article>';
 }
 function ambiguityEditor(s,p){
     const assigned=s.overrides?.aliases||{},issues=p?.ambiguity_choices||[],labels=new Set(Object.keys(assigned));
@@ -118,25 +126,24 @@ function manualReferences(s){
     const references=[s.image,...(s.refs||[])].filter(Boolean);
     return {images:references.filter(f=>!audio(f)),audio:references.filter(audio)};
 }
-function previewPanel(p){
-    const visible=(p.visible||[]).map(c=>c.name||db.characters.find(d=>d.id===c)?.name||String(c));
-    const speaking=(p.speaking||[]).map(c=>c.name||db.characters.find(d=>d.id===c)?.name||String(c));
-    return '<section class="panel"><h3>Final production inputs</h3><p>'+ (p.ready?'Ready for production':'Needs review')+' · '+esc(p.seconds)+' s · '+esc(p.workflow_version||'No workflow')+'</p>'+
-        (p.blockers?.length?'<ul class="danger">'+p.blockers.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>':'')+
-        (p.warnings?.length?'<ul>'+p.warnings.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>':'')+
-        '<p>Visible · '+esc(visible.join(', ')||'None')+'<br>Speaking · '+esc(speaking.join(', ')||'None')+'</p>'+
-        '<p>Images · '+esc((p.images||[]).join(', ')||'None')+'<br>Audio · '+esc((p.audio||[]).join(', ')||'None')+'</p>'+
-        '<h3>Positive prompt</h3><pre dir="auto">'+esc(p.positive_prompt)+'</pre>'+(p.negative_prompt?'<h3>Negative prompt</h3><pre dir="auto">'+esc(p.negative_prompt)+'</pre>':'')+
-        (p.split_proposal?.length?'<h3>Proposed split</h3><ol>'+p.split_proposal.map(s=>'<li dir="auto">'+esc(s.seconds)+' s · '+esc(s.action||s.prompt||s.text)+'</li>').join('')+'</ol><button data-story-action="split">Apply proposed split</button>':'')+
-        (p.graph?'<details><summary>Derived runtime graph</summary><pre>'+esc(JSON.stringify(p.graph,null,2))+'</pre></details>':'')+'</section>';
+function referenceContents(p,s){
+    const files=p?[...p.images,...p.audio]:[s.image,...(s.refs||[])].filter(Boolean);
+    const refs=files.map(f=>'<figure><figcaption>'+esc(f)+'</figcaption>'+
+        (audio(f)?'<audio controls preload="none" src="'+src(f)+'"></audio>':'<img loading="lazy" alt="'+esc(f)+'" src="'+src(f)+'">')+'</figure>').join('');
+    return (refs?'<div class="gallery shot-pictures">'+refs+'</div>':p?'<p>No character references found.</p>':'<p role="status">Matching assets…</p>')+
+        (p?.blockers?.length?'<ul class="danger">'+p.blockers.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>':'')+
+        (p?.split_proposal?.length?'<button data-story-action="split">Apply proposed split</button>':'');
 }
 function selectedValues(t){return Array.from(t.selectedOptions,o=>o.value)}
 function shotChanges(s){
     const changes={};
     for(const t of document.querySelectorAll('[data-shot-field]')){
         const key=t.dataset.shotField,val=t.type==='number'?t.valueAsNumber:t.value;
-        if((s[key]??'')!==val)changes[key]=val;
+        const original=s[key]??(key==='prompt'?s.action:'')??'';
+        if(typeof val==='string'&&String(original).replace(/\r\n?/g,'\n')===val)continue;
+        if(original!==val)changes[key]=val;
     }
+    if('prompt' in changes&&s.action===s.prompt)changes.action=changes.prompt;
     const overrides=structuredClone(s.overrides||{});
     for(const t of document.querySelectorAll('[data-cast-enable]')){
         const kind=t.dataset.castEnable,key=kind+'_ids';
@@ -174,10 +181,17 @@ async function saveShot(){
     const s=selectedShot(),changes=shotChanges(s);
     if(Object.keys(changes).length)await projectAction('/shots/update',{episode:ep.id,shot:s.id,changes});
 }
-async function fetchPreview(){
-    const episodeId=ep.id,shotId=selectedShot().id;
-    const data=await post('/shots/preview',{episode:episodeId,shot:shotId});
-    if(ep.id===episodeId&&selectedShot()?.id===shotId){preview={episode:episodeId,shot:shotId,data};render()}
+function loadShotReferences(){
+    const shot=selectedShot(),episodeId=ep.id,panel=$('#shotReferences');
+    if(!panel||(preview?.episode===episodeId&&preview.shot===shot.id))return;
+    post('/shots/preview',{episode:episodeId,shot:shot.id,graph:false}).then(data=>{
+        if(!panel.isConnected)return;
+        preview={episode:episodeId,shot:shot.id,data};
+        panel.innerHTML='<h3>Character References</h3>'+referenceContents(data,shot);
+        $('#assignmentIssues').innerHTML=ambiguityEditor(shot,data);
+    }).catch(err=>{
+        if(panel.isConnected)panel.innerHTML='<h3>Character References</h3><p class="danger">'+esc(err.message)+'</p>';
+    });
 }
 async function approveShots(all){
     const revoke=!all&&approvalIsCurrent(selectedShot());
@@ -188,7 +202,7 @@ async function approveShots(all){
         render();reportStatus('Approval revoked.');return;
     }
     const result=await projectAction('/shots/approve',{episode:ep.id,...(all?{}:{shot:shot.id})});
-    if(!all&&page===1)await fetchPreview();else render();
+    render();
     const blocked=Object.entries(result.blocked||{}),approved=Array.isArray(result.approved)?result.approved.length:result.approved;
     if(blocked.length){
         $('#notice').textContent=(approved||0)+' approved. '+blocked.map(([id,why])=>(titleShot(ep.shots.find(s=>s.id===id)||{sourceHeading:id}))+': '+(Array.isArray(why)?why.join(' · '):why)).join(' / ');
@@ -216,9 +230,19 @@ document.addEventListener('change',async e=>{
     if(t.dataset.castEnable){$('[data-cast-list="'+t.dataset.castEnable+'"]').disabled=!t.checked;return}
     if(t.id==='characterChoice'){selectedCharacter=t.value||null;render();return}
     if(t.id!=='storyFile'||!t.files.length)return;
-    const file=t.files[0],episodeId=ep.id;t.value='';
+    const file=t.files[0],episodeId=ep.id,quick=page===1;t.value='';
     try{
-        const proposal=await uploadContent('/story/parse',file);proposals.set(episodeId,proposal);
+        const proposal=await uploadContent('/story/parse',file);
+        if(quick){
+            const current=db.episodes.find(e=>e.id===episodeId);
+            const title=file.name.replace(/\.[^.]+$/,'').replaceAll('_',' ');
+            const result=await projectAction('/story/commit',{episode:episodeId,proposal,
+                ...(current?.shots.length?{newEpisode:title}:{})});
+            ep=db.episodes.find(e=>e.id===result.episode);
+            selectedId=ep.shots[0]?.id||'';
+            page=1;render();reportStatus(ep.shots.length+' shots imported.');return;
+        }
+        proposals.set(episodeId,proposal);
         if(ep.id===episodeId){render();reportStatus('Review the proposed scenes before adding them.')}
     }catch(err){reportError(err)}
 });
@@ -228,7 +252,7 @@ document.addEventListener('submit',async e=>{
     e.preventDefault();
     const button=form.querySelector('[type=submit]');button.disabled=true;
     try{
-        if(form.id==='shotForm'){await saveShot();await fetchPreview();reportStatus('Shot inputs previewed.');return}
+        if(form.id==='shotForm'){await saveShot();render();reportStatus('Prompt saved.');return}
         const f=form.elements,id=selectedCharacter||uid();
         await projectAction('/characters/save',{character:{id,name:f.namedItem('name').value.trim(),aliases:f.aliases.value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean),description:f.description.value,images:selectedValues(f.images),voices:selectedValues(f.voices)}});
         selectedCharacter=id;render();reportStatus('Character saved.');
@@ -237,7 +261,7 @@ document.addEventListener('submit',async e=>{
 document.addEventListener('click',async e=>{
     const b=e.target.closest('button[data-story-action],button[data-review-retake]');if(!b)return;
     const action=b.dataset.storyAction,episodeId=ep?.id;
-    if(b.dataset.reviewRetake){selectedId=b.dataset.reviewRetake;page=1;render();$('[data-shot-field="change"]').focus();return}
+    if(b.dataset.reviewRetake){selectedId=b.dataset.reviewRetake;page=1;render();$('#shotSettings').open=true;$('[data-shot-field="change"]').focus();return}
     b.disabled=true;
     try{
         switch(action){

@@ -239,6 +239,17 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual((p["images"],p["audio"]),(["clock.jpg"],["ava.wav"]))
         self.assertFalse(self.preview(legacy,max_audio=0)["ready"])
 
+    def test_inline_shots_markdown_headings_timed_scenes_and_encodings(self):
+        inline = se.parse_story("Scene 1\nShot 1: Ava enters the room.\nShot 2: Sam waves.\n")
+        self.assertEqual([s["action"] for s in inline["scenes"][0]["shots"]], ["Ava enters the room.", "Sam waves."])
+        md = se.parse_story("**Scene 1**\n- **Shot 1:** Ava opens the window.\n")
+        self.assertEqual(len(md["scenes"][0]["shots"]), 1)
+        ep02 = se.parse_story("EP02 · SH001 | The Window Seat\nScene 1 / 00:00 – 00:10\nAva looks outside.\n")
+        self.assertEqual(ep02["scenes"][0]["title"], "Scene 1")
+        self.assertEqual(ep02["scenes"][0]["shots"][0]["seconds"], 10)
+        self.assertEqual(se.extract_story("ar.txt", "مشهد 1\nالنافذة".encode("utf-16")), "مشهد 1\nالنافذة")
+        self.assertEqual(se.extract_story("ar.txt", "مشهد 1\nالنافذة مفتوحة".encode("cp1256")), "مشهد 1\nالنافذة مفتوحة")
+
 
 if __name__=="__main__":
     unittest.main()

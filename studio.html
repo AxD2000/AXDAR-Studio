@@ -8,7 +8,7 @@ let db,assets,ep,page=0,state={results:[]},saveQueue=Promise.resolve(),timer,edi
 const aliases={'Grumpy Orange Tabby Character Sheet.png':'Orange tabby','Golden Retriever Character Turnaround Sheet (1).png':'Golden retriever','Cozy Sunlit Traditional Living Room.png':'Living room','emma.png':'Emma','jack.png':'Jack','tobby.png':'Tobby','emma.mp3':'Emma · voice','jack.mp3':'Jack · voice','tom.mp3':'Tom · voice'};
 const name=f=>aliases[f]||f, audio=f=>/\.(mp3|wav|ogg|m4a|flac)$/i.test(f), images=()=>assets.filter(f=>!audio(f)), src=f=>'/asset/'+encodeURIComponent(f);
 function option(v,t,selected){return '<option value="'+esc(v)+'" '+(v===selected?'selected':'')+'>'+esc(t)+'</option>'}
-async function post(path,obj){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Studio':'__TOKEN__'},body:JSON.stringify(obj)});let data=await r.json();if(!r.ok)throw Error(localize(data.error)||r.status);return data}
+async function post(path,obj){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Studio':'__TOKEN__'},body:JSON.stringify(obj)});let data=await r.json().catch(()=>({}));if(r.status===403)throw Error('Studio restarted — reload this page (F5) and try again.');if(!r.ok)throw Error(localize(data.error)||r.status);return data}
 function savePayload(){
     return {
         id:db.id,
