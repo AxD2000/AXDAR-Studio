@@ -157,13 +157,18 @@ def execute(folder, config):
             stage(PHASES[4],"Running",model["name"],index,len(absent))
             model["status"]="Downloading"
             report(result)
+            def on_progress(done_bytes, total_bytes, speed_mibs, _idx=index, _name=model["name"]):
+                pct = (done_bytes * 100.0 / total_bytes) if total_bytes else 100.0
+                stage(PHASES[4],"Running",f"{_name} · {done_bytes/1e9:.2f}/{total_bytes/1e9:.2f} GB ({pct:.0f}%) · {speed_mibs:.1f} MiB/s",_idx,len(absent))
             try:
-                provision.install_models(root,[model["name"]])
+                provision.install_models(root,[model["name"]],progress=on_progress)
             except (OSError,ValueError) as exc:
                 model["status"]="Failed"
                 model["error"]=redact(str(exc),os.environ.get("HF_TOKEN",""))
                 report(result)
                 raise
+            model["status"]="Installed"
+            report(result)
         stage(PHASES[4],"Completed","Verified model downloads",len(absent),len(absent))
         sage_installed=result.get("sageAttention")=="Missing"
         if sage_installed:

@@ -3,7 +3,9 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.parse import urlsplit
@@ -57,7 +59,8 @@ def install_sage(root):
         source, helpers, wheels, staged = (path/name for name in ("source","helpers","wheels","staged"))
         subprocess.run(["git","init","-q",str(source)], check=True)
         def step(args, **kwargs):
-            subprocess.run(args, check=True, capture_output=True, timeout=900, **kwargs)
+            print("[sage]", " ".join(str(a) for a in args[:6]), flush=True)
+            subprocess.run(args, check=True, timeout=900, **kwargs)
         step(["git","-C",str(source),"fetch","--depth=1","https://github.com/thu-ml/SageAttention.git",SAGE_REVISION])
         step(["git","-C",str(source),"checkout","--detach",SAGE_REVISION])
         pip = [py,"-m","pip","--disable-pip-version-check"]
@@ -129,7 +132,7 @@ def model_sources():
     return {Path(item["file"]).name:item for item in lock}
 
 
-def download_weight(url, tmp, expected):
+def download_weight(url, tmp, expected, progress=None, label=""):
     offset=tmp.stat().st_size if tmp.exists() else 0
     if offset == expected:
         return
@@ -138,6 +141,11 @@ def download_weight(url, tmp, expected):
         headers["Authorization"]="Bearer "+token
     if offset:
         headers["Range"]=f"bytes={offset}-"
+    name = label or tmp.stem
+    started = time.monotonic()
+    start_offset = offset
+    last_report = 0.0
+    print(f"[download] Starting {name} ({offset/1e9:.2f}/{expected/1e9:.2f} GB)", flush=True)
     with build_opener(ModelRedirect()).open(Request(url,headers=headers),timeout=90) as src:
         if src.status==206:
             match=re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",src.headers.get("Content-Range",""))
@@ -145,15 +153,25 @@ def download_weight(url, tmp, expected):
                 raise ValueError("The model server returned an invalid resume range.")
         else:
             offset=0
+            start_offset=0
         with tmp.open("ab" if offset else "wb") as out:
             while chunk:=src.read(1024*1024):
                 offset+=len(chunk)
                 if offset>expected:
                     raise ValueError("The download exceeds the verified model size.")
                 out.write(chunk)
+                now = time.monotonic()
+                if now - last_report >= 2.0 or offset == expected:
+                    elapsed = max(0.001, now - started)
+                    mb_s = (offset - start_offset) / (1024 * 1024) / elapsed
+                    pct = (offset * 100.0 / expected) if expected else 100.0
+                    print(f"[download] {name}: {offset/1e9:.2f}/{expected/1e9:.2f} GB ({pct:.1f}%) · {mb_s:.1f} MiB/s", flush=True)
+                    if progress:
+                        progress(offset, expected, mb_s)
+                    last_report = now
 
 
-def install_models(root, required):
+def install_models(root, required, progress=None):
     known=model_sources()
     changed=False
     for name in required:
@@ -169,13 +187,15 @@ def install_models(root, required):
         if shutil.disk_usage(dest.parent).free<max(0,m["bytes"]-partial)+256*1024**2:
             raise ValueError("Insufficient disk space for "+name)
         url="https://huggingface.co/"+m["repo"]+"/resolve/"+m["revision"]+"/"+m["file"]
-        download_weight(url,tmp,m["bytes"])
+        download_weight(url,tmp,m["bytes"],progress=progress,label=name)
         if tmp.stat().st_size!=m["bytes"]:
             raise ValueError("Model download incomplete. Retry to resume: "+name)
+        print(f"[verify] Checking SHA-256 for {name}...", flush=True)
         if digest(tmp)!=m["sha256"]:
             tmp.unlink()
             raise ValueError("Downloaded model failed verification: "+name)
         tmp.replace(dest)
+        print(f"[verify] Verified {name}", flush=True)
         changed=True
     return changed
 
