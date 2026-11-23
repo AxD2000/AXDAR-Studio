@@ -149,4 +149,18 @@ class HttpTests(unittest.TestCase):
         snap=self.g['files_snapshot']()
         self.assertIsNot(snap,self.g['files'])
 
+    def test_layer_d_production_ui_and_service_status_endpoint(self):
+        with urlopen(self.url+'/production-ui.js') as response:
+            prod_js=response.read().decode()
+        self.assertIn('Autonomous Vast production (Layer D)',prod_js)
+        self.assertIn('driveClientFile',prod_js)
+        self.assertIn('cancel-countdown',prod_js)
+        with urlopen(self.url+'/connection-ui.js') as response:
+            conn_js=response.read().decode()
+        self.assertIn('connect-ssh',conn_js)
+        self.assertIn('Discover instances',conn_js)
+        status=self.post({'action':'service-status'},route='/production')
+        self.assertEqual(set(status.keys()),{'driveConnected','webhookSaved','visualSaved'})
+        self.assertTrue(all(isinstance(v,bool) for v in status.values()))
+
 if __name__=='__main__':unittest.main()

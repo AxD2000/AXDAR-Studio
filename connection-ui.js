@@ -1,3 +1,5 @@
+let discoveredInstances = [];
+
 function connectionPanel(){
     const c=state.connection||{};
     const details=c.instance&&!['Vast starting','Waiting for Vast','Unavailable'].includes(c.state)?
@@ -10,11 +12,21 @@ function connectionPanel(){
       (c.error?'<p class="'+(pending?'muted':'danger')+'">'+esc(c.error)+'</p>':'')+
       '<div class="row"><button data-connection="refresh">Refresh instances</button>'+
       '<button data-connection="reconnect">Reconnect from scratch</button>'+
+      '<button data-connection="disconnect">Disconnect tunnel</button>'+
       (state.restartSupported?'<button data-connection="restart-studio">Restart Studio</button>':'')+
       '<button data-tools="open">Terminal &amp; HF Token</button></div>'+
-      '<details '+(c.indicators?.api==='red'?'open':'')+'><summary>Vast API key</summary>'+
+      '<details '+(c.indicators?.api==='red'?'open':'')+'><summary>Vast API key &amp; instance selector</summary>'+
       '<label for="vastApiKey">Vast API key</label><input id="vastApiKey" type="password" autocomplete="off" dir="ltr">'+
-      '<button data-connection="key">Save API key</button></details></section>';
+      '<div class="row"><button data-connection="key">Save API key</button>'+
+      '<button data-connection="instances">Discover instances</button></div>'+
+      (discoveredInstances.length?'<label for="vastInstanceSelect">Rented instance<select id="vastInstanceSelect">'+
+        discoveredInstances.map(row=>option(String(row.id),'#'+row.id+' · '+(row.gpu||'GPU')+' · '+(row.status||'unknown')+(row.rate!=null?' · $'+Number(row.rate).toFixed(3)+'/hr':''),String(c.instance||''))).join('')+
+        '</select></label><button data-connection="connect">Connect selected instance</button>':'')+
+      '</details>'+
+      '<details><summary>Direct SSH connection (without Vast API)</summary>'+
+      '<label for="manualSshInput">Vast SSH command (ssh -p PORT root@HOST)</label>'+
+      '<input id="manualSshInput" type="text" autocomplete="off" dir="ltr" placeholder="ssh -p 12345 root@ssh.vast.ai">'+
+      '<button data-connection="connect-ssh">Connect using SSH</button></details></section>';
 }
 
 document.addEventListener('click',async e=>{
@@ -36,17 +48,25 @@ document.addEventListener('click',async e=>{
         if(action==='key')body.key=document.getElementById('vastApiKey').value;
         if(action==='hf')body.token=document.getElementById('hfToken').value;
         if(action==='command')body.command=document.getElementById('remoteCommand').value;
+        if(action==='connect')body.instance=Number(document.getElementById('vastInstanceSelect')?.value||0);
+        if(action==='connect-ssh')body.ssh=document.getElementById('manualSshInput')?.value||'';
         const result=await post('/connection',body);
         if(action==='hf'){document.getElementById('hfToken').value='';document.getElementById('hfSaved').textContent='Saved in Windows credential vault';return}
         if(action==='command'){
             document.getElementById('remoteOutput').textContent=result.output;
             return;
         }
+        if(action==='instances'){
+            discoveredInstances=Array.isArray(result)?result:[];
+            render();
+            reportStatus(discoveredInstances.length+' Vast instance(s) found.');
+            return;
+        }
         state=await(await fetch('/status')).json();
         render();
         if(action==='key')reportStatus('Vast API key saved.');
     }catch(err){const dialog=document.getElementById('workflowTools');if(dialog.open)document.getElementById('remoteOutput').textContent=err.message;else reportError(err)}
-    finally{button.disabled=false}
+    finally{if(button.isConnected)button.disabled=false}
 });
 
 function connectionIndicators(c,keys){

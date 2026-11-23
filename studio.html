@@ -97,13 +97,15 @@ function sessionView(){
     const session=state.session?.episode===ep.id?state.session:null;
     const canSubmit=state.connection?.state==='Ready'&&approved&&!state.running&&!state.workflowError;
     return connectionPanel()+
-      '<section class="panel"><h2>Direct ComfyUI submission</h2><p>'+approved+' approved shots in '+esc(ep.title)+'</p>'+
-      '<p>'+esc(state.workflow||'')+'</p>'+
-      '<button class="primary" id="start" '+(canSubmit?'':'disabled')+'>Submit approved shots</button>'+
+      remoteProductionPanel()+
+      productionServicesPanel()+
+      '<details class="panel"><summary>Direct ComfyUI submission (single-shot / desktop tunnel mode)</summary>'+
+      '<p>'+approved+' approved shots in '+esc(ep.title)+' · '+esc(state.workflow||'')+'</p>'+
+      '<button id="start" '+(canSubmit?'':'disabled')+'>Submit directly from desktop</button>'+
       (state.workflowError?'<p class="danger">'+esc(state.workflowError)+'</p>':'')+
       (session?'<p role="status">'+esc(session.phase)+' · '+session.completed+'/'+session.submitted+' complete'+
         (session.failed?' · '+session.failed+' failed':'')+'</p>':'')+
-      (session?.error?'<p class="danger">'+esc(localize(session.error))+'</p>':'')+'</section>'+
+      (session?.error?'<p class="danger">'+esc(localize(session.error))+'</p>':'')+'</details>'+
       '<section class="panel"><h2>Shot history</h2>'+ep.shots.filter(s=>versions(s).length).map(s=>
         '<div><strong>'+heading(s,ep.shots.indexOf(s))+'</strong>'+results(s)+'</div>').join('')+'</section>';
 }

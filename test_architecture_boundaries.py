@@ -81,6 +81,21 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("BUNDLE_OK", result.stdout)
 
+    def test_isolated_remote_worker_deploy_bundle_without_studio(self):
+        import vast_deploy
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in vast_deploy.SOURCES:
+                shutil.copy2(ROOT / name, Path(tmp) / name)
+            self.assertFalse((Path(tmp) / "studio.pyw").exists())
+            code = (
+                f"import sys; sys.path.insert(0, {tmp!r}); "
+                "import vast_worker, worker, comfy_client, production, workflow_profiles; "
+                "print('WORKER_BUNDLE_OK')"
+            )
+            result = subprocess.run([sys.executable, "-I", "-B", "-c", code], capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("WORKER_BUNDLE_OK", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

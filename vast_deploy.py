@@ -267,6 +267,18 @@ class Controller:
         if act=="instances":return self.list_instances()
         if act=="charges":return billing_charges(obj.get("instance"))
         if act=="review":return self.import_review(obj)
+        if act=="service-status":
+            vault=drive_archive.vault()
+            try:
+                drive_ok=bool(drive_archive.account())
+            except Exception:
+                drive_ok=False
+            try:
+                webhook_ok=bool(vault.get_password(drive_archive.SERVICE,"webhook"))
+                visual_ok=bool(vault.get_password(drive_archive.SERVICE,"visual"))
+            except Exception:
+                webhook_ok=visual_ok=False
+            return {"driveConnected":drive_ok,"webhookSaved":webhook_ok,"visualSaved":visual_ok}
         if act=="service-settings":
             vault=drive_archive.vault()
             for field in ("webhook","visual"):
@@ -313,7 +325,7 @@ class Controller:
                 self.watch(old,False)
                 return {"ok":True}
             if act=="start":
-                if self.thread and self.thread.is_alive() or old and self.view.get("status") not in ("finished","stopped","needs attention","deployment failed"):
+                if self.thread and self.thread.is_alive() or (old and not old.get("abandoned") and self.view.get("status") not in ("finished","stopped","needs attention","deployment failed")):
                     raise ValueError("Finish or stop the current production first")
                 if obj.get("instance") or obj.get("useConnection"):
                     target=self.connection.ssh_target()
