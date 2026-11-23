@@ -634,6 +634,23 @@ def public_profile(wf):
                                     "format","nodeCount","executable")}
 
 
+def runtime_requirements(ctx, spec, wf):
+    required = {}
+    for _eid, shot, rules in spec["jobs"]:
+        prompt_text = shot.get("frozenPrompt") or ctx["prompt"](shot, rules)
+        runtime = runtime_graph(
+            wf, shot, prompt_text,
+            ctx["generation_images"](shot),
+            ctx["generation_voices"](shot),
+            str, "AXDAR/check",
+        )
+        for node in runtime.values():
+            key = json.dumps(node, sort_keys=True)
+            if key not in required:
+                required[key] = node
+    return {"graph": required}
+
+
 class WorkflowStore:
     """Content-addressed original files and immutable mapping revisions; selection is an atomic pointer."""
     def __init__(self, directory):

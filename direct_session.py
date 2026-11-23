@@ -6,8 +6,8 @@ from http.client import HTTPException
 from urllib.parse import quote
 
 import production
-from vast_connection import identity
-from vast_worker import runtime_requirements
+from vast_credentials import identity
+from workflow_profiles import runtime_requirements
 from workflow_install_remote import redact, scan
 from workflow_gate import verify_first_shot
 

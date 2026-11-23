@@ -10,13 +10,12 @@ from urllib.request import Request, build_opener
 
 import production
 from provision import ModelRedirect
-import vast_deploy
-from vast_connection import SSH_CHECK_SECONDS, hf_token, identity
 from workflow_install_remote import PHASES, redact
 from workflow_profiles import _parse, _upstream, public_profile
 
 
-INSTALL_ROOT = vast_deploy.STORE + "/installations"
+INSTALL_ROOT = "/workspace/axdar-studio/installations"
+SSH_CHECK_SECONDS = 45
 TERMINAL = {"ready","needs attention","failed","cancelled","timed out"}
 FILES = ("workflow_install_remote.py","production.py","provision.py","model-lock.json")
 HF_VALUE = r"hf_[A-Za-z0-9]{8,256}"
@@ -26,6 +25,10 @@ HF_ASSIGNMENT = re.compile(
     rf"(?P<quote>['\"]?)(?P<token>{HF_VALUE})(?P=quote)(?P<tail>[ \t]*(?:#[^\r\n]*)?)(?=\r?$)",
     re.M,
 )
+
+
+def _default_identity(target):
+    return str(target.get("id") or f"{target['host']}:{target['port']}")
 
 
 def prepare_install_script(script):
@@ -45,17 +48,23 @@ def prepare_install_script(script):
     return cleaned,next(iter(tokens),None)
 
 
-def saved_hf_token():
+def saved_hf_token(token_fn=None):
+    if token_fn is None:
+        return None
     try:
-        return bool(hf_token())
+        return bool(token_fn())
     except Exception:
         return None
 
 
 class WorkflowManager:
-    def __init__(self, ctx):
+    def __init__(self, ctx, *, ssh_ops=None, hf_token_fn=None, identity_fn=None, ssh_check_seconds=SSH_CHECK_SECONDS):
         self.ctx=ctx
         self.connection=ctx["controller"].connection
+        self.ssh_ops=ssh_ops if ssh_ops is not None else ctx.get("ssh_ops")
+        self._hf_token=hf_token_fn if hf_token_fn is not None else ctx.get("hf_token")
+        self._identity=identity_fn if identity_fn is not None else (ctx.get("identity") or _default_identity)
+        self._ssh_check_seconds=ssh_check_seconds
         directory=ctx["DATA"]/"production"
         self.path=directory/"workflow-installations.json"
         self.profiles=ctx["DATA"]/"production"/"workflow-installation-profiles"
@@ -66,15 +75,25 @@ class WorkflowManager:
         self.telemetry={}
         self.telemetry_lock=threading.Lock()
 
+    def _token(self, value=None):
+        if self._hf_token is None:
+            raise ValueError("Hugging Face credential provider is not configured.")
+        return self._hf_token(value) if value is not None else self._hf_token()
+
+    def _require_ssh(self):
+        if self.ssh_ops is None:
+            raise ValueError("SSH transport is not configured for Workflow Manager.")
+        return self.ssh_ops
+
     def selected_instance(self):
         try:
-            return identity(self.connection.target())
+            return self._identity(self.connection.target())
         except ValueError:
             settings=self.connection.snapshot()
             if settings.get("instance"):
                 return str(settings["instance"])
             if settings.get("ssh"):
-                return identity(settings["ssh"])
+                return self._identity(settings["ssh"])
             return None
 
     def save(self, record, **changes):
@@ -111,11 +130,11 @@ class WorkflowManager:
             if not isinstance(supplied,str):
                 raise ValueError("Enter a Hugging Face access token.")
             supplied=supplied.strip()
-            token=supplied or (hf_token() if mode=="token" else "")
+            token=supplied or (self._token() if mode=="token" else "")
             if not token or not re.fullmatch(HF_VALUE,token):
                 raise ValueError("Enter a Hugging Face access token.")
             if mode=="save-token":
-                hf_token(token)
+                self._token(token)
                 return {"saved":True}
             try:
                 with build_opener(ModelRedirect()).open(Request("https://huggingface.co/api/whoami-v2",
@@ -127,11 +146,11 @@ class WorkflowManager:
             except OSError:
                 raise ValueError("Could not reach Hugging Face to verify the token.") from None
             if supplied:
-                hf_token(token)
+                self._token(token)
             return {"valid":True,"saved":True}
         if mode=="install-preview":
             script,token=prepare_install_script(request.get("script",""))
-            saved=saved_hf_token()
+            saved=saved_hf_token(self._hf_token)
             return {"script":script,"hfTokenSaved":saved,"willSaveHfToken":bool(token and not saved)}
         if mode=="prepare":
             return self.prepare(request.get("version"))
@@ -163,7 +182,7 @@ class WorkflowManager:
             raise ValueError("Choose an installation timeout of 1–180 minutes.")
         with self.ctx["LOCK"], self.lock:
             target=self.connection.target()
-            instance=identity(target)
+            instance=self._identity(target)
             if self.ctx["running"] or self.ctx["production_busy"]():
                 raise ValueError("Finish or pause the active production first.")
             if self.busy(instance):
@@ -172,8 +191,8 @@ class WorkflowManager:
                 raise ValueError("The selected instance changed. Review the installation again.")
             plan={k:wf["graph"][k] for k in _upstream(wf["graph"],[wf["output"]])}
             if mode=="install":
-                if embedded_token and not saved_hf_token():
-                    hf_token(embedded_token)
+                if embedded_token and not saved_hf_token(self._hf_token):
+                    self._token(embedded_token)
                 self.save_profile(version,script=script)
             record=dict(id=uuid.uuid4().hex,version=version,instance=instance,
                              rate=target.get("rate"),status="starting",started=time.time(),mode=mode,
@@ -205,7 +224,7 @@ class WorkflowManager:
             except (ValueError,OSError):
                 raise ValueError("ComfyUI could not convert this workflow. Check its Workflow to API Converter and use the original JSON again.") from None
             with self.ctx["LOCK"]:
-                if identity(self.connection.target())!=identity(target):
+                if self._identity(self.connection.target())!=self._identity(target):
                     raise ValueError("The instance changed during conversion. Prepare the workflow on the new connection.")
                 wf=store.attach(version,json.dumps(graph,ensure_ascii=False).encode("utf-8"))
                 self.save_profile(version,capture=wf["version"])
@@ -216,7 +235,7 @@ class WorkflowManager:
                 self.ctx["actions"].workflow("select",{"version":wf["version"]})
             active=self.ctx["active_workflow"]
         message=None
-        previous=self.profile(wf["version"]).get("instances",{}).get(identity(target))
+        previous=self.profile(wf["version"]).get("instances",{}).get(self._identity(target))
         if not previous and wf["output"] and not wf["issues"]:
             try:
                 self.action({"action":"scan","version":wf["version"]})
@@ -225,27 +244,28 @@ class WorkflowManager:
         return dict(profile=public_profile(wf),active=active["version"] if active else None,message=message)
 
     def launch(self, record, target, spec, script):
+        ops=self._require_ssh()
         folder=INSTALL_ROOT+"/"+record["id"]
         self.save(record,message="Uploading the reviewed installation plan")
         try:
             spec["port"]=target["comfy_port"]
-            vast_deploy.ssh(target,f"umask 077; mkdir -p {folder}")
+            ops.ssh(target,f"umask 077; mkdir -p {folder}")
             base=self.ctx["BASE"]
-            vast_deploy.deploy_files(target,{folder+"/"+name:base/name for name in FILES})
-            vast_deploy.put_json(target,folder+"/spec.json",spec)
+            ops.deploy_files(target,{folder+"/"+name:base/name for name in FILES})
+            ops.put_json(target,folder+"/spec.json",spec)
             if script.strip():
-                vast_deploy.ssh(target,f"umask 077; cat > {folder}/install.sh",
-                                data=script.replace("\r\n","\n").encode())
+                ops.ssh(target,f"umask 077; cat > {folder}/install.sh",
+                        data=script.replace("\r\n","\n").encode())
             if record.get("cancel"):
                 self.save(record,status="cancelled",finished=time.time(),message="Cancelled before launch")
                 return
-            token=(hf_token() or "") if spec["mode"]=="install" else ""
+            token=(self._token() or "") if spec["mode"]=="install" else ""
             self.save(record,dispatched=True,message="Waiting for remote installer")
             command=("IFS= read -r HF_TOKEN; export HF_TOKEN; "
                      "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN; export HUGGING_FACE_HUB_TOKEN; "
                      f"umask 077; nohup python3 {folder}/workflow_install_remote.py {folder}"
                      " </dev/null >/dev/null 2>&1 &")
-            vast_deploy.ssh(target,command,data=(token+"\n").encode(),timeout=SSH_CHECK_SECONDS)
+            ops.ssh(target,command,data=(token+"\n").encode(),timeout=self._ssh_check_seconds)
         except Exception:
             if not record.get("dispatched"):
                 self.save(record,status="failed",finished=time.time(),message="Remote setup could not be uploaded over SSH.")
@@ -264,16 +284,17 @@ class WorkflowManager:
             self.watchers[instance].start()
 
     def reconcile(self, record):
+        ops=self._require_ssh()
         instance=record["instance"]
         folder=INSTALL_ROOT+"/"+record["id"]
         while self.selected_instance()==instance and self.records.get(instance) is record and self.busy(instance):
             try:
                 target=self.connection.ssh_target()
-                if identity(target)!=instance:
+                if self._identity(target)!=instance:
                     raise ValueError("Select the original instance to reconcile installation.")
                 if record.get("cancel"):
-                    vast_deploy.ssh(target,f"umask 077; touch {folder}/cancel",timeout=SSH_CHECK_SECONDS)
-                data=vast_deploy.ssh(target,f"python3 {folder}/workflow_install_remote.py {folder} snapshot",timeout=SSH_CHECK_SECONDS)
+                    ops.ssh(target,f"umask 077; touch {folder}/cancel",timeout=self._ssh_check_seconds)
+                data=ops.ssh(target,f"python3 {folder}/workflow_install_remote.py {folder} snapshot",timeout=self._ssh_check_seconds)
                 state=json.loads(data)
                 if not state.get("started"):
                     self.save(record,status="reconnecting",message="Remote process is not yet confirmed. It will not be restarted automatically.")
@@ -316,7 +337,7 @@ class WorkflowManager:
                         otherInstallations=sum(key!=target and record.get("status") not in TERMINAL
                                                for key,record in self.records.items()),
                         savedScript=previous.get("script",""),
-                        hfTokenSaved=saved_hf_token(),
+                        hfTokenSaved=saved_hf_token(self._hf_token),
                         verification=previous.get("instances",{}).get(target),telemetry=self.telemetry)
 
     def refresh_telemetry(self):

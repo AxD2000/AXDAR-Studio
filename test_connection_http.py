@@ -13,9 +13,10 @@ class HttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.ctx=runpy.run_path('studio.pyw')
-        cls.g=cls.ctx['Handler'].do_POST.__globals__
+        cls.app=cls.ctx['app']
+        cls.g=cls.app
         cls.server=cls.ctx['StudioServer'](('127.0.0.1',0),cls.ctx['Handler'])
-        cls.g['PORT']=cls.server.server_port
+        cls.app.PORT=cls.server.server_port
         cls.url='http://127.0.0.1:'+str(cls.server.server_port)
         cls.thread=threading.Thread(target=cls.server.serve_forever,daemon=True);cls.thread.start()
     @classmethod
@@ -59,7 +60,7 @@ class HttpTests(unittest.TestCase):
         controller.current.return_value={}
         direct=Mock(interrupted=False)
         manager=Mock()
-        with patch.dict(self.g,dict(controller=controller,direct_session=direct,workflow_manager=manager,workspace_started=threading.Event())):
+        with patch.multiple(self.app,controller=controller,direct_session=direct,workflow_manager=manager,workspace_started=threading.Event()):
             self.post({'mode':'new'},route='/workspace-session')
         controller.archive_for_new_session.assert_called_once_with()
         direct.archive_for_new_session.assert_called_once_with()
@@ -70,8 +71,8 @@ class HttpTests(unittest.TestCase):
         controller=Mock()
         controller.current.return_value={'episode':'saved-episode'}
         direct=Mock(interrupted=False)
-        with patch.dict(self.g,dict(controller=controller,direct_session=direct,workflow_manager=Mock(),
-                                    workspace_started=threading.Event(),session={})):
+        with patch.multiple(self.app,controller=controller,direct_session=direct,workflow_manager=Mock(),
+                            workspace_started=threading.Event(),session={}):
             self.assertEqual(self.post({'mode':'resume'},route='/workspace-session')['episode'],'saved-episode')
             self.post({'mode':'resume'},route='/workspace-session')
         controller.connection.reconnect.assert_called_once_with()
@@ -91,14 +92,14 @@ class HttpTests(unittest.TestCase):
     def test_restart_is_available_after_active_work_finishes(self):
         requested=threading.Event()
         shutdown=threading.Event()
-        with patch.dict(self.g,dict(restart_requested=requested,running=True,production_busy=lambda:False)), \
-             patch.object(self.g['workflow_manager'],'busy',return_value=False), \
+        with patch.multiple(self.app,restart_requested=requested,running=True,production_busy=lambda:False), \
+             patch.object(self.app.workflow_manager,'busy',return_value=False), \
              patch.object(self.server,'shutdown',side_effect=shutdown.set):
             with self.assertRaises(HTTPError) as error:
                 self.post({},route='/studio/restart')
             self.assertEqual(error.exception.code,400);error.exception.close()
             self.assertFalse(requested.is_set())
-            self.g['running']=False
+            self.app.running=False
             self.assertEqual(self.post({},route='/studio/restart'),{'restarting':True})
             self.assertTrue(requested.is_set() and shutdown.wait(2))
 
@@ -111,13 +112,13 @@ class HttpTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             asset=Path(root)/'reference.png'
             asset.write_bytes(b'fixture')
-            with patch.dict(self.g,dict(reference_available=Mock(side_effect=[True,False,True]),
-                                        remote=Mock(side_effect=ConnectionResetError("upload reset")))), \
-                 patch.object(self.g['controller'],'connection',connection), \
-                 patch.object(self.g['vast_deploy'],'stage_reference') as stage:
-                self.assertEqual(self.g['upload'](url,asset,remote_name),remote_name)
-                self.g['remote'].assert_not_called()
-                self.assertEqual(self.g['upload'](url,asset,remote_name),remote_name)
+            with patch.multiple(self.app,reference_available=Mock(side_effect=[True,False,True]),
+                                remote=Mock(side_effect=ConnectionResetError("upload reset"))), \
+                 patch.object(self.app.controller,'connection',connection), \
+                 patch.object(self.app.vast_deploy,'stage_reference') as stage:
+                self.assertEqual(self.app.upload(url,asset,remote_name),remote_name)
+                self.app.remote.assert_not_called()
+                self.assertEqual(self.app.upload(url,asset,remote_name),remote_name)
                 stage.assert_called_once_with(connection.target.return_value,asset,remote_name)
 
     def test_second_studio_cannot_listen_on_the_same_address(self):

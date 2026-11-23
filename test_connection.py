@@ -244,7 +244,7 @@ class ConnectionTests(unittest.TestCase):
 class DiagnosticTests(unittest.TestCase):
     def test_ssh_sets_thirty_second_login_timeout(self):
         from vast_deploy import ssh
-        with patch('vast_deploy.subprocess.run',return_value=subprocess.CompletedProcess([],0,b'18188',b'')) as run:
+        with patch('vast_ssh_ops.subprocess.run',return_value=subprocess.CompletedProcess([],0,b'18188',b'')) as run:
             self.assertEqual(ssh({'host':'fixture','port':22},'probe',timeout=45),b'18188')
         args=run.call_args.args[0]
         self.assertEqual(args[args.index('ConnectTimeout=30')-1],'-o')

@@ -1,7 +1,6 @@
 """Runs on the user's rented ComfyUI Linux instance. All state lives in /workspace."""
 import json
 import os
-import runpy
 import shutil
 import subprocess
 import sys
@@ -9,30 +8,20 @@ import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
+import comfy_client
 import production as prod
 import provision
+import workflow_profiles
 from drive_archive import archive_run
 from production_services import countdown, deliver, event
 import take_quality
+from workflow_profiles import runtime_requirements
 
 
 def comfy_root():
     candidates=[Path(os.environ["COMFY_ROOT"])] if os.environ.get("COMFY_ROOT") else []
     candidates += [Path("/workspace/ComfyUI"), Path("/opt/ComfyUI"), Path.home()/"ComfyUI"]
     return next((p for p in candidates if (p/"main.py").is_file()),None)
-
-
-def runtime_requirements(ctx,spec,wf):
-    from workflow_profiles import runtime_graph
-    required={}
-    for eid,shot,rules in spec["jobs"]:
-        prompt=shot.get("frozenPrompt") or ctx["prompt"](shot,rules)
-        runtime=runtime_graph(wf,shot,prompt,ctx["generation_images"](shot),ctx["generation_voices"](shot),str,"AXDAR/check")
-        for node in runtime.values():
-            key=json.dumps(node,sort_keys=True)
-            if key not in required:
-                required[key]=node
-    return {"graph":required}
 
 
 def ready(ctx, wf, repair=True):
@@ -112,10 +101,23 @@ def execute(directory, maintenance=False):
         except BlockingIOError:
             raise RuntimeError("Another production worker is active on this instance")
         spec=prod.read(directory/"spec.json")
-        ctx=runpy.run_path(str(Path(__file__).with_name("studio.pyw")))
-        ctx=ctx["prepare_shot"].__globals__
-        ctx["DATA"]=directory/"episodes"
-        ctx["files"]={name:store/"blobs"/sha for name,sha in spec["assets"].items()}
+        asset_map={name:store/"blobs"/sha for name,sha in spec["assets"].items()}
+        ctx={
+            "DATA": directory/"episodes",
+            "files": asset_map,
+            "generation_images": comfy_client.generation_images,
+            "generation_voices": comfy_client.generation_voices,
+            "prompt": comfy_client.prompt,
+            "remote": comfy_client.remote,
+            "json_api": comfy_client.json_api,
+            "upload": comfy_client.upload,
+            "download_output": comfy_client.download_output,
+            "prepare_workflow": workflow_profiles.inspect_workflow,
+        }
+        ctx["prepare_shot"]=lambda url,folder,eid,shot,wf_obj,rec: comfy_client.prepare_shot(
+            url, folder, eid, shot, wf_obj, rec,
+            asset_map=ctx["files"], upload_fn=ctx["upload"], json_api_fn=ctx["json_api"],
+        )
         wf=spec["workflow"]
         if "mapping" not in wf:
             wf=ctx["prepare_workflow"](wf["name"],wf["graph"])

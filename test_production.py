@@ -258,7 +258,8 @@ class QueueTests(unittest.TestCase):
                 return "\n".join(dst for sha,dst in pairs if inventory.get(dst)!=sha).encode()
             return b""
         def fake_put(t,dst,src):inventory[dst]=p.digest(src)
-        with patch.object(vd,"ssh",side_effect=fake_ssh),patch.object(vd,"put",side_effect=fake_put) as send:
+        import vast_ssh_ops
+        with patch.object(vd,"ssh",side_effect=fake_ssh),patch.object(vast_ssh_ops,"ssh",side_effect=fake_ssh),patch.object(vast_ssh_ops,"put",side_effect=fake_put) as send:
             vd.deploy(ROOT,target,spec,{"test.png":asset})
             count=send.call_count;self.assertGreater(count,1)
             vd.deploy(ROOT,target,spec,{"test.png":asset})
@@ -337,7 +338,7 @@ class QueueTests(unittest.TestCase):
 
     def test_provider_stop_is_stop_only(self):
         import os
-        with patch.dict(os.environ,{"VAST_API_KEY":"test-secret"}),patch("vast_deploy.urlopen",return_value=io.BytesIO(b'{"success":true}')) as api:
+        with patch.dict(os.environ,{"VAST_API_KEY":"test-secret"}),patch("vast_ssh_ops.urlopen",return_value=io.BytesIO(b'{"success":true}')) as api:
             vd.request_instance_stop({"id":42})
             req=api.call_args.args[0]
             self.assertEqual(req.get_method(),"PUT")
@@ -345,7 +346,8 @@ class QueueTests(unittest.TestCase):
             self.assertNotIn("test-secret",req.full_url)
 
     def test_real_studio_builds_graph_with_selected_assets(self):
-        ctx=runpy.run_path(str(ROOT/"studio.pyw"))["prepare_shot"].__globals__
+        from app_context import AppContainer
+        ctx=AppContainer(ROOT)
         wf=ctx["active_workflow"]
         if not wf or wf.get("adapter")!="minimax-h3":
             self.skipTest("Select the user H3 workflow for the reference-graph check.")
@@ -354,7 +356,7 @@ class QueueTests(unittest.TestCase):
             path=self.dir/(name+".source");path.write_bytes(b"x");ctx["files"][name]=path
         ctx["upload"]=lambda url,f,name:f.name
         ctx["json_api"]=lambda *_:{}
-        graph=ctx["prepare_shot"]("",self.dir,self.eid,shot,wf,dict(prompt=ctx["prompt"](shot,[])))
+        graph=ctx.prepare_shot("",self.dir,self.eid,shot,wf,dict(prompt=ctx["prompt"](shot,[])))
         refs=graph[wf["reference"]]["inputs"]
         self.assertEqual(graph[refs["ref_audios.ref_audio_0"][0]]["inputs"]["audio"],"tom.mp3")
         self.assertIn("<Audio 1>",graph[wf["prompt"]]["inputs"]["value"])

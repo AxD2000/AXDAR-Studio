@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
-from vast_connection import VAST_IDENTITY, api_key
+from vast_credentials import VAST_IDENTITY, api_key
 
 
 class NoRedirect(HTTPRedirectHandler):

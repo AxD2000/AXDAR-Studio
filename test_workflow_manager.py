@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import comfy_client
 import direct_session
 from test_production import movie
 from workflow_gate import verify_first_shot
@@ -20,6 +21,8 @@ import editor_media
 import production
 import provision
 import take_quality
+import vast_credentials
+import vast_ssh_ops
 import workflow_install_remote as remote
 import workflow_manager
 import workflow_profiles
@@ -169,7 +172,8 @@ class WorkflowManagerTests(unittest.TestCase):
         connection.ssh_target.return_value=connection.target.return_value
         ctx={"controller":SimpleNamespace(connection=connection),"BASE":Path.cwd(),"DATA":self.root,
              "actions":SimpleNamespace(store=store),"production_busy":lambda:False,
-             "running":False,"LOCK":threading.RLock()}
+             "running":False,"LOCK":threading.RLock(),
+             "ssh_ops":vast_ssh_ops,"hf_token":vast_credentials.hf_token,"identity":vast_credentials.identity}
         return workflow_manager.WorkflowManager(ctx),wf["version"]
 
     def test_ui_json_is_converted_automatically_on_the_selected_connection(self):
@@ -280,19 +284,15 @@ class WorkflowManagerTests(unittest.TestCase):
                         image="Tom.png",refs=["Jack.png","Tom.wav","Jack.wav"]), []],
               [eid, dict(id="two",revision="approved",seconds=2,frozenPrompt="Jack walks silently.",
                         image="Jack.png",refs=[]), []]]
-        ctx=runpy.run_path("studio.pyw")["prepare_shot"].__globals__
-        ctx["DATA"]=self.root
-        ctx["running"]=True
-        ctx["files"]={}
+        asset_map={}
         for name in ("Tom.png","Jack.png","Tom.wav","Jack.wav"):
             path=self.root/name
             path.write_text("fixture",encoding="utf-8")
-            ctx["files"][name]=path
+            asset_map[name]=path
         uploaded=[]
         def upload(_url,path,_filename):
             uploaded.append(path.name)
             return path.name
-        ctx["upload"]=upload
         nodes={n["class_type"]:{} for n in graph.values()}
         nodes.update(LoadAudio={},VAELoader={"input":{"required":{"vae_name":[[linux_vae],{}]}}})
         nodes[upscaler]={"input":{"required":{
@@ -316,9 +316,15 @@ class WorkflowManagerTests(unittest.TestCase):
                 ticket=path.rsplit("/",1)[-1]
                 return {ticket:{"status":{"status_str":"success","completed":True},"outputs":{}}}
             raise AssertionError(path)
-        ctx["json_api"]=api
-        ctx["download_output"]=lambda _url,dest,*_: (dest/"video.part").write_bytes(movie(2))
-        ctx["take_quality"]=SimpleNamespace(check=lambda *_:{"technical":"passed","audioStreams":1})
+        ctx={
+            "DATA":self.root,"LOCK":threading.RLock(),"running":True,"files":asset_map,
+            "generation_images":comfy_client.generation_images,"generation_voices":comfy_client.generation_voices,
+            "prompt":comfy_client.prompt,"json_api":api,
+            "prepare_shot":lambda url,folder,e,s,w,r: comfy_client.prepare_shot(
+                url,folder,e,s,w,r,asset_map=asset_map,upload_fn=upload,json_api_fn=api),
+            "download_output":lambda _url,dest,*_: (dest/"video.part").write_bytes(movie(2)),
+            "take_quality":SimpleNamespace(check=lambda *_:{"technical":"passed","audioStreams":1}),
+        }
         view=dict(end=time.time()+60,episode=eid,submitted=2,phase="Preparing ComfyUI",completed=0,failed=0)
         session=direct_session.DirectSession(ctx)
         session.start(view,jobs,wf,None,"http://fixture")
@@ -352,7 +358,7 @@ class WorkflowManagerTests(unittest.TestCase):
 
     def test_unconfirmed_script_and_credentials_in_script_never_reach_ssh(self):
         manager,version=self.manager()
-        with patch.object(workflow_manager.vast_deploy,"ssh") as ssh:
+        with patch.object(vast_ssh_ops,"ssh") as ssh:
             with self.assertRaisesRegex(ValueError,"confirm"):
                 manager.action({"action":"install","version":version,"script":"echo hi"})
             with self.assertRaisesRegex(ValueError,"Save your Hugging Face token"):
@@ -368,9 +374,10 @@ class WorkflowManagerTests(unittest.TestCase):
             if value:
                 stored.append(value)
             return stored[-1] if stored else None
+        manager._hf_token=vault
+        manager.ctx["hf_token"]=vault
         launched=threading.Event()
-        with patch.object(workflow_manager,"hf_token",side_effect=vault), \
-             patch.object(manager,"launch",side_effect=lambda *_:launched.set()) as launch:
+        with patch.object(manager,"launch",side_effect=lambda *_:launched.set()) as launch:
             preview=manager.action({"action":"install-preview","script":script})
             self.assertEqual(stored,[])
             self.assertTrue(preview["willSaveHfToken"])
@@ -391,8 +398,8 @@ class WorkflowManagerTests(unittest.TestCase):
             if value:
                 stored.append(value)
             return stored[-1] if stored else None
-        with patch.object(workflow_manager,"hf_token",side_effect=vault), \
-             patch.object(workflow_manager,"build_opener") as opener:
+        manager._hf_token=vault
+        with patch.object(workflow_manager,"build_opener") as opener:
             self.assertFalse(manager.status(version)["hfTokenSaved"])
             self.assertTrue(manager.action({"action":"save-token","token":fixture})["saved"])
             opener.assert_not_called()
@@ -406,10 +413,10 @@ class WorkflowManagerTests(unittest.TestCase):
         manager,version=self.manager()
         record=manager.records["42"]=dict(id="a"*32,version=version,instance="42")
         token="hf_fixtureabcdefghijkl"
-        with patch.object(workflow_manager,"hf_token",return_value=token), \
-             patch.object(workflow_manager.vast_deploy,"ssh") as ssh, \
-             patch.object(workflow_manager.vast_deploy,"deploy_files"), \
-             patch.object(workflow_manager.vast_deploy,"put_json"),patch.object(manager,"watch"):
+        manager._hf_token=lambda _v=None: token
+        with patch.object(vast_ssh_ops,"ssh") as ssh, \
+             patch.object(vast_ssh_ops,"deploy_files"), \
+             patch.object(vast_ssh_ops,"put_json"),patch.object(manager,"watch"):
             manager.launch(record,manager.connection.target(),{"mode":"install"},"echo ready")
         self.assertEqual(ssh.call_args.kwargs["data"],(token+"\n").encode())
         self.assertNotIn(token,ssh.call_args.args[1])
@@ -428,7 +435,7 @@ class WorkflowManagerTests(unittest.TestCase):
             if isinstance(result,Exception):
                 raise result
             return result
-        with patch.object(workflow_manager.vast_deploy,"ssh",side_effect=ssh) as mock,patch.object(workflow_manager.time,"sleep"):
+        with patch.object(vast_ssh_ops,"ssh",side_effect=ssh) as mock,patch.object(workflow_manager.time,"sleep"):
             reopened.reconcile(reopened.records["42"])
         self.assertEqual(reopened.status(version)["installation"]["status"],"cancelled")
         self.assertTrue(any("touch" in call.args[1] for call in mock.call_args_list))
@@ -453,7 +460,7 @@ class WorkflowManagerTests(unittest.TestCase):
                             dispatched=True,started=time.time(),timeout=60)
         manager.save(record)
         terminal={"started":True,"status":"failed","report":{},"exitCode":1,"finished":time.time()}
-        with patch.object(workflow_manager.vast_deploy,"ssh",return_value=json.dumps(terminal).encode()),patch.object(workflow_manager.time,"sleep"):
+        with patch.object(vast_ssh_ops,"ssh",return_value=json.dumps(terminal).encode()),patch.object(workflow_manager.time,"sleep"):
             manager.reconcile(record)
         view=manager.status(version)
         self.assertEqual(view["installation"]["status"],"failed")
@@ -697,7 +704,7 @@ class WorkflowManagerTests(unittest.TestCase):
             return {ticket:{"status":{"status_str":"success","completed":True},
                             "outputs":{"135":{"videos":[{"filename":"wrong-preview.mp4"}]},
                                        "141":{"videos":[{"filename":"real.mp4","type":"output"}]}}}}
-        download=runpy.run_path("studio.pyw")["download_output"]
+        download=comfy_client.download_output
         ctx={"DATA":self.root,"LOCK":threading.RLock(),"controller":SimpleNamespace(connection=connection),
              "json_api":api,"prepare_shot":lambda _u,_f,_e,s,_w,_r:{"id":s["id"],"141":{"inputs":{"audio":["arr",0]}}},
              "download_output":download,"prompt":lambda s,_:s["prompt"],"take_quality":take_quality,"running":True}
@@ -709,7 +716,7 @@ class WorkflowManagerTests(unittest.TestCase):
         session=direct_session.DirectSession(ctx)
         session.start(view,jobs,wf,target,tunnel[0])
         with patch.object(direct_session,"runtime_requirements",return_value={"graph":self.graph}), \
-             patch.object(workflow_manager.vast_deploy,"ssh") as ssh, \
+             patch.object(vast_ssh_ops,"ssh") as ssh, \
              patch.object(workflow_profiles,"timing",return_value={"playback_seconds":2}),patch.object(production.time,"sleep"):
             session.run(tunnel[0],wf,target)
         ssh.assert_not_called()
