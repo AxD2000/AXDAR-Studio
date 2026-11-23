@@ -182,38 +182,45 @@ class DirectSession:
     def run(self, url, wf, target=None):
         ctx=self.ctx
         view=self.plan["view"]
-        deadline=view["end"]
-        render_ctx=dict(ctx,technical_qc=ctx["take_quality"].check,direct=True,
-                        instance=identity(target) if target else None)
-        def on_current(fn):
-            def call(_old_url,*args):
-                current=self.target_url(deadline,target,url)
-                view["phase"]="Verifying first shot" if self.plan.get("verifying") else "Rendering"
-                return fn(current,*args)
-            return call
-        render_ctx["json_api"]=on_current(ctx["json_api"])
-        render_ctx["prepare_shot"]=on_current(ctx["prepare_shot"])
-        render_ctx["download_output"]=on_current(ctx["download_output"])
-        cancel_unsupported=set()
-        def cancel_prompt(ticket):
-            if self.plan["control"]!="stop" or ticket in cancel_unsupported:
-                return False
-            if not re.fullmatch(r"[0-9a-f-]{36}",ticket):
-                return False
-            try:
-                reply=render_ctx["json_api"](url,f"/api/jobs/{ticket}/cancel",{})
-            except (OSError,HTTPException):
-                return False
-            except ValueError:
-                # Older servers lack prompt-scoped cancellation. Never send a global interrupt.
+        try:
+            deadline=view["end"]
+            render_ctx={
+                "DATA": ctx["DATA"],
+                "prompt": ctx.get("prompt"),
+                "generation_images": ctx.get("generation_images"),
+                "generation_voices": ctx.get("generation_voices"),
+                "technical_qc": ctx["take_quality"].check,
+                "direct": True,
+                "instance": identity(target) if target else None,
+            }
+            def on_current(fn):
+                def call(_old_url,*args):
+                    current=self.target_url(deadline,target,url)
+                    view["phase"]="Verifying first shot" if self.plan.get("verifying") else "Rendering"
+                    return fn(current,*args)
+                return call
+            render_ctx["json_api"]=on_current(ctx["json_api"])
+            render_ctx["prepare_shot"]=on_current(ctx["prepare_shot"])
+            render_ctx["download_output"]=on_current(ctx["download_output"])
+            cancel_unsupported=set()
+            def cancel_prompt(ticket):
+                if self.plan["control"]!="stop" or ticket in cancel_unsupported:
+                    return False
+                if not re.fullmatch(r"[0-9a-f-]{36}",ticket):
+                    return False
+                try:
+                    reply=render_ctx["json_api"](url,f"/api/jobs/{ticket}/cancel",{})
+                except (OSError,HTTPException):
+                    return False
+                except ValueError:
+                    # Older servers lack prompt-scoped cancellation. Never send a global interrupt.
+                    cancel_unsupported.add(ticket)
+                    return False
+                if isinstance(reply,dict) and reply.get("cancelled") is True:
+                    return True
                 cancel_unsupported.add(ticket)
                 return False
-            if isinstance(reply,dict) and reply.get("cancelled") is True:
-                return True
-            cancel_unsupported.add(ticket)
-            return False
-        render_ctx["cancel_prompt"]=cancel_prompt
-        try:
+            render_ctx["cancel_prompt"]=cancel_prompt
             jobs=self.plan["jobs"]
             # An already-submitted attempt must be reconciled before dependency
             # validation. Reconnecting only changes the tunnel, not its owner.

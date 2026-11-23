@@ -520,11 +520,13 @@ def _validate_runtime_contracts(graph, keys, model_info):
             if not spec:
                 continue
             options = spec.get("options")
-            if options is not None and value not in options:
-                raise ValueError(
-                    f"Node {ident}.{key} ({value!r}) does not match ComfyUI's registered choices. "
-                    "Fix and re-export the workflow in ComfyUI; AXDAR does not modify exported workflows."
-                )
+            if options is not None:
+                choices = [o["key"] if isinstance(o, dict) and "key" in o else o for o in options]
+                if value not in choices:
+                    raise ValueError(
+                        f"Node {ident}.{key} ({value!r}) does not match ComfyUI's registered choices {choices}. "
+                        "Fix and re-export the workflow in ComfyUI; AXDAR does not modify exported workflows."
+                    )
             typ = spec.get("type")
             if (typ == "BOOLEAN" and not isinstance(value, bool)) or (typ in ("INT", "FLOAT") and not _number(value)):
                 raise ValueError(
