@@ -47,7 +47,9 @@ class HttpTests(unittest.TestCase):
     def test_refresh_uses_the_shared_connection(self):
         connection=Mock()
         connection.refresh.return_value={"state":"Connecting","instance":13}
-        with patch.object(self.g["controller"],"connection",connection):
+        with patch.multiple(self.app,running=False,production_busy=lambda:False), \
+             patch.object(self.app.workflow_manager,'busy',return_value=False), \
+             patch.object(self.app.controller,"connection",connection):
             self.assertEqual(self.post({"action":"refresh"})["instance"],13)
         connection.refresh.assert_called_once_with(keep_active=False)
 

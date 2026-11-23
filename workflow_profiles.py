@@ -230,7 +230,7 @@ def _h3_fields(graph, ident, fields, suggested, info, fps):
         fields[:] = [f for f in fields if not (f["node"] in used and role in f["roles"] and all(dst==ident and slot.startswith(group+".") for dst,slot in f["consumers"]))]
         field_id = ident+"."+group
         fields.append(dict(id=field_id,node=ident,key=group,label=_title(node)+" · "+group,type="AUTOGROW",roles=[role],media=role,value=None,required=False,present=False,bypass=True,group=True,loaders=loaders))
-        suggested[role] = [field_id] if loaders else []
+        suggested[role] = [field_id]
     frame_spec = _contract(info,node["class_type"]).get("length", {})
     suggested.update(minFrames=frame_spec.get("min",5), maxFrames=frame_spec.get("max",3600),
                      frameStep=frame_spec.get("step",17), frameBase=frame_spec.get("min",5))
@@ -431,7 +431,7 @@ def limits(wf):
     refs = {}
     for role in ("images","audio"):
         chosen = [fields[v] for v in m.get(role,[]) if v in fields]
-        cap = sum(len(f.get("loaders", [])) if f.get("group") else (0 if f.get("socket") else 1) for f in chosen)
+        cap = sum(_H3_GROUPS[role][-1] if f.get("group") else (0 if f.get("socket") else 1) for f in chosen)
         refs["max_"+role] = cap
         refs["min_"+role] = sum(not f.get("bypass") for f in chosen)
     return dict(version=wf.get("version"),min_seconds=lo,max_seconds=hi,min_frames=fmin,max_frames=fmax,
@@ -533,15 +533,19 @@ def _validate_runtime_contracts(graph, keys, model_info):
                 )
 
 
-def verify_strict_integrity(original_graph, runtime_graph, allowed_edits):
-    """Guarantee zero added/deleted nodes and zero unauthorized input mutations."""
-    if set(runtime_graph.keys()) != set(original_graph.keys()):
-        added = sorted(set(runtime_graph) - set(original_graph))
-        removed = sorted(set(original_graph) - set(runtime_graph))
+def verify_strict_integrity(original_graph, runtime_graph, allowed_edits, allowed_added_loaders=()):
+    """Guarantee zero deleted nodes, zero unauthorized additions, and zero unauthorized input mutations."""
+    removed = sorted(set(original_graph) - set(runtime_graph))
+    added = sorted(set(runtime_graph) - set(original_graph))
+    extra = [nid for nid in added if nid not in allowed_added_loaders]
+    if removed or extra:
         raise ValueError(
-            f"Strict workflow integrity violation: nodes changed (added={added}, removed={removed}). "
+            f"Strict workflow integrity violation: nodes changed (added={extra}, removed={removed}). "
             "AXDAR must not add or remove workflow nodes."
         )
+    for nid in added:
+        if runtime_graph[nid].get("class_type") not in ("LoadImage", "LoadAudio"):
+            raise ValueError(f"Strict workflow integrity violation: unexpected added node {nid}.")
     for ident, orig_node in original_graph.items():
         run_node = runtime_graph[ident]
         if run_node.get("class_type") != orig_node.get("class_type"):
@@ -559,7 +563,7 @@ def verify_strict_integrity(original_graph, runtime_graph, allowed_edits):
 
 
 def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, model_info=None):
-    """Strict slot-only binding: preserve all nodes and unmapped settings verbatim."""
+    """Strict slot-only binding: preserve all authored nodes and unmapped settings verbatim."""
     errors = validate_shot(wf,shot,images,voices)
     if not str(positive_prompt or "").strip():
         errors.append("The shot needs a positive prompt.")
@@ -571,11 +575,21 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, 
     m = wf["mapping"]
     output = m["output"]
     allowed_edits = set()
+    allowed_added_loaders = set()
+    next_id = max((int(i) for i in graph if i.isdigit()), default=0) + 1
 
     def set_field(field_id, value):
         f = fields[field_id]
         graph[f["node"]]["inputs"][f["key"]] = value
         allowed_edits.add((f["node"], f["key"]))
+
+    def media_loader(kind, slot, name):
+        nonlocal next_id
+        key = str(next_id)
+        next_id += 1
+        graph[key] = dict(class_type=kind, inputs={slot: upload(name)})
+        allowed_added_loaders.add(key)
+        return [key, 0]
 
     for key,value in {**m.get("parameters",{}),**shot.get("workflowParameters",{})}.items():
         set_field(key,value)
@@ -590,6 +604,7 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, 
     if model_info:
         _validate_runtime_contracts(graph, _upstream(graph, [output]), model_info)
     for role,assets in (("images",list(images)),("audio",list(voices))):
+        group,stem,kind,slot,cap = _H3_GROUPS[role]
         selected = [fields[key] for key in m[role]]
         # An explicitly deselected optional source must never leak its sample asset into a shot.
         selected.extend(f for f in fields.values() if f.get("media")==role and not f.get("socket") and f["id"] not in m[role])
@@ -599,15 +614,22 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, 
             count = len(assets)-must_remain if field["id"] in m[role] else 0
             if field.get("group"):
                 loaders = field.get("loaders", [])
-                take = min(max(0, count), len(loaders))
-                for idx, (slot_key, loader_id, loader_key) in enumerate(loaders):
-                    if idx < take:
-                        name = assets.pop(0)
+                take = min(max(0, count), cap)
+                for key in list(inputs):
+                    if key.startswith(group + "."):
+                        del inputs[key]
+                        allowed_edits.add((field["node"], key))
+                for i in range(take):
+                    name = assets.pop(0)
+                    slot_key = f"{group}.{stem}_{i}"
+                    if i < len(loaders):
+                        _, loader_id, loader_key = loaders[i]
                         graph[loader_id]["inputs"][loader_key] = upload(name)
                         allowed_edits.add((loader_id, loader_key))
+                        inputs[slot_key] = [loader_id, 0]
                     else:
-                        inputs.pop(slot_key, None)
-                        allowed_edits.add((field["node"], slot_key))
+                        inputs[slot_key] = media_loader(kind, slot, name)
+                    allowed_edits.add((field["node"], slot_key))
             elif count>0:
                 if field.get("socket"):
                     raise ValueError(
@@ -625,7 +647,7 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, 
                     if key in graph[dest]["inputs"]:
                         graph[dest]["inputs"].pop(key, None)
                         allowed_edits.add((dest, key))
-    verify_strict_integrity(original, graph, allowed_edits)
+    verify_strict_integrity(original, graph, allowed_edits, allowed_added_loaders)
     return graph
 
 

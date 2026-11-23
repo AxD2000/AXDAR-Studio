@@ -54,7 +54,7 @@ class WorkflowProfiles(unittest.TestCase):
             self.assertEqual(g["84"]["inputs"]["value"],"new words")
             self.assertEqual(g["141"]["inputs"].get("filename_prefix"),wf["graph"]["141"]["inputs"].get("filename_prefix"))
             self.assertEqual(uploaded,["left.png","right.png","line.wav"])
-            self.assertEqual(set(g.keys()),set(wf["graph"].keys()))
+            self.assertTrue(set(wf["graph"].keys()).issubset(set(g.keys())))
             self.assertEqual(profiles.timing(wf,5)["frames"],124)
             self.assertEqual(profiles.limits(wf)["trained_frame_range"],[124,362])
             no_refs = profiles.runtime_graph(wf,shot,"quiet",[],[],upload,"p")
@@ -79,7 +79,7 @@ class WorkflowProfiles(unittest.TestCase):
         self.assertEqual(wf["mapping"]["fps"],30)
         g = profiles.runtime_graph(wf,{"seconds":5},"words",[],[],str,"p")
         self.assertEqual(g["56"]["inputs"]["length"],158)
-        self.assertNotIn("75",g)
+        self.assertIn("75",g)
         raw["141"]["inputs"]["frame_rate"] = 24
         raw["75"]["inputs"]["expression"] = "a * 3"
         self.assertEqual(profiles.inspect_workflow("changed calculator",raw)["mapping"]["frames"],"56.length")
