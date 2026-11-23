@@ -470,7 +470,7 @@ class WorkflowManagerTests(unittest.TestCase):
         view=dict(end=time.time()+60,episode=eid,submitted=2,phase="Preparing ComfyUI",completed=0,failed=0)
         session=direct_session.DirectSession(ctx)
         session.start(view,jobs,wf,None,"http://fixture")
-        with patch("vast_worker.runtime_requirements",return_value={"graph":wf["graph"]}), \
+        with patch.object(direct_session,"runtime_requirements",return_value={"graph":wf["graph"]}), \
              patch.object(workflow_profiles,"timing",return_value={"playback_seconds":2}):
             session.run("http://fixture",wf)
         self.assertEqual(view["phase"],"Stopped")
@@ -595,8 +595,14 @@ class WorkflowManagerTests(unittest.TestCase):
             tunnel[0]=new_url
         connection=SimpleNamespace(target=current_target,snapshot=lambda:{"url":tunnel[0]},
                                    lock=threading.RLock(),retry_saved=Mock(side_effect=reopen))
+        preflight_urls=[]
         def api(url,path,obj=None):
             self.assertEqual(url,tunnel[0])
+            if path=="/object_info":
+                preflight_urls.append(url)
+                if len(preflight_urls)==1:
+                    raise ConnectionResetError("Temporary preflight reset")
+                return {n["class_type"]:{} for n in self.graph.values()}
             if path=="/prompt":
                 submitted.append(obj)
                 if len(submitted)==1:
@@ -621,8 +627,12 @@ class WorkflowManagerTests(unittest.TestCase):
         view=dict(end=time.time()+60,episode=eid,submitted=3,phase="Preparing ComfyUI",completed=0,failed=0)
         session=direct_session.DirectSession(ctx)
         session.start(view,jobs,wf,target,tunnel[0])
-        with patch.object(direct_session.vast_deploy,"prepare_direct"),patch.object(workflow_profiles,"timing",return_value={"playback_seconds":2}),patch.object(production.time,"sleep"):
+        with patch.object(direct_session,"runtime_requirements",return_value={"graph":self.graph}), \
+             patch.object(workflow_manager.vast_deploy,"ssh") as ssh, \
+             patch.object(workflow_profiles,"timing",return_value={"playback_seconds":2}),patch.object(production.time,"sleep"):
             session.run(tunnel[0],wf,target)
+        ssh.assert_not_called()
+        self.assertEqual(preflight_urls,["http://old-tunnel"]*2)
         self.assertEqual((view["phase"],view["completed"]),("Finished",3),view.get("error"))
         self.assertEqual([x["prompt"]["id"] for x in submitted],[shot["id"] for _,shot,_ in jobs])
         connection.retry_saved.assert_called_once_with("42")

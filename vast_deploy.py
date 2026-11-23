@@ -152,29 +152,6 @@ def deploy_files(target, planned):
         put(target,dst,planned[dst])
 
 
-def prepare_direct(ctx, target, jobs, workflow, timeout, repair=True):
-    from vast_worker import runtime_requirements
-    base = ctx["BASE"]
-    requirements = runtime_requirements(ctx, {"jobs":jobs}, workflow)
-    revision = hashlib.sha256("".join(prod.digest(base/n) for n in SOURCES).encode()).hexdigest()
-    release = STORE + "/releases/" + revision
-    ssh(target, f"umask 077; mkdir -p {release}")
-    deploy_files(target, {release+"/"+name:base/name for name in SOURCES})
-    code = ("import json, sys\nfrom vast_worker import ready\n"
-            "from urllib.request import urlopen\n"
-            "def api(url, path):\n"
-            " with urlopen(url + path, timeout=15) as response: return json.load(response)\n"
-            f"try: ready({{'json_api':api}}, json.load(sys.stdin), repair={repair})\n"
-            "except Exception as exc: sys.exit(str(exc))")
-    try:
-        ssh(target, f"cd {release} && python3 -c {shlex.quote(code)}",
-            data=json.dumps(requirements).encode(), timeout=max(15, timeout()))
-    except subprocess.TimeoutExpired:
-        raise ValueError("ComfyUI dependency setup ran out of session time.") from None
-    except OSError as exc:
-        raise ValueError(str(exc).splitlines()[-1]) from None
-
-
 def deploy(base,target,spec,assets):
     release,run=paths(spec)
     ssh(target,f"umask 077; mkdir -p {release} {run} {STORE}/blobs")

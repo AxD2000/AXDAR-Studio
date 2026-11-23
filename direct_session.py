@@ -5,8 +5,8 @@ import uuid
 from http.client import HTTPException
 
 import production
-import vast_deploy
 from vast_connection import identity
+from vast_worker import runtime_requirements
 from workflow_install_remote import redact, scan
 from workflow_gate import verify_first_shot
 
@@ -214,15 +214,19 @@ class DirectSession:
                     if any(row[1]==prior["ticket"] for row in queued["queue_running"]+queued["queue_pending"]):
                         raise RuntimeError("ComfyUI is still cancelling the original prompt. Resume after it leaves the queue.")
                 if not in_flight and i==self.plan["index"] and not self.plan.get("validated"):
-                    if target:
-                        vast_deploy.prepare_direct(render_ctx,target,jobs[i:],wf,lambda:deadline-time.time(),repair=False)
-                    else:
-                        from vast_worker import runtime_requirements
-                        info=render_ctx["json_api"](url,"/object_info")
-                        graph=runtime_requirements(ctx,{"jobs":jobs[i:]},wf)["graph"]
-                        dependencies=scan(graph,info)
-                        if dependencies["nodes"] or any(m["status"]!="Installed" for m in dependencies["models"]):
-                            raise ValueError("Resolve the missing workflow dependencies before production.")
+                    graph=runtime_requirements(ctx,{"jobs":jobs[i:]},wf)["graph"]
+                    for attempt in range(3):
+                        try:
+                            info=render_ctx["json_api"](url,"/object_info")
+                            break
+                        except (OSError,HTTPException) as exc:
+                            if attempt==2 or time.time()+2>=deadline:
+                                raise RuntimeError("Could not read workflow dependencies through the ComfyUI connection. Resume to try again.") from exc
+                            time.sleep(2)
+                    dependencies=scan(graph,info)
+                    missing=dependencies["nodes"]+[m["name"] for m in dependencies["models"] if m["status"]!="Installed"]
+                    if missing:
+                        raise ValueError("Resolve the missing workflow dependencies before production: "+", ".join(missing))
                     self.plan["validated"]=True
                 if wf.get("format")=="ComfyUI UI JSON" and i==0 and not self.plan.get("sampleVerified"):
                     self.plan.setdefault("id",uuid.uuid4().hex)
