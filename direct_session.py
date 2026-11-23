@@ -3,12 +3,35 @@ import re
 import time
 import uuid
 from http.client import HTTPException
+from urllib.parse import quote
 
 import production
 from vast_connection import identity
 from vast_worker import runtime_requirements
 from workflow_install_remote import redact, scan
 from workflow_gate import verify_first_shot
+
+
+def dependency_info(api, url, graph, deadline):
+    try:
+        return api(url, "/object_info")
+    except (OSError, HTTPException):
+        # A large registry response can reset a tunnel while smaller requests still work.
+        pass
+    info = {}
+    for kind in sorted({node["class_type"] for node in graph.values()}):
+        path = "/object_info/" + quote(kind, safe="")
+        for attempt in range(2):
+            if time.time() >= deadline:
+                raise TimeoutError("ComfyUI dependency validation ran out of session time.")
+            try:
+                info.update(api(url, path))
+                break
+            except (OSError, HTTPException) as exc:
+                if attempt:
+                    raise RuntimeError("Could not read the ComfyUI schema for " + kind + ". Resume when the connection is ready.") from exc
+                time.sleep(1)
+    return info
 
 
 class DirectSession:
@@ -208,21 +231,14 @@ class DirectSession:
                 same_revision=prior.get("revision")==shot["revision"]
                 if same_revision and self.plan["retry"]:
                     self.release_unavailable_video(latest,prior,target)
-                in_flight=same_revision and prior.get("status") in ("submitting","queued","waiting","uncertain")
+                in_flight=bool(latest and same_revision and production.pending_prompt(prior,latest.parent))
                 if same_revision and prior.get("status")=="cancelled":
                     queued=render_ctx["json_api"](url,"/queue")
                     if any(row[1]==prior["ticket"] for row in queued["queue_running"]+queued["queue_pending"]):
                         raise RuntimeError("ComfyUI is still cancelling the original prompt. Resume after it leaves the queue.")
                 if not in_flight and i==self.plan["index"] and not self.plan.get("validated"):
                     graph=runtime_requirements(ctx,{"jobs":jobs[i:]},wf)["graph"]
-                    for attempt in range(3):
-                        try:
-                            info=render_ctx["json_api"](url,"/object_info")
-                            break
-                        except (OSError,HTTPException) as exc:
-                            if attempt==2 or time.time()+2>=deadline:
-                                raise RuntimeError("Could not read workflow dependencies through the ComfyUI connection. Resume to try again.") from exc
-                            time.sleep(2)
+                    info=dependency_info(render_ctx["json_api"],url,graph,deadline)
                     dependencies=scan(graph,info)
                     missing=dependencies["nodes"]+[m["name"] for m in dependencies["models"] if m["status"]!="Installed"]
                     if missing:

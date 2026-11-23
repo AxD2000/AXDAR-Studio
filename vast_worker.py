@@ -67,9 +67,7 @@ def ready(ctx, wf, repair=True):
                 choices=field[0] if isinstance(field[0],list) else (field[1].get("options") if len(field)>1 else None)
                 if isinstance(choices,list) and provision.model_choice(value, choices) is None:
                     models.add(value)
-    sage_required = any(node["class_type"] == "MiniMaxH3MemoryEfficientSageAttentionPatch"
-                        for node in wf["graph"].values())
-    sage_missing = sage_required and not provision.sage_ready()
+    sage_missing = provision.requires_sage(wf["graph"]) and not provision.sage_ready()
     if missing or models or sage_missing:
         if not repair:
             raise ValueError("Still unavailable after preparation: "+", ".join(

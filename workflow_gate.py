@@ -16,17 +16,27 @@ def verify_first_shot(ctx, url, deadline, batch, wf, row, retry_failed=False):
     folder=root/batch
     folder.mkdir(parents=True,exist_ok=True)
     report_path=folder/"first-shot.json"
+    def latest_attempt():
+        attempts=(ctx["DATA"]/episode/shot["id"]).glob("*/job.json")
+        return next(((path.parent, record) for path in sorted(attempts,reverse=True)
+                     if (record:=production.read(path,{})).get("revision")==shot["revision"]),(folder,{}))
+
     report=production.read(report_path,{})
     if report.get("status")=="passed":
         return "done"
     if report.get("status")=="failed":
         message=report["message"]
-        if report.get("prompt") or not (message.startswith("First shot verification failed. ComfyUI 400:")
-                                      and '"prompt_outputs_failed_validation"' in message):
+        attempt_folder, attempt=latest_attempt()
+        rejected=(not report.get("prompt") and message.startswith("First shot verification failed. ComfyUI 400:")
+                  and '"prompt_outputs_failed_validation"' in message)
+        pending=(report.get("prompt") and report["prompt"]==attempt.get("ticket")
+                 and "cursor" in report and production.pending_prompt(attempt,attempt_folder))
+        if not (rejected or pending):
             raise ValueError(message)
-        # A confirmed validation rejection created no ComfyUI prompt. Keep the old attempt and rebuild its inputs.
-        report={}
-        retry_failed=True
+        if rejected:
+            # A confirmed rejection created no ComfyUI prompt. Rebuild while keeping the old attempt.
+            report={}
+            retry_failed=True
 
     def api(route):
         return ctx["json_api"](url,route)
@@ -90,9 +100,7 @@ def verify_first_shot(ctx, url, deadline, batch, wf, row, retry_failed=False):
     result=production.render(settings,url,deadline,episode,shot,rules,wf,2,observe,retry_failed)
     if result in ("waiting","uncertain","cancelled"):
         return result
-    attempts=(ctx["DATA"]/episode/shot["id"]).glob("*/job.json")
-    attempt=next((record for path in sorted(attempts,reverse=True)
-                  if (record:=production.read(path,{})).get("revision")==shot["revision"]),{})
+    _,attempt=latest_attempt()
     message=None
     if result!="done" or attempt.get("quality",{}).get("technical")!="passed":
         observe()

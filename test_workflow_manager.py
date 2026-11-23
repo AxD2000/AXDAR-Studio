@@ -115,6 +115,32 @@ class WorkflowManagerTests(unittest.TestCase):
             self.assertEqual(remote.execute(self.root,config),2)
         self.assertEqual(production.read(self.root/"stage.json")["report"]["nodes"],["Lora Loader Stack (rgthree)"])
 
+    def test_sage_library_is_checked_and_repaired_independently_of_node_registration(self):
+        name="MiniMaxH3MemoryEfficientSageAttentionPatch"
+        graph={"1":node(name)}
+        ready=False
+        def endpoint(url, **_):
+            payload={"queue_running":[],"queue_pending":[]} if url.endswith("/queue") else {name:{}}
+            return io.BytesIO(json.dumps(payload).encode())
+        def build(root):
+            nonlocal ready
+            self.assertEqual(root,self.root)
+            ready=True
+        config={"port":18188,"graph":graph}
+        with patch.object(remote,"root_path",return_value=self.root), \
+             patch.object(remote,"urlopen",side_effect=endpoint), \
+             patch.object(provision,"sage_ready",side_effect=lambda:ready), \
+             patch.object(provision,"install_sage",side_effect=build) as install, \
+             patch.object(remote.subprocess,"run") as command:
+            self.assertEqual(remote.execute(self.root,dict(config,mode="scan")),2)
+            report=production.read(self.root/"stage.json")["report"]
+            self.assertEqual((report["nodes"],report["sageAttention"]),([],"Missing"))
+            install.assert_not_called()
+            self.assertEqual(remote.execute(self.root,dict(config,mode="install")),0)
+            install.assert_called_once_with(self.root)
+            command.assert_called_once_with(["supervisorctl","restart","comfyui"],check=True,timeout=90)
+        self.assertEqual(production.read(self.root/"stage.json")["report"]["sageAttention"],"Installed")
+
     def test_script_token_filter_keeps_hf_hub_function_names(self):
         script="from huggingface_hub import hf_hub_download"
         self.assertEqual(remote.redact(script),script)
@@ -471,6 +497,31 @@ class WorkflowManagerTests(unittest.TestCase):
         result=remote.snapshot(self.root)
         self.assertEqual((result["status"],result["exitCode"]),("cancelled",-15))
 
+    def test_install_displays_carriage_return_progress_and_redacts_split_tokens(self):
+        production.atomic(self.root/"spec.json",{"timeout":60})
+        token="hf_fixtureabcdefghijkl"
+        child=Mock(pid=4242)
+        child.wait.return_value=0
+        key=SimpleNamespace(fd=7,fileobj=child.stdout)
+        monitor=Mock()
+        monitor.select.return_value=[(key,1)]
+        monitor.get_map.side_effect=[True,True,True,True,False]
+        selector=Mock(__enter__=Mock(return_value=monitor),__exit__=Mock(return_value=None))
+        steps=iter([b"90%\r",b"secret hf_fixture",b"abcdefghijkl\n100%\r",b""])
+        def output(_fd,_count):
+            chunk=next(steps)
+            if chunk.startswith(b"secret"):
+                self.assertIn("90%",(self.root/"terminal.log").read_text("utf-8"))
+            return chunk
+        with patch.dict(remote.os.environ,HF_TOKEN=token), \
+             patch.object(remote.subprocess,"Popen",return_value=child), \
+             patch.object(remote.selectors,"DefaultSelector",return_value=selector), \
+             patch.object(remote.os,"read",side_effect=output):
+            remote.run(self.root)
+        log=(self.root/"terminal.log").read_text("utf-8")
+        self.assertNotIn(token,log)
+        self.assertIn("90%\nsecret [REDACTED]\n100%\n",log)
+
     def test_stop_cancels_only_saved_prompt_and_leaves_next_shot_unsubmitted(self):
         eid=str(uuid.uuid4())
         jobs=[[eid,dict(id=str(uuid.uuid4()),revision="approved",seconds=2,prompt="Original"),[]] for _ in range(2)]
@@ -619,14 +670,15 @@ class WorkflowManagerTests(unittest.TestCase):
             tunnel[0]=new_url
         connection=SimpleNamespace(target=current_target,snapshot=lambda:{"url":tunnel[0]},
                                    lock=threading.RLock(),retry_saved=Mock(side_effect=reopen))
-        preflight_urls=[]
+        preflight=[]
         def api(url,path,obj=None):
             self.assertEqual(url,tunnel[0])
             if path=="/object_info":
-                preflight_urls.append(url)
-                if len(preflight_urls)==1:
-                    raise ConnectionResetError("Temporary preflight reset")
-                return {n["class_type"]:{} for n in self.graph.values()}
+                preflight.append((url,path))
+                raise ConnectionResetError("Large preflight response reset the connection")
+            if path.startswith("/object_info/"):
+                preflight.append((url,path))
+                return {path.rsplit("/",1)[-1]:{}}
             if path=="/prompt":
                 submitted.append(obj)
                 if len(submitted)==1:
@@ -656,7 +708,9 @@ class WorkflowManagerTests(unittest.TestCase):
              patch.object(workflow_profiles,"timing",return_value={"playback_seconds":2}),patch.object(production.time,"sleep"):
             session.run(tunnel[0],wf,target)
         ssh.assert_not_called()
-        self.assertEqual(preflight_urls,["http://old-tunnel"]*2)
+        classes=sorted({n["class_type"] for n in self.graph.values()})
+        self.assertEqual(preflight,[("http://old-tunnel",path) for path in
+                                   ["/object_info",*("/object_info/"+kind for kind in classes)]])
         self.assertEqual((view["phase"],view["completed"]),("Finished",3),view.get("error"))
         self.assertEqual([x["prompt"]["id"] for x in submitted],[shot["id"] for _,shot,_ in jobs])
         connection.retry_saved.assert_called_once_with("42")

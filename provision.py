@@ -40,6 +40,10 @@ def comfy_python():
     return os.environ.get("COMFY_PYTHON", "/venv/main/bin/python")
 
 
+def requires_sage(graph):
+    return any(node["class_type"] == "MiniMaxH3MemoryEfficientSageAttentionPatch" for node in graph.values())
+
+
 def sage_ready():
     return subprocess.run([comfy_python(), "-c", SAGE_CHECK],
                           capture_output=True, timeout=40).returncode == 0

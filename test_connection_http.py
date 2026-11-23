@@ -1,8 +1,10 @@
 """Local HTTP acceptance with mocked external services; no Vast requests."""
 import json
 import runpy
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from urllib.request import Request,urlopen
 from urllib.error import HTTPError
 from unittest.mock import Mock,patch
@@ -84,6 +86,39 @@ class HttpTests(unittest.TestCase):
     def test_status_contains_shared_state(self):
         with urlopen(self.url+'/status') as response:status=json.load(response)
         self.assertIn('connection',status);self.assertEqual(status['running'],False)
+        self.assertTrue(status['restartSupported'])
+
+    def test_restart_is_available_after_active_work_finishes(self):
+        requested=threading.Event()
+        shutdown=threading.Event()
+        with patch.dict(self.g,dict(restart_requested=requested,running=True,production_busy=lambda:False)), \
+             patch.object(self.g['workflow_manager'],'busy',return_value=False), \
+             patch.object(self.server,'shutdown',side_effect=shutdown.set):
+            with self.assertRaises(HTTPError) as error:
+                self.post({},route='/studio/restart')
+            self.assertEqual(error.exception.code,400);error.exception.close()
+            self.assertFalse(requested.is_set())
+            self.g['running']=False
+            self.assertEqual(self.post({},route='/studio/restart'),{'restarting':True})
+            self.assertTrue(requested.is_set() and shutdown.wait(2))
+
+    def test_reference_upload_reuses_server_file_and_falls_back_on_its_own_tunnel(self):
+        url='http://127.0.0.1:19500'
+        remote_name='axdar_'+'a'*64+'.png'
+        connection=Mock(lock=threading.RLock())
+        connection.snapshot.return_value={'url':url}
+        connection.target.return_value={'id':42,'host':'fixture','port':22}
+        with tempfile.TemporaryDirectory() as root:
+            asset=Path(root)/'reference.png'
+            asset.write_bytes(b'fixture')
+            with patch.dict(self.g,dict(reference_available=Mock(side_effect=[True,False,True]),
+                                        remote=Mock(side_effect=ConnectionResetError("upload reset")))), \
+                 patch.object(self.g['controller'],'connection',connection), \
+                 patch.object(self.g['vast_deploy'],'stage_reference') as stage:
+                self.assertEqual(self.g['upload'](url,asset,remote_name),remote_name)
+                self.g['remote'].assert_not_called()
+                self.assertEqual(self.g['upload'](url,asset,remote_name),remote_name)
+                stage.assert_called_once_with(connection.target.return_value,asset,remote_name)
 
     def test_second_studio_cannot_listen_on_the_same_address(self):
         with self.assertRaises(OSError):

@@ -10,6 +10,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 import production as p
@@ -154,6 +155,36 @@ class QueueTests(unittest.TestCase):
         jobs=self.jobs(2);self.network=4
         self.assertEqual(self.drive(jobs)["status"],"waiting")
         self.assertEqual(self.drive(jobs)["status"],"finished");self.assertEqual(len(self.requests),2)
+
+    def test_interruption_after_acknowledgement_preserves_the_prompt(self):
+        eid, shot, rules = self.jobs(1)[0]
+        def interrupted(url, path, obj=None):
+            if path.startswith("/history/"):
+                raise RuntimeError("The local session stopped monitoring")
+            return self.api(url, path, obj)
+        self.ctx["json_api"]=interrupted
+        args=(self.ctx,self.spec["url"],self.spec["end"],eid,shot,rules,self.workflow,0,lambda:None)
+        self.assertEqual(p.render(*args),"waiting")
+        [record]=(self.dir/eid/shot["id"]).glob("*/job.json")
+        job=p.read(record)
+        self.assertEqual(job["ticket"],"1")
+        p.atomic(record,dict(job,status="error"))  # A record written by a previous Studio version.
+        self.ctx["json_api"]=self.api
+        self.assertEqual(p.render(*args,retry_failed=True),"done")
+        self.assertEqual(len(self.requests),1)
+
+    def test_http_validation_rejection_remains_a_definite_error(self):
+        eid, shot, rules = self.jobs(1)[0]
+        error=HTTPError(self.spec["url"]+"/prompt",400,"invalid input",{},io.BytesIO(b""))
+        self.addCleanup(error.close)
+        def rejected(url, path, obj=None):
+            self.assertEqual(path,"/prompt")
+            raise ValueError("ComfyUI 400: invalid input") from error
+        self.ctx["json_api"]=rejected
+        result=p.render(self.ctx,self.spec["url"],self.spec["end"],eid,shot,rules,self.workflow,0,lambda:None)
+        self.assertEqual(result,"error")
+        [record]=(self.dir/eid/shot["id"]).glob("*/job.json")
+        self.assertNotIn("ticket",p.read(record))
 
     def test_missing_ack_no_evidence_never_resubmits(self):
         def no_ack(url,path,obj=None):

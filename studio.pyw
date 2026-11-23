@@ -1,5 +1,8 @@
 from pathlib import Path
 import copy, json, mimetypes, os, re, secrets, shutil, socket, threading, time, uuid, webbrowser
+import subprocess
+import sys
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlencode, urlsplit, unquote, parse_qs, quote
 from urllib.request import Request, urlopen
@@ -116,12 +119,37 @@ def json_api(url, path, obj=None):
     with remote(url,path,json.dumps(obj).encode() if obj is not None else None, {"Content-Type":"application/json"}) as f:
         return json.load(f)
 
+def reference_available(url, asset, name):
+    path = "/view?" + urlencode({"filename":name, "type":"input"})
+    try:
+        with urlopen(Request(url + path, method="HEAD"), timeout=6) as existing:
+            return existing.headers.get("Content-Length") == str(asset.stat().st_size)
+    except HTTPError as exc:
+        exc.close()
+    except (OSError, HTTPException):
+        pass
+    return False
+
+
 def upload(url, asset, name):
+    if reference_available(url, asset, name):
+        return name
     boundary = uuid.uuid4().hex
     body = (f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="{name}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode()
             + asset.read_bytes() + f'\r\n--{boundary}--\r\n'.encode())
-    with remote(url, "/upload/image", body, {"Content-Type":"multipart/form-data; boundary="+boundary}) as f:
-        info=json.load(f)
+    try:
+        with remote(url, "/upload/image", body, {"Content-Type":"multipart/form-data; boundary="+boundary}) as f:
+            info=json.load(f)
+    except (OSError, HTTPException):
+        connection=controller.connection
+        with connection.lock:
+            if connection.snapshot().get("url") != url:
+                raise
+            target=connection.target()
+        vast_deploy.stage_reference(target, asset, name)
+        if not reference_available(url, asset, name):
+            raise ConnectionError("ComfyUI has not confirmed the uploaded reference.")
+        return name
     return "/".join(filter(None,[info.get("subfolder"),info["name"]]))
 
 def generation_images(shot):
@@ -144,8 +172,12 @@ def prepare_shot(url, folder, eid, s, wf, record):
         if name not in files or Path(name).name != name:
             raise ValueError("Missing asset: " + name)
         shutil.copy2(files[name], folder/name)
+    def upload_reference(name):
+        asset=folder/name
+        uploaded="axdar_"+production.digest(asset)+asset.suffix.lower()
+        return upload(url, asset, uploaded)
     return workflow_profiles.runtime_graph(wf, s, record["prompt"], images, voices,
-        lambda name: upload(url, folder/name, uuid.uuid4().hex + Path(name).suffix),
+        upload_reference,
         "AXDAR/" + eid + "/" + s["id"] + "/" + folder.name,
         model_info=lambda kind: json_api(url, "/object_info/" + quote(kind, safe="")))
 
@@ -202,6 +234,7 @@ def production_busy():
 
 
 workspace_started=threading.Event()
+restart_requested=threading.Event()
 
 
 def discover_vast():
@@ -382,7 +415,7 @@ class Handler(BaseHTTPRequestHandler):
                                    remote=bool(j.get("remote_run")),video="/video/"+relative if video else "",
                                    artifactPending=bool(j.get("artifact_pending")),
                                    preview="/take-preview/"+relative if preview and review else ""))
-            return self.send(dict(production=controller.current(),running=running,session=session,results=result,workflow=active_workflow["name"] if active_workflow else "Workflow blocked",workflowError=workflow_error,connection=controller.connection.snapshot()))
+            return self.send(dict(production=controller.current(),running=running,session=session,results=result,workflow=active_workflow["name"] if active_workflow else "Workflow blocked",workflowError=workflow_error,connection=controller.connection.snapshot(),restartSupported=True))
         p=files.get(route[7:]) if route.startswith("/asset/") else None
         if re.fullmatch(r"/(video|take-preview)/[a-f0-9-]+/[a-f0-9-]+/\d+",route):
             kind,eid,sid,version=route[1:].split("/")
@@ -399,6 +432,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         global running,session,active_workflow,workflow_error,drive_pending
         if self.headers.get("X-Studio")!=TOKEN: return self.send({},status=403)
+        if restart_requested.is_set(): return self.send({"error":"Studio is restarting."},status=503)
         try:
             size=int(self.headers["Content-Length"])
             if self.path == "/plugins":
@@ -431,6 +465,17 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=="/workspace-session":
                 if self.headers.get("Host") != f"127.0.0.1:{PORT}": return self.send({},status=403)
                 return self.send(open_workspace_session(obj.get("mode")))
+            if self.path=="/studio/restart":
+                if self.headers.get("Host") != f"127.0.0.1:{PORT}": return self.send({},status=403)
+                with LOCK, editor.lock, freecut.lock:
+                    if running or production_busy() or workflow_manager.busy() or editor.active or any(
+                            job.get("state")=="working" for job in freecut.jobs.values()):
+                        raise ValueError("Finish or pause active work before restarting Studio.")
+                    restart_requested.set()
+                try:
+                    return self.send({"restarting":True})
+                finally:
+                    threading.Thread(target=self.server.shutdown,daemon=True).start()
             if self.path=="/workflow-manager":
                 return self.send(workflow_manager.action(obj))
             if self.path=="/direct-production":
@@ -581,6 +626,13 @@ if __name__=="__main__":
             if "project" not in json.load(response): raise
         webbrowser.open(address)
     else:
-        webbrowser.open(address)
-        threading.Thread(target=discover_vast,daemon=True).start()
-        server.serve_forever()
+        with server:
+            webbrowser.open(address)
+            threading.Thread(target=discover_vast,daemon=True).start()
+            server.serve_forever()
+        if restart_requested.is_set():
+            try:
+                controller.connection.disconnect()
+            finally:
+                subprocess.Popen([sys.executable,"-B",str(BASE/"studio.pyw")],cwd=BASE,
+                                 creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))

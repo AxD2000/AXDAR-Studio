@@ -10,6 +10,7 @@ function connectionPanel(){
       (c.error?'<p class="'+(pending?'muted':'danger')+'">'+esc(c.error)+'</p>':'')+
       '<div class="row"><button data-connection="refresh">Refresh instances</button>'+
       '<button data-connection="reconnect">Reconnect from scratch</button>'+
+      (state.restartSupported?'<button data-connection="restart-studio">Restart Studio</button>':'')+
       '<button data-tools="open">Terminal &amp; HF Token</button></div>'+
       '<details '+(c.indicators?.api==='red'?'open':'')+'><summary>Vast API key</summary>'+
       '<label for="vastApiKey">Vast API key</label><input id="vastApiKey" type="password" autocomplete="off" dir="ltr">'+
@@ -25,6 +26,12 @@ document.addEventListener('click',async e=>{
     if(!action)return;
     button.disabled=true;
     try{
+        if(action==='restart-studio'){
+            await saveQueue;
+            await post('/studio/restart',{});
+            reportStatus('Restarting Studio…');
+            return;
+        }
         const body={action};
         if(action==='key')body.key=document.getElementById('vastApiKey').value;
         if(action==='hf')body.token=document.getElementById('hfToken').value;

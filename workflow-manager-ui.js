@@ -84,14 +84,17 @@ function dependencyView(){
     if(!Array.isArray(report?.models))return '<p>Check the connected instance to verify '+esc(p.name)+'.</p>';
     const nodes=Array.isArray(report.nodes)?report.nodes:[];
     const outstanding=report.models.filter(m=>m.status!=='Installed');
+    const sageMissing=report.sageAttention==='Missing';
     const space=report.diskFreeBytes!=null&&report.downloadBytes!=null?
         '<p>'+((report.downloadBytes||0)/1e9).toFixed(2)+' GB verified downloads · '+
         (report.diskFreeBytes/1e9).toFixed(2)+' GB available'+
         (report.downloadBytes>report.diskFreeBytes?' · Insufficient disk space':'')+'</p>':'';
-    return '<p>'+esc(p.name)+'</p><p>'+(nodes.length||outstanding.length?
-        nodes.length+' node classes and '+outstanding.length+' model files need attention on this instance.':
+    return '<p>'+esc(p.name)+'</p><p>'+(nodes.length||outstanding.length||sageMissing?
+        nodes.length+' node classes and '+outstanding.length+' model files need attention on this instance.'+
+        (sageMissing?' SageAttention needs repair.':''):
         'All required dependencies are available on this instance.')+'</p><h3>Custom nodes</h3>'+
         (nodes.length?'<ul>'+nodes.map(node=>'<li>'+esc(node)+'</li>').join('')+'</ul>':'<p>All required classes registered.</p>')+
+        (report.sageAttention?'<p>SageAttention · '+esc(report.sageAttention)+'</p>':'')+
         '<h3>Model files</h3>'+space+'<table><thead><tr><th>File</th><th>Status</th><th>Verified source</th></tr></thead><tbody>'+
         report.models.map(m=>'<tr><td>'+esc(m.name||'Unknown file')+'</td><td>'+esc(m.status||'Pending')+(m.error?' · '+esc(m.error):'')+'</td><td>'+
             (m.source?.repo?esc(m.source.repo)+(m.source.revision?' @ '+esc(String(m.source.revision).slice(0,12)):''):'—')+'</td></tr>').join('')+'</tbody></table>';
@@ -109,6 +112,8 @@ function installationView(){
         (scan?'Dependency scan · ':'Installation · ')+i.status;
     const profile=workflowCatalog.profiles.find(item=>item.version===i.version);
     const cost=i.rate!=null?' · '+moneyLabel(i.elapsed/3600*i.rate)+' estimated':'';
+    const stages=[...(data.phases||[])];
+    if(i.stages?.SageAttention&&!stages.includes('SageAttention'))stages.splice(stages.indexOf('ComfyUI restart'),0,'SageAttention');
     return (profile?'<p>'+esc(profile.name)+'</p>':'')+
         '<p role="status">'+esc(label)+' · '+timeLabel(i.elapsed)+cost+(!scanDone&&i.exitCode!=null?' · '+(scan?'Scan exit ':'Installer exit ')+i.exitCode:'')+(i.bashExitCode!=null?' · Bash exit '+i.bashExitCode:'')+'</p>'+
         (scanDone?'<p>Open Dependencies for the results, or choose Start Installation.</p>':'')+
@@ -116,7 +121,7 @@ function installationView(){
         (!terminal?'<button data-wm="cancel" data-wm-instance="'+esc(i.instance)+'">'+(scan?'Cancel Scan':'Cancel Installation')+'</button>':'')+
         parked+
         '<table><thead><tr><th>Stage</th><th>Status</th><th>Elapsed</th><th>Progress</th></tr></thead><tbody>'+
-        (data.phases||[]).map(name=>{
+        stages.map(name=>{
             const stage=i.stages?.[name]||{},t=(stage.status==='Running'?Date.now()/1000:stage.updated)-stage.started;
             const status=scanDone?(stage.status==='Failed'?'Items missing':stage.status||'Skipped'):stage.status||'Pending';
             return '<tr><td>'+esc(name)+'</td><td>'+esc(status)+'</td><td>'+timeLabel(t)+'</td><td>'+

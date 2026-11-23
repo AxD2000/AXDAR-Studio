@@ -134,6 +134,19 @@ def put_json(target,path,data):
     ssh(target,f"umask 077; cat > {tmp} && mv {tmp} {path}",data=json.dumps(data).encode())
 
 
+def stage_reference(target, asset, name):
+    if not re.fullmatch(r"axdar_[0-9a-f]{64}\.[a-z0-9]{1,8}", name):
+        raise ValueError("Invalid reference filename.")
+    roots=("/workspace/ComfyUI", "/opt/ComfyUI", "/root/ComfyUI")
+    search=("for root in " + " ".join(roots) + "; do "
+            'if test -f "$root/main.py" && test -d "$root/input"; then printf "%s" "$root"; exit; fi; done')
+    root=ssh(target, search, timeout=45).decode().strip()
+    if root not in roots:
+        raise ConnectionError("The original ComfyUI input folder could not be confirmed over SSH.")
+    put(target, root + "/input/" + name, asset)
+    return name
+
+
 def paths(spec):
     sid=uuid.UUID(spec["id"]).hex
     release=spec["release"]

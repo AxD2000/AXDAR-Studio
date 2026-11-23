@@ -114,8 +114,15 @@ def execute(folder, config):
             return False
         return any(p.is_file() for p in models_root.glob("*/"+str(path))) if not any(c in name for c in "*?[]") else False
     graph=config["graph"]
+    needs_sage=provision.requires_sage(graph)
+    def dependencies(info):
+        result=scan(graph,info,exists)
+        if needs_sage:
+            result["sageAttention"]="Installed" if provision.sage_ready() else "Missing"
+        return result
+
     stage(PHASES[2],"Running")
-    result=scan(graph,info,exists)
+    result=dependencies(info)
     report(result)
     stage(PHASES[2],"Completed",f"{len(result['nodes'])} missing")
     if config["mode"]=="scan":
@@ -137,7 +144,7 @@ def execute(folder, config):
                 stage(PHASES[3],"Failed","The Bash script returned a nonzero exit code.")
                 return 1
             info=api("/object_info")
-            result=scan(graph,info,exists)
+            result=dependencies(info)
             report(result)
         missing=set(result["nodes"])
         known=set().union(*(kinds for kinds,*_ in provision.NODE_SOURCES))
@@ -158,12 +165,22 @@ def execute(folder, config):
                 report(result)
                 raise
         stage(PHASES[4],"Completed","Verified model downloads",len(absent),len(absent))
-        if installed or config.get("restart"):
+        sage_installed=result.get("sageAttention")=="Missing"
+        if sage_installed:
+            idle()
+            stage("SageAttention","Running","Building the pinned library for this CUDA and PyTorch environment")
+            try:
+                provision.install_sage(root)
+            except (OSError,ValueError,subprocess.SubprocessError) as exc:
+                stage("SageAttention","Failed","The pinned CUDA build or GPU test failed")
+                raise ValueError("SageAttention could not be installed on this CUDA and PyTorch environment.") from exc
+            stage("SageAttention","Completed","Pinned build passed the GPU check")
+        if installed or sage_installed or config.get("restart"):
             # ComfyUI reads many model lists dynamically. Restart for newly installed nodes
             # or when the approved Bash script explicitly requests a restart.
             info=api("/object_info")
             still=scan(graph,info,exists)
-            if config.get("restart") or installed & set(still["nodes"]):
+            if sage_installed or config.get("restart") or installed & set(still["nodes"]):
                 idle()
                 stage(PHASES[5],"Running","Restarting the ComfyUI supervisor service")
                 subprocess.run(["supervisorctl","restart","comfyui"],check=True,timeout=90)
@@ -180,9 +197,10 @@ def execute(folder, config):
         if PHASES[5] not in state["stages"]:
             stage(PHASES[5],"Skipped","ComfyUI restart was unnecessary")
     stage(PHASES[6],"Running")
-    result=scan(graph,api("/object_info"),exists)
+    result=dependencies(api("/object_info"))
     report(result)
-    available=not result["nodes"] and all(m["status"]=="Installed" for m in result["models"])
+    available=(not result["nodes"] and result.get("sageAttention","Installed")=="Installed"
+               and all(m["status"]=="Installed" for m in result["models"]))
     stage(PHASES[6],"Completed" if available else "Failed",
           "Required classes registered and model choices verified" if available else "Review unresolved dependencies")
     return 0 if available else 2
@@ -231,9 +249,10 @@ def run(folder):
                         monitor.unregister(key.fileobj)
                         continue
                     pending+=data
-                    last=pending.rfind(b"\n")
+                    last=max(pending.rfind(b"\n"),pending.rfind(b"\r"))
                     if last!=-1:
-                        log.write(redact(pending[:last+1].decode("utf-8",errors="replace"),token))
+                        lines=pending[:last+1].replace(b"\r\n",b"\n").replace(b"\r",b"\n")
+                        log.write(redact(lines.decode("utf-8",errors="replace"),token))
                         pending=pending[last+1:]
                     if len(pending)>1024*1024:
                         pending=b""

@@ -7,7 +7,7 @@ import time
 import uuid
 from http.client import HTTPException
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 
 def read(path, default=None):
@@ -120,6 +120,18 @@ class Uncertain(Exception):
     pass
 
 
+class ExecutionFailed(ValueError):
+    pass
+
+
+def pending_prompt(job, folder):
+    if job.get("status") in ("queued", "waiting", "submitting", "uncertain"):
+        return True
+    # Older Studio versions could store an error after accepting a prompt without checking its history.
+    return (job.get("status") == "error" and bool(job.get("ticket"))
+            and not (folder / "history.json").is_file())
+
+
 def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_failed=False, retry_key=None, admit=True, budget_check=None):
     root = ctx["DATA"]/eid/shot["id"]
     root.mkdir(parents=True, exist_ok=True)
@@ -135,7 +147,7 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
             if not (ctx.get("direct") and j.get("remote_run") and not (folder/"video.mp4").is_file()):
                 inspect_take(folder/"video.mp4", j)
             return "done"
-        if j["status"] in ("queued","waiting","submitting","uncertain") or j.get("ticket") and j["status"]!="error":
+        if pending_prompt(j, folder) or j.get("ticket") and j["status"]!="error":
             same_target = str(j["instance"]) == str(ctx.get("instance")) if j.get("instance") else j.get("url") == url
             if not same_target:
                 raise Uncertain("Prior submission belongs to another server; reconcile it before generating again.")
@@ -211,7 +223,7 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
                     atomic(folder/"history.json",h)
                     if h.get("status",{}).get("status_str")=="error":
                         details=next((m[1] for m in h["status"].get("messages",[]) if m[0]=="execution_error"),{})
-                        raise ValueError(str(details.get("node_type","Render"))+": "+str(details.get("exception_message","ComfyUI execution failed"))[:800])
+                        raise ExecutionFailed(str(details.get("node_type","Render"))+": "+str(details.get("exception_message","ComfyUI execution failed"))[:800])
                     if h.get("status",{}).get("completed") is False:
                         raise Uncertain("The original ComfyUI prompt has no completed execution history.")
                     if not j.get("artifact_pending"):
@@ -260,7 +272,17 @@ def render(ctx, url, deadline, eid, shot, rules, wf, retries, notify, retry_fail
         except Uncertain as exc:
             j.update(status="uncertain",error=str(exc))
         except Exception as exc:
-            j.update(status="error",error=str(exc)[:900])
+            if j["status"] == "done":
+                raise
+            confirmed_failure = isinstance(exc, ExecutionFailed) or (j.get("quality") or {}).get("technical") == "failed"
+            response = exc if isinstance(exc, HTTPError) else exc.__cause__
+            rejected = isinstance(response, HTTPError) and 400 <= response.code < 500
+            status = "error"
+            if j.get("ticket") and not confirmed_failure:
+                status = "waiting"
+            elif j["status"] == "submitting" and not rejected:
+                status = "uncertain"
+            j.update(status=status,error=str(exc)[:900])
         if j["status"]=="error":
             if (folder/"video.part").is_file():
                 (folder/"video.part").replace(folder/"video.failed.mp4")
