@@ -52,14 +52,14 @@ class WorkflowProfiles(unittest.TestCase):
             self.assertEqual(g[inputs["ref_audios.ref_audio_0"][0]]["inputs"]["audio"],"staged/line.wav")
             self.assertEqual(g["74"]["inputs"]["value"],5)
             self.assertEqual(g["84"]["inputs"]["value"],"new words")
-            self.assertEqual(g["141"]["inputs"]["filename_prefix"],"AXDAR/take")
+            self.assertEqual(g["141"]["inputs"].get("filename_prefix"),wf["graph"]["141"]["inputs"].get("filename_prefix"))
             self.assertEqual(uploaded,["left.png","right.png","line.wav"])
-            self.assertNotIn("135",g)
+            self.assertEqual(set(g.keys()),set(wf["graph"].keys()))
             self.assertEqual(profiles.timing(wf,5)["frames"],124)
             self.assertEqual(profiles.limits(wf)["trained_frame_range"],[124,362])
             no_refs = profiles.runtime_graph(wf,shot,"quiet",[],[],upload,"p")
             self.assertFalse(any(k.startswith(("ref_images.","ref_audios.")) for k in no_refs["56"]["inputs"]))
-            self.assertFalse(any(n["class_type"] in ("LoadImage","LoadAudio") for n in no_refs.values()))
+            self.assertEqual(set(no_refs.keys()),set(wf["graph"].keys()))
             self.assertEqual(copied,wf["graph"])
             self.assertEqual(store.original(wf["version"]),raw)
             self.assertEqual(store.active()["version"],wf["version"])
@@ -104,7 +104,9 @@ class WorkflowProfiles(unittest.TestCase):
         rendered = profiles.runtime_graph(wf,shot,"changed positive",["shot.png"],[],lambda n:"new/"+n,"new/shot")
         self.assertEqual(rendered["t"]["inputs"],dict(positive_prompt="changed positive",negative_prompt="changed negative"))
         self.assertEqual(rendered["pic"]["inputs"]["image"],"new/shot.png")
-        self.assertNotIn("voice",rendered)
+        self.assertEqual(rendered["voice"],graph["voice"])
+        self.assertEqual(set(rendered.keys()),set(graph.keys()))
+        self.assertEqual(rendered["out"]["inputs"]["filename_prefix"],"original")
         self.assertNotIn("speech",rendered["gen"]["inputs"])
         self.assertEqual(rendered["gen"]["inputs"]["frame_count"],73)
         self.assertEqual(profiles.timing(wf,7)["split"],[4,3])
@@ -113,7 +115,9 @@ class WorkflowProfiles(unittest.TestCase):
         self.assertEqual(graph["pic"]["inputs"]["image"],"unrelated.png")
         no_voice = profiles.inspect_workflow("custom",graph,metadata,dict(wf["mapping"],audio=[]))
         self.assertEqual(no_voice["issues"],[])
-        self.assertNotIn("voice",profiles.runtime_graph(no_voice,shot,"p",["right.png"],[],str,"p"))
+        no_voice_rendered = profiles.runtime_graph(no_voice,shot,"p",["right.png"],[],str,"p")
+        self.assertEqual(no_voice_rendered["voice"],graph["voice"])
+        self.assertNotIn("speech",no_voice_rendered["gen"]["inputs"])
 
     def test_missing_nonprimitive_and_required_widget(self):
         graph,metadata = generic_graph()
@@ -132,15 +136,36 @@ class WorkflowProfiles(unittest.TestCase):
         out = profiles.runtime_graph(fixed,shot,"words",["ref.png"],[],str,"prefix")
         self.assertEqual(out["gen"]["inputs"]["guidance"],6)
 
-    def test_missing_image_socket_can_be_bound_and_absent_optional_audio_stays_absent(self):
+    def test_unwired_image_socket_is_rejected_without_synthesizing_nodes(self):
         graph,metadata = generic_graph()
         del graph["gen"]["inputs"]["portrait"],graph["pic"]
         wf = profiles.inspect_workflow("custom",graph,metadata)
-        self.assertEqual(wf["mapping"]["images"],["gen.portrait"])
+        self.assertEqual(wf["mapping"]["images"],[])
+        mapped = profiles.inspect_workflow("custom",graph,metadata,{"images":["gen.portrait"]})
+        self.assertTrue(any("does not add nodes" in issue for issue in mapped["issues"]))
+
+    def test_strict_mode_preserves_extra_nodes_and_rejects_mismatched_contracts(self):
+        graph,metadata = generic_graph()
+        graph["preview"] = node("PreviewImage", images=["gen",0])
+        graph["up"] = node("MinimaxH3LatentUpscaler3D", latent=["gen",0], device=True, precision="cuda")
+        wf = profiles.inspect_workflow("strict",graph,metadata)
         self.assertEqual(wf["issues"],[])
-        out = profiles.runtime_graph(wf,{"seconds":2},"text",["correct.png"],[],str,"p")
-        loader = out["gen"]["inputs"]["portrait"][0]
-        self.assertEqual(out[loader],node("LoadImage",image="correct.png"))
+        out = profiles.runtime_graph(wf,{"seconds":2},"text",["a.png"],[],str,"prefix")
+        self.assertIn("preview",out)
+        self.assertEqual(out["preview"],graph["preview"])
+        self.assertEqual(out["up"],graph["up"])
+        upscaler_info = lambda kind: {"MinimaxH3LatentUpscaler3D":{"input":{"required":{
+            "device":["COMBO",{"options":["cuda","rocm","cpu"]}],
+            "precision":["COMBO",{"options":["fp32","fp16","bf16"]}],
+        }}}} if kind=="MinimaxH3LatentUpscaler3D" else {}
+        graph["gen"]["inputs"]["up"] = ["up",0]
+        wf_up = profiles.inspect_workflow("strict-up",graph,metadata)
+        with self.assertRaisesRegex(ValueError,"does not modify exported workflows"):
+            profiles.runtime_graph(wf_up,{"seconds":2},"text",["a.png"],[],str,"prefix",model_info=upscaler_info)
+        with self.assertRaisesRegex(ValueError,"Strict workflow integrity violation"):
+            tampered = copy.deepcopy(graph)
+            tampered["out"]["inputs"]["fps"] = 60
+            profiles.verify_strict_integrity(graph, tampered, set())
 
     def test_ambiguous_text_output_and_source_bytes_survive_remapping(self):
         graph = {"a":node("CustomWords",literal_a="first",literal_b="second"),

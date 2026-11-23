@@ -31,8 +31,10 @@ def fingerprint(value):
 
 def production_prompt(wf, text, voices):
     parts = [text]
+    prefix = str((wf.get("mapping") or {}).get("promptPrefix") or "").strip()
+    if prefix:
+        parts.insert(0, prefix)
     if wf.get("reference") and wf.get("graph", {}).get(wf["reference"], {}).get("class_type") == "MiniMaxH3ReferenceToVideo":
-        parts.insert(0, "r34l1sm")
         parts.extend(f"<Audio {i}> is the voice reference for {Path(name).stem}." for i, name in enumerate(voices, 1))
     return "\n".join(filter(None, parts))
 

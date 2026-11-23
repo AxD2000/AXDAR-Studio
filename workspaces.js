@@ -1,6 +1,16 @@
-const spaces=['Story & Scenes','Shot Lab','Asset Vault','Production','Video Editor','Economics','Settings','Workflow'];
-const symbols=['▤','▣','▧','◈','▥','∑','⚙'];
-const descriptions=['Script, scene breakdown and continuity','Prompts, character references and shot approvals','Project reference photos and voices','Workflow, generation queue and take history','Assemble and review the episode','Estimate GPU time and retry costs','Local preferences and workflow configuration','Install, validate and monitor ComfyUI workflows'];
+const workspaceItems=[
+    {title:'Story & Scenes',symbol:'▤',description:'Script, scene breakdown and continuity'},
+    {title:'Shot Lab',symbol:'▣',description:'Prompts, character references and shot approvals'},
+    {title:'Asset Vault',symbol:'▧',description:'Project reference photos and voices'},
+    {title:'Production',symbol:'◈',description:'Workflow, generation queue and take history'},
+    {title:'Video Editor',symbol:'▥',description:'Assemble and review the episode'},
+    {title:'Economics',symbol:'∑',description:'Estimate GPU time and retry costs'},
+    {title:'Settings',symbol:'⚙',description:'Local preferences and workflow configuration'},
+    {title:'Workflow',symbol:'❖',description:'Install, validate and monitor ComfyUI workflows'}
+];
+const spaces=workspaceItems.map(item=>item.title);
+const symbols=workspaceItems.map(item=>item.symbol);
+const descriptions=workspaceItems.map(item=>item.description);
 let storyTab='Script', selectedId='', estimateEpisode='';
 let estimate={shots:1,failure:10,rate:.55,minutes:6};
 function selectedShot(){return ep.shots.find(s=>s.id===selectedId)||ep.shots[0]}

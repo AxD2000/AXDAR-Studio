@@ -124,4 +124,28 @@ class HttpTests(unittest.TestCase):
         with self.assertRaises(OSError):
             self.ctx['StudioServer'](self.server.server_address,self.ctx['Handler'])
 
+    def test_post_requires_matching_host_and_separates_500_from_400(self):
+        request=Request(self.url+'/save',data=b'{}',headers={'Content-Type':'application/json','X-Studio':self.g['TOKEN'],'Host':'evil.example:18753'})
+        with self.assertRaises(HTTPError) as error:
+            urlopen(request)
+        self.assertEqual(error.exception.code,403);error.exception.close()
+        with patch.object(self.g['actions'],'general_save',side_effect=RuntimeError('boom')):
+            with self.assertRaises(HTTPError) as error:
+                self.post({},route='/save')
+            self.assertEqual(error.exception.code,500);error.exception.close()
+
+    def test_workspaces_icons_and_slim_pagehide_save(self):
+        with urlopen(self.url+'/workspaces.js') as response:
+            js=response.read().decode()
+        self.assertIn("title:'Workflow',symbol:",js)
+        with urlopen(self.url) as response:
+            html=response.read().decode()
+        self.assertIn('function savePayload()',html)
+        self.assertIn('saveInFlight',html)
+        self.assertIn("'Content-Type':'application/json'",html)
+
+    def test_files_snapshot_is_isolated_from_in_place_updates(self):
+        snap=self.g['files_snapshot']()
+        self.assertIsNot(snap,self.g['files'])
+
 if __name__=='__main__':unittest.main()

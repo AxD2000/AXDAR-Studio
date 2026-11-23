@@ -303,7 +303,8 @@ class Controller:
         if spec.get("archive"):
             folder=self.ctx["DATA"].joinpath(*spec["archive"])
             return {name:folder/name for name in spec["assets"]}
-        return {name:self.ctx["files"][name] for name in spec["assets"] if name in self.ctx["files"]}
+        snap=self.ctx["files_snapshot"]() if "files_snapshot" in self.ctx else dict(self.ctx["files"])
+        return {name:snap[name] for name in spec["assets"] if name in snap}
 
     def current(self):
         with self.lock:
@@ -443,7 +444,7 @@ class Controller:
                 ep=next(e for e in db["episodes"] if e["id"]==obj["episode"])
                 jobs=[]; assets={}; ids=set()
                 skipped={}
-                sources=self.ctx["files"]
+                sources=self.ctx["files_snapshot"]() if "files_snapshot" in self.ctx else dict(self.ctx["files"])
                 wf=self.ctx["active_workflow"]
                 rules=db["rules"]
                 archive=obj.get("archive")
@@ -463,7 +464,7 @@ class Controller:
                 else:
                     prepared,skipped=self.ctx["actions"].approved_jobs(db,ep)
                     shots=[row[1] for row in prepared]
-                    sources=self.ctx["files"]
+                    sources=self.ctx["files_snapshot"]() if "files_snapshot" in self.ctx else dict(self.ctx["files"])
                 for s in shots:
                     if not s["approved"]:continue
                     for value in [ep["id"],s["id"]]:

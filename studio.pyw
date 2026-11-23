@@ -1,5 +1,5 @@
 from pathlib import Path
-import copy, json, mimetypes, os, re, secrets, shutil, socket, threading, time, uuid, webbrowser
+import copy, json, logging, mimetypes, os, re, secrets, shutil, socket, threading, time, uuid, webbrowser
 import subprocess
 import sys
 from http.client import HTTPException
@@ -30,35 +30,44 @@ files.update({p.name:p for p in LIBRARY.iterdir() if p.is_file() and p.suffix !=
 PHOTOS = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
 VOICES = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
 
+def files_snapshot():
+    with LOCK:
+        return dict(files)
+
 def import_asset(filename, blob):
+    global files
     filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename).strip(" .")
     stem, ext = Path(filename).stem[:80].strip(" ."), Path(filename).suffix.lower()
     if not stem or ext not in PHOTOS | VOICES:
         raise ValueError("Choose a supported photo or voice file.")
     if re.match(r"^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)", stem, re.I):
         stem = "_" + stem
-    existing = {name.casefold() for name in files}
-    number, name = 1, stem + ext
-    while name.casefold() in existing or (LIBRARY/name).exists():
-        number += 1
-        name = f"{stem} ({number}){ext}"
-    target = LIBRARY/name
-    temp = LIBRARY/(uuid.uuid4().hex + ".part")
-    try:
-        temp.write_bytes(blob)
-        temp.replace(target)
-    finally:
-        temp.unlink(missing_ok=True)
-    files[name] = target
-    return name
+    with LOCK:
+        existing = {name.casefold() for name in files}
+        number, name = 1, stem + ext
+        while name.casefold() in existing or (LIBRARY/name).exists():
+            number += 1
+            name = f"{stem} ({number}){ext}"
+        target = LIBRARY/name
+        temp = LIBRARY/(uuid.uuid4().hex + ".part")
+        try:
+            temp.write_bytes(blob)
+            temp.replace(target)
+        finally:
+            temp.unlink(missing_ok=True)
+        updated = dict(files)
+        updated[name] = target
+        files = updated
+        return name
 
 def active_assets(db):
     refreshed = {p.name:p for p in ASSETS.rglob("*") if p.is_file() and p.suffix.lower() in PHOTOS | VOICES}
     refreshed.update({p.name:p for p in LIBRARY.iterdir() if p.is_file() and p.suffix.lower() in PHOTOS | VOICES})
     global files
-    files = refreshed
-    hidden = set(db.get("removedAssets", []))
-    return [name for name in files if name not in hidden]
+    with LOCK:
+        files = refreshed
+        hidden = set(db.get("removedAssets", []))
+        return [name for name in files if name not in hidden]
 
 def clean_assets(db):
     hidden = set(db.get("removedAssets", []))
@@ -106,7 +115,7 @@ def generation_voices(shot):
 def prompt(s, rules):
     selected = [s["image"], *s["refs"]]
     lines = [r["text"] for r in rules if r["scope"] == "all" or r["scope"] in selected or (r["scope"]=="dialog" and s["dialog"])]
-    return "\n".join(x for x in ["r34l1sm", s["prompt"], *[f"<Audio {i}> is the voice reference for {Path(name).stem}." for i, name in enumerate(generation_voices(s), 1)], *lines, s["change"]] if x)
+    return "\n".join(x for x in [s["prompt"], *[f"<Audio {i}> is the voice reference for {Path(name).stem}." for i, name in enumerate(generation_voices(s), 1)], *lines, s["change"]] if x)
 
 def remote(url, path, body=None, headers=None):
     try:
@@ -168,10 +177,11 @@ from workflow_install_remote import redact
 
 def prepare_shot(url, folder, eid, s, wf, record):
     images, voices = generation_images(s), generation_voices(s)
+    asset_map = files_snapshot()
     for name in dict.fromkeys([*images,*voices]):
-        if name not in files or Path(name).name != name:
+        if name not in asset_map or Path(name).name != name:
             raise ValueError("Missing asset: " + name)
-        shutil.copy2(files[name], folder/name)
+        shutil.copy2(asset_map[name], folder/name)
     def upload_reference(name):
         asset=folder/name
         uploaded="axdar_"+production.digest(asset)+asset.suffix.lower()
@@ -416,7 +426,7 @@ class Handler(BaseHTTPRequestHandler):
                                    artifactPending=bool(j.get("artifact_pending")),
                                    preview="/take-preview/"+relative if preview and review else ""))
             return self.send(dict(production=controller.current(),running=running,session=session,results=result,workflow=active_workflow["name"] if active_workflow else "Workflow blocked",workflowError=workflow_error,connection=controller.connection.snapshot(),restartSupported=True))
-        p=files.get(route[7:]) if route.startswith("/asset/") else None
+        p=files_snapshot().get(route[7:]) if route.startswith("/asset/") else None
         if re.fullmatch(r"/(video|take-preview)/[a-f0-9-]+/[a-f0-9-]+/\d+",route):
             kind,eid,sid,version=route[1:].split("/")
             folder=DATA/eid/sid/version
@@ -431,7 +441,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.send({},status=404)
     def do_POST(self):
         global running,session,active_workflow,workflow_error,drive_pending
-        if self.headers.get("X-Studio")!=TOKEN: return self.send({},status=403)
+        if self.headers.get("Host") != f"127.0.0.1:{PORT}" or self.headers.get("X-Studio")!=TOKEN: return self.send({},status=403)
         if restart_requested.is_set(): return self.send({"error":"Studio is restarting."},status=503)
         try:
             size=int(self.headers["Content-Length"])
@@ -607,7 +617,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send({"ok":True,"submitted":len(jobs),"blocked":skipped})
                 else: return self.send({},status=404)
             self.send({"ok":True})
-        except Exception as e: self.send({"error":str(e)},status=400)
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeError, OSError, HTTPException, subprocess.SubprocessError) as e:
+            self.send({"error":str(e)},status=400)
+        except Exception:
+            logging.exception("Unhandled error in POST %s", self.path)
+            self.send({"error":"Unexpected internal Studio error."},status=500)
     def log_message(self,*args): pass
 
 class StudioServer(ThreadingHTTPServer):

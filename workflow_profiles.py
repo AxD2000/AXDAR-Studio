@@ -212,13 +212,25 @@ _H3_EXPR = "max(5,round(a*24))+(5-(max(5,round(a*24))%17))%17"
 def _h3_fields(graph, ident, fields, suggested, info, fps):
     node = graph[ident]
     inputs = node["inputs"]
-    for role, (group, key, _, _, _) in _H3_GROUPS.items():
-        # Replace the exported sample loaders with a single variable-size binding.
-        used = {v[0] for k,v in inputs.items() if k.startswith(group+".") and _link(v)}
+    for role, (group, _key, loader_kind, loader_slot, _) in _H3_GROUPS.items():
+        # Reuse only the existing loader nodes already authored in the exported graph.
+        wired = []
+        for slot, target in inputs.items():
+            if not (slot.startswith(group + ".") and _link(target)):
+                continue
+            src_id = target[0]
+            src_node = graph.get(src_id, {})
+            if src_node.get("class_type") == loader_kind and loader_slot in src_node.get("inputs", {}):
+                suffix = slot.rsplit("_", 1)[-1]
+                order = (0, int(suffix), slot) if suffix.isdecimal() else (1, 0, slot)
+                wired.append((order, slot, src_id, loader_slot))
+        wired.sort(key=lambda item: item[0])
+        loaders = [[slot, src_id, lslot] for _, slot, src_id, lslot in wired]
+        used = {src_id for _, _, src_id, _ in wired}
         fields[:] = [f for f in fields if not (f["node"] in used and role in f["roles"] and all(dst==ident and slot.startswith(group+".") for dst,slot in f["consumers"]))]
         field_id = ident+"."+group
-        fields.append(dict(id=field_id,node=ident,key=group,label=_title(node)+" · "+group,type="AUTOGROW",roles=[role],media=role,value=None,required=False,present=False,bypass=True,group=True))
-        suggested[role] = [field_id]
+        fields.append(dict(id=field_id,node=ident,key=group,label=_title(node)+" · "+group,type="AUTOGROW",roles=[role],media=role,value=None,required=False,present=False,bypass=True,group=True,loaders=loaders))
+        suggested[role] = [field_id] if loaders else []
     frame_spec = _contract(info,node["class_type"]).get("length", {})
     suggested.update(minFrames=frame_spec.get("min",5), maxFrames=frame_spec.get("max",3600),
                      frameStep=frame_spec.get("step",17), frameBase=frame_spec.get("min",5))
@@ -275,7 +287,7 @@ def inspect_workflow(name, raw_or_dict, object_info=None, mapping=None):
         if len(candidates)>1 and role not in override:
             issues.append(f"Choose the {role} input among {', '.join(candidates)}.")
     for role in ("images","audio"):
-        candidates = [f["id"] for f in fields if f.get("media")==role]
+        candidates = [f["id"] for f in fields if f.get("media")==role and not f.get("socket")]
         suggested[role] = candidates if len(candidates) <= 1 else []
     fps = _output_fps(graph,output,branch)
     if fps:
@@ -306,7 +318,10 @@ def inspect_workflow(name, raw_or_dict, object_info=None, mapping=None):
             continue
         if len(set(values))!=len(values):
             issues.append(f"Duplicate {role} input.")
-        available = [f["id"] for f in fields if f.get("media")==role]
+        for fid in values:
+            if by_id.get(fid,{}).get("socket"):
+                issues.append(f"Connect a Load{'Image' if role=='images' else 'Audio'} node to {fid} in ComfyUI and re-export; AXDAR does not add nodes.")
+        available = [f["id"] for f in fields if f.get("media")==role and not f.get("socket")]
         required = [fid for fid in available if not by_id[fid].get("bypass")]
         if any(fid not in values for fid in required) or (len(available)>1 and role not in override and not h3):
             issues.append(f"Map and order the {role} inputs: "+", ".join(available))
@@ -416,7 +431,7 @@ def limits(wf):
     refs = {}
     for role in ("images","audio"):
         chosen = [fields[v] for v in m.get(role,[]) if v in fields]
-        cap = sum(_H3_GROUPS[role][-1] if f.get("group") else 1 for f in chosen)
+        cap = sum(len(f.get("loaders", [])) if f.get("group") else (0 if f.get("socket") else 1) for f in chosen)
         refs["max_"+role] = cap
         refs["min_"+role] = sum(not f.get("bypass") for f in chosen)
     return dict(version=wf.get("version"),min_seconds=lo,max_seconds=hi,min_frames=fmin,max_frames=fmax,
@@ -486,62 +501,82 @@ def validate_shot(wf, shot, images, voices):
     return issues
 
 
-def _resolve_runtime_contracts(graph, keys, model_info, upscaler_precision):
+def _validate_runtime_contracts(graph, keys, model_info):
+    """Read-only verification against ComfyUI /object_info. Never mutates exported nodes."""
     contracts = {}
     for ident in keys:
         node = graph[ident]
         kind = node["class_type"]
         inputs = node["inputs"]
-        if kind == "MinimaxH3LatentUpscaler3D":
-            if kind not in contracts:
-                contracts[kind] = _contract(model_info(kind), kind)
-            contract = contracts[kind]
-            device = contract.get("device", {})
-            precision = contract.get("precision", {})
-            if type(inputs.get("device")) is bool and inputs.get("precision") in device.get("options", []):
-                if "enable_temporal_chunking" in contract:
-                    inputs.setdefault("enable_temporal_chunking", inputs["device"])
-                inputs["device"] = inputs["precision"]
-                selected = upscaler_precision.get(ident, precision.get("default"))
-                if selected in precision.get("options", []):
-                    inputs["precision"] = selected
-            for key in ("enable_temporal_chunking", "force_unload"):
-                if type(default := contract.get(key, {}).get("default")) is bool:
-                    inputs.setdefault(key, default)
         for key, value in inputs.items():
-            if not isinstance(value, str) or not value.lower().endswith(MODEL_SUFFIXES) or not any(c in value for c in "/\\"):
+            if _link(value):
+                continue
+            needs_check = (isinstance(value, str) and value.lower().endswith(MODEL_SUFFIXES)) or kind == "MinimaxH3LatentUpscaler3D"
+            if not needs_check:
                 continue
             if kind not in contracts:
                 contracts[kind] = _contract(model_info(kind), kind)
-            options = contracts[kind].get(key, {}).get("options")
-            if options and (registered := model_choice(value, options)) is not None:
-                inputs[key] = registered
+            spec = contracts[kind].get(key)
+            if not spec:
+                continue
+            options = spec.get("options")
+            if options is not None and value not in options:
+                raise ValueError(
+                    f"Node {ident}.{key} ({value!r}) does not match ComfyUI's registered choices. "
+                    "Fix and re-export the workflow in ComfyUI; AXDAR does not modify exported workflows."
+                )
+            typ = spec.get("type")
+            if (typ == "BOOLEAN" and not isinstance(value, bool)) or (typ in ("INT", "FLOAT") and not _number(value)):
+                raise ValueError(
+                    f"Node {ident}.{key} ({value!r}) has an incompatible type for {typ}. "
+                    "Fix and re-export the workflow in ComfyUI; AXDAR does not modify exported workflows."
+                )
+
+
+def verify_strict_integrity(original_graph, runtime_graph, allowed_edits):
+    """Guarantee zero added/deleted nodes and zero unauthorized input mutations."""
+    if set(runtime_graph.keys()) != set(original_graph.keys()):
+        added = sorted(set(runtime_graph) - set(original_graph))
+        removed = sorted(set(original_graph) - set(runtime_graph))
+        raise ValueError(
+            f"Strict workflow integrity violation: nodes changed (added={added}, removed={removed}). "
+            "AXDAR must not add or remove workflow nodes."
+        )
+    for ident, orig_node in original_graph.items():
+        run_node = runtime_graph[ident]
+        if run_node.get("class_type") != orig_node.get("class_type"):
+            raise ValueError(f"Strict workflow integrity violation: node {ident} changed class_type.")
+        orig_inputs = orig_node.get("inputs", {})
+        run_inputs = run_node.get("inputs", {})
+        for key in set(orig_inputs) | set(run_inputs):
+            if (ident, key) in allowed_edits:
+                continue
+            if (key in orig_inputs) != (key in run_inputs) or orig_inputs.get(key) != run_inputs.get(key):
+                raise ValueError(
+                    f"Strict workflow integrity violation: unauthorized edit to {ident}.{key}. "
+                    "AXDAR only injects mapped shot inputs."
+                )
 
 
 def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, model_info=None):
-    """Build only the selected output's graph. Imported graphs and reference samples stay immutable."""
+    """Strict slot-only binding: preserve all nodes and unmapped settings verbatim."""
     errors = validate_shot(wf,shot,images,voices)
     if not str(positive_prompt or "").strip():
         errors.append("The shot needs a positive prompt.")
     if errors:
         raise ValueError(" ".join(errors))
-    graph = copy.deepcopy(wf["graph"])
+    original = wf["graph"]
+    graph = copy.deepcopy(original)
     fields = {f["id"]:f for f in wf["fields"]}
     m = wf["mapping"]
     output = m["output"]
-    next_id = max((int(i) for i in graph if i.isdigit()), default=0)+1
+    allowed_edits = set()
+
     def set_field(field_id, value):
         f = fields[field_id]
         graph[f["node"]]["inputs"][f["key"]] = value
-    def media_node(kind, slot, name):
-        nonlocal next_id
-        key = str(next_id)
-        next_id += 1
-        graph[key] = dict(class_type=kind,inputs={slot:upload(name)})
-        return [key,0]
-    for field in fields.values():
-        if field["required"] and not field["present"] and field.get("default") is not None and "parameter" in field["roles"]:
-            set_field(field["id"],field["default"])
+        allowed_edits.add((f["node"], f["key"]))
+
     for key,value in {**m.get("parameters",{}),**shot.get("workflowParameters",{})}.items():
         set_field(key,value)
     set_field(m["positive"],positive_prompt)
@@ -553,34 +588,45 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, 
     if m.get("frames"):
         set_field(m["frames"],timing(wf,shot["seconds"])["frames"])
     if model_info:
-        _resolve_runtime_contracts(graph, _upstream(graph, [output]), model_info, wf.get("upscaler_precision", {}))
+        _validate_runtime_contracts(graph, _upstream(graph, [output]), model_info)
     for role,assets in (("images",list(images)),("audio",list(voices))):
-        group,stem,kind,slot,_ = _H3_GROUPS[role]
         selected = [fields[key] for key in m[role]]
         # An explicitly deselected optional source must never leak its sample asset into a shot.
-        selected.extend(f for f in fields.values() if f.get("media")==role and f["id"] not in m[role])
+        selected.extend(f for f in fields.values() if f.get("media")==role and not f.get("socket") and f["id"] not in m[role])
         for index,field in enumerate(selected):
             inputs = graph[field["node"]]["inputs"]
             must_remain = sum(not f.get("bypass") for f in selected[index+1:])
             count = len(assets)-must_remain if field["id"] in m[role] else 0
             if field.get("group"):
-                for key in list(inputs):
-                    if key.startswith(group+"."):
-                        del inputs[key]
-                for i in range(min(max(0,count),_H3_GROUPS[role][-1])):
-                    inputs[f"{group}.{stem}_{i}"] = media_node(kind,slot,assets.pop(0))
+                loaders = field.get("loaders", [])
+                take = min(max(0, count), len(loaders))
+                for idx, (slot_key, loader_id, loader_key) in enumerate(loaders):
+                    if idx < take:
+                        name = assets.pop(0)
+                        graph[loader_id]["inputs"][loader_key] = upload(name)
+                        allowed_edits.add((loader_id, loader_key))
+                    else:
+                        inputs.pop(slot_key, None)
+                        allowed_edits.add((field["node"], slot_key))
             elif count>0:
+                if field.get("socket"):
+                    raise ValueError(
+                        f"Mapped socket {field['id']} has no existing loader node. "
+                        "Wire it in ComfyUI and re-export; AXDAR does not add nodes."
+                    )
                 name = assets.pop(0)
-                set_field(field["id"],media_node(kind,slot,name) if field.get("socket") else upload(name))
+                set_field(field["id"], upload(name))
             elif field.get("socket") or not field.get("consumers") or graph[field["node"]]["class_type"] not in ("LoadImage","LoadAudio"):
-                inputs.pop(field["key"],None)
+                if field["key"] in inputs:
+                    inputs.pop(field["key"], None)
+                    allowed_edits.add((field["node"], field["key"]))
             else:
                 for dest,key in field["consumers"]:
-                    graph[dest]["inputs"].pop(key,None)
-    if "filename_prefix" in graph[output]["inputs"]:
-        graph[output]["inputs"]["filename_prefix"] = prefix
-    keep = _upstream(graph,[output])
-    return {k:node for k,node in graph.items() if k in keep}
+                    if key in graph[dest]["inputs"]:
+                        graph[dest]["inputs"].pop(key, None)
+                        allowed_edits.add((dest, key))
+    verify_strict_integrity(original, graph, allowed_edits)
+    return graph
 
 
 def public_profile(wf):
@@ -666,16 +712,6 @@ class WorkflowStore:
         wf = inspect_workflow(rec["name"],executable or raw,rec["metadata"],rec["mapping"])
         wf.update(version=version,format="ComfyUI UI JSON" if editor is not None else "ComfyUI API JSON",
                   nodeCount=len(editor if editor is not None else wf["graph"]),executable=True)
-        if editor and "MinimaxH3LatentUpscaler3D" in editor.values():
-            original = json.loads(raw.decode("utf-8-sig"))
-            graph = original.get("workflow", original.get("graph", original))
-            authored = {}
-            for node in graph["nodes"]:
-                widgets = node.get("widgets_values")
-                if node["type"] == "MinimaxH3LatentUpscaler3D" and isinstance(widgets, list) and widgets:
-                    if widgets[-1] in ("fp32", "fp16", "bf16"):
-                        authored[str(node["id"])] = widgets[-1]
-            wf["upscaler_precision"] = authored
         return wf
 
     def _executable(self, rec):

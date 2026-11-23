@@ -252,17 +252,23 @@ class WorkflowManagerTests(unittest.TestCase):
 
     def test_ui_batch_submits_each_shots_prompt_and_only_its_references(self):
         graph=dict(self.graph)
-        graph["56"]=node("MiniMaxH3ReferenceToVideo",length=124,prompt=["84",0],vae=["65",0],
-                         **{"ref_images.ref_image_3":["169",0]})
-        graph["65"]=node("VAELoader",vae_name=r"Minimax\minimax_h3_video_vae_fp16.safetensors")
-        graph["84"]=node("PrimitiveStringMultiline",value="Template text")
-        graph["169"]=node("LoadImage",image="template-only.png")
-        upscaler="MinimaxH3LatentUpscaler3D"
-        graph["124"]=node(upscaler,latent=["121",0],device=True,precision="cuda")
-        graph["141"]=node("VHS_VideoCombine",images=["124",0],frame_rate=24,format="video/h264-mp4")
         linux_vae="Minimax/minimax_h3_video_vae_fp16.safetensors"
+        graph["56"]=node("MiniMaxH3ReferenceToVideo",length=124,prompt=["84",0],vae=["65",0],
+                         **{"ref_images.ref_image_0":["169",0],
+                            "ref_images.ref_image_1":["170",0],
+                            "ref_audios.ref_audio_0":["171",0],
+                            "ref_audios.ref_audio_1":["172",0]})
+        graph["65"]=node("VAELoader",vae_name=linux_vae)
+        graph["84"]=node("PrimitiveStringMultiline",value="Template text")
+        graph["169"]=node("LoadImage",image="template-only-0.png")
+        graph["170"]=node("LoadImage",image="template-only-1.png")
+        graph["171"]=node("LoadAudio",audio="template-only-0.wav")
+        graph["172"]=node("LoadAudio",audio="template-only-1.wav")
+        upscaler="MinimaxH3LatentUpscaler3D"
+        graph["124"]=node(upscaler,latent=["121",0],device="cuda",precision="bf16",
+                          enable_temporal_chunking=True,force_unload=True)
+        graph["141"]=node("VHS_VideoCombine",images=["124",0],frame_rate=24,format="video/h264-mp4")
         original={"nodes":[{"id":int(k),"type":n["class_type"]} for k,n in graph.items()]}
-        next(n for n in original["nodes"] if n["id"]==124)["widgets_values"]=[True,"cuda","bf16"]
         store=workflow_profiles.WorkflowStore(self.root/"upscaler-workflow")
         saved=store.import_workflow("H3 fixture",json.dumps(original).encode())
         captured=store.attach(saved["version"],json.dumps(graph).encode())
@@ -334,16 +340,15 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertEqual(uploaded,["Tom.png","Jack.png","Tom.wav","Jack.wav","Jack.png"])
         self.assertEqual(production.read(failed)["error"],rejected)
         for prompt, expected in zip(prompts,(["Tom.png","Jack.png","Tom.wav","Jack.wav"],["Jack.png"]),strict=True):
-            self.assertNotIn("169",prompt)
+            self.assertEqual(set(prompt.keys()),set(graph.keys()))
             self.assertEqual(prompt["65"]["inputs"]["vae_name"],linux_vae)
-            self.assertEqual(prompt["124"]["inputs"],dict(latent=["121",0],device="cuda",precision="bf16",
-                                 enable_temporal_chunking=True,force_unload=True))
+            self.assertEqual(prompt["124"]["inputs"],graph["124"]["inputs"])
             reference=prompt["56"]["inputs"]
             actual=[next(iter(prompt[target[0]]["inputs"].values())) for slot,target in reference.items()
                     if slot.startswith(("ref_images.","ref_audios."))]
             self.assertEqual(actual,expected)
         self.assertEqual(wf["graph"]["84"]["inputs"]["value"],"Template text")
-        self.assertEqual(wf["graph"]["65"]["inputs"]["vae_name"],graph["65"]["inputs"]["vae_name"])
+        self.assertEqual(wf["graph"]["65"]["inputs"]["vae_name"],linux_vae)
 
     def test_unconfirmed_script_and_credentials_in_script_never_reach_ssh(self):
         manager,version=self.manager()
