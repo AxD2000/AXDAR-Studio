@@ -21,6 +21,9 @@ from vast_credentials import (
     identity_options,
 )
 
+COMFY_PROBE_TIMEOUT_SECONDS = 8
+COMFY_PROBE_MAX_MISSED = 6
+
 def connection_error(exc):
     """Classify diagnostics without displaying raw SSH/API output or credentials."""
     from urllib.error import HTTPError
@@ -399,7 +402,7 @@ class Connection:
             self._indicate(ssh='red', comfy='red', gpu='red')
             return False
         try:
-            with urlopen(self.url + '/system_stats', timeout=3) as response:
+            with urlopen(self.url + '/system_stats', timeout=COMFY_PROBE_TIMEOUT_SECONDS) as response:
                 data = json.load(response)
             if 'system' not in data:
                 self._indicate(comfy='red', gpu='red')
@@ -409,7 +412,8 @@ class Connection:
             self._indicate(ssh='green', comfy='green', gpu='green' if gpu else 'red')
             return True
         except (OSError, ValueError):
-            self._indicate(comfy='red', gpu='red')
+            # Keep ssh='green' while the tunnel process is still alive; only ComfyUI HTTP probe timed out/failed.
+            self._indicate(ssh='green', comfy='red', gpu='red')
             return False
 
     def _run(self):
@@ -449,11 +453,17 @@ class Connection:
                             self._state('Ready')
                         else:
                             if not self.process or self.process.poll() is not None:
+                                self._indicate(ssh='red', comfy='red', gpu='red')
                                 raise ValueError('SSH tunnel ended during the session.')
                             missed += 1
-                            if missed >= 3:
-                                raise ValueError('ComfyUI did not answer three checks during the session.')
-                            self._state('ComfyUI Starting', 'Checking ComfyUI again on the existing SSH tunnel.')
+                            if missed >= COMFY_PROBE_MAX_MISSED:
+                                raise ValueError(
+                                    f'SSH tunnel is alive, but ComfyUI did not answer {COMFY_PROBE_MAX_MISSED} consecutive checks during the session.'
+                                )
+                            self._state(
+                                'ComfyUI Starting',
+                                f'SSH tunnel alive; waiting for busy ComfyUI to answer /system_stats ({missed}/{COMFY_PROBE_MAX_MISSED}).',
+                            )
                             continue
                         checks += 1
                         if self.settings.get('instance') and checks % 6 == 0:

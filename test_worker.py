@@ -689,5 +689,88 @@ class Phase6DownloadsDeliveryAndEndToEndTests(unittest.TestCase):
             self.assertTrue((dest / "manifest.json").is_file())
 
 
+class RcaFix1ConnectionProbeToleranceTests(unittest.TestCase):
+    def test_probe_uses_8s_timeout_and_keeps_ssh_green_when_only_comfy_is_slow(self):
+        import vast_connection
+        from unittest.mock import Mock
+        self.assertEqual(vast_connection.COMFY_PROBE_TIMEOUT_SECONDS, 8)
+        self.assertEqual(vast_connection.COMFY_PROBE_MAX_MISSED, 6)
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = vast_connection.Connection(Path(tmp) / "c.json", lambda: [], lambda *a, **k: b"")
+            conn.process = Mock()
+            conn.process.poll.return_value = None
+            conn.url = "http://127.0.0.1:19999"
+            with patch("vast_connection.urlopen", side_effect=TimeoutError("slow comfy")) as mocked:
+                self.assertFalse(conn._probe())
+                self.assertEqual(mocked.call_args.kwargs["timeout"], 8)
+            self.assertEqual(conn.indicators["ssh"], "green")
+            self.assertEqual(conn.indicators["comfy"], "red")
+
+    def test_five_missed_comfy_probes_keep_alive_ssh_tunnel_while_sixth_reconnects(self):
+        import vast_connection
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            discover = Mock(return_value=[dict(id=12, host="ssh1.vast.ai", port=1234, status="running")])
+            conn = vast_connection.Connection(Path(tmp) / "c.json", discover, Mock(return_value=b"8188\n"))
+            conn.settings = dict(instance=12, auto=False)
+            proc = Mock()
+            proc.poll.return_value = None
+            conn.process = proc
+            conn._open = Mock()
+            # Initial Ready + 5 consecutive slow ComfyUI probes + recovery on 6th check -> NEVER tears down SSH!
+            conn._probe = Mock(side_effect=[True, False, False, False, False, False, True])
+            waits = {"n": 0}
+
+            def wait(seconds):
+                waits["n"] += 1
+                return waits["n"] >= 7
+
+            conn.stop.wait = wait
+            conn._run()
+            conn._open.assert_called_once()
+            self.assertEqual(conn.state, "Ready")
+            self.assertTrue(any("SSH tunnel alive; waiting for busy ComfyUI" in line for line in conn.recent_logs()))
+
+            # Dead SSH process on 1st missed check triggers immediate SSH reconnect (not waiting 6 checks!)
+            conn2 = vast_connection.Connection(Path(tmp) / "c2.json", discover, Mock(return_value=b"8188\n"))
+            conn2.settings = dict(instance=12, auto=False)
+            dead_proc = Mock()
+            dead_proc.poll.return_value = 1
+            conn2._open = Mock(side_effect=lambda *a: setattr(conn2, "process", dead_proc))
+            conn2._probe = Mock(side_effect=[True, False, True])
+            stop_after = {"n": 0}
+
+            def wait2(seconds):
+                stop_after["n"] += 1
+                if stop_after["n"] >= 2:
+                    conn2.stop.set()
+                    return True
+                return False
+
+            conn2.stop.wait = wait2
+            conn2._run()
+            self.assertTrue(any("SSH tunnel ended during the session." in line for line in conn2.recent_logs()))
+
+            # 6th consecutive slow ComfyUI check triggers reconnect with explicit busy-ComfyUI diagnostic
+            conn3 = vast_connection.Connection(Path(tmp) / "c3.json", discover, Mock(return_value=b"8188\n"))
+            conn3.settings = dict(instance=12, auto=False)
+            alive_proc = Mock()
+            alive_proc.poll.return_value = None
+            conn3._open = Mock(side_effect=lambda *a: setattr(conn3, "process", alive_proc))
+            conn3._probe = Mock(side_effect=[True, False, False, False, False, False, False, True])
+            waits3 = {"n": 0}
+
+            def wait3(seconds):
+                waits3["n"] += 1
+                if waits3["n"] >= 7:
+                    conn3.stop.set()
+                    return True
+                return False
+
+            conn3.stop.wait = wait3
+            conn3._run()
+            self.assertTrue(any("did not answer 6 consecutive checks" in line for line in conn3.recent_logs()))
+
+
 if __name__ == "__main__":
     unittest.main()
