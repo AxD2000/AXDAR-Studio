@@ -26,3 +26,18 @@ button.danger:hover:not(:disabled){background:rgba(238,130,120,0.14);border-colo
 .wm-thumb-card video{width:100%;height:110px;object-fit:cover;border-radius:6px;background:#111}
 .wm-zoom-dialog{width:min(960px,94vw)}
 .wm-zoom-dialog video{width:100%;max-height:76vh;background:#000;border-radius:8px}
+.wk-inline{display:inline-flex;align-items:center;gap:6px;margin:0}
+.wk-inline select{width:auto}
+.wk-checks{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:6px 14px;margin:10px 0}
+.wk-check{display:flex;align-items:center;gap:7px;margin:0;cursor:pointer}
+.wk-invariants{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.wk-shot-row{border:1px solid var(--edge);border-radius:9px;padding:12px;margin-bottom:10px;background:var(--field)}
+.wk-take-chip{margin-top:6px;padding:6px 8px;border:1px solid var(--edge);border-radius:7px;background:var(--panel)}
+.wk-take-selected{border-color:var(--accent)}
+.wk-link{color:var(--accent);text-decoration:none;padding:4px 8px;border:1px solid var(--edge);border-radius:6px}
+.wk-state-completed{background:rgba(34,197,94,.2);color:#86efac}
+.wk-state-failed{background:rgba(238,130,120,.2);color:#ee8278}
+.wk-state-generating{background:rgba(183,154,250,.22);color:var(--accent)}
+.wk-state-skipped{opacity:.75}
+.wk-log-dialog{width:min(900px,94vw)}
+.wk-log-dialog pre{max-height:55vh;overflow:auto;background:var(--field);padding:10px;border-radius:7px}

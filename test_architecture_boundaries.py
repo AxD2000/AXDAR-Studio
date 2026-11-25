@@ -20,13 +20,13 @@ DEPARTMENTS = {
 
 FORBIDDEN_IMPORTS = {
     "vast": DEPARTMENTS["workflow"] | DEPARTMENTS["story"] | DEPARTMENTS["plugins"]
-            | {"production", "direct_session", "take_quality", "editor_media", "comfy_client", "studio", "app_context", "studio_routes"},
+            | {"production", "direct_session", "take_quality", "editor_media", "comfy_client", "studio", "app_context", "studio_routes", "worker_config", "worker_runtime"},
     "workflow": DEPARTMENTS["vast"] | DEPARTMENTS["story"] | DEPARTMENTS["plugins"]
-                | {"direct_session", "take_quality", "editor_media", "studio", "app_context", "studio_routes"},
+                | {"direct_session", "take_quality", "editor_media", "studio", "app_context", "studio_routes", "worker_config", "worker_runtime"},
     "story": DEPARTMENTS["vast"] | DEPARTMENTS["plugins"]
-             | {"workflow_manager", "workflow_install_remote", "production", "direct_session", "editor_media", "studio", "app_context", "studio_routes"},
+             | {"workflow_manager", "workflow_install_remote", "production", "direct_session", "editor_media", "studio", "app_context", "studio_routes", "worker_config", "worker_runtime"},
     "plugins": DEPARTMENTS["vast"] | DEPARTMENTS["workflow"] | DEPARTMENTS["story"]
-               | {"production", "direct_session", "comfy_client", "editor_media", "studio", "app_context", "studio_routes"},
+               | {"production", "direct_session", "comfy_client", "editor_media", "studio", "app_context", "studio_routes", "worker_config", "worker_runtime"},
 }
 
 

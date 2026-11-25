@@ -165,6 +165,7 @@ class HttpTests(unittest.TestCase):
     def test_removed_workspaces_sections_and_routes_are_absent(self):
         with urlopen(self.url + '/workspaces.js') as response:
             ws_js = response.read().decode()
+        self.assertIn("title:'Worker',symbol:", ws_js)
         self.assertIn("title:'Workflow',symbol:", ws_js)
         for removed in ('Continuity', 'Video Editor', 'Economics', 'Settings'):
             self.assertNotIn(removed, ws_js)
@@ -172,7 +173,10 @@ class HttpTests(unittest.TestCase):
             html = response.read().decode()
         self.assertIn('function savePayload()', html)
         self.assertIn('saveInFlight', html)
-        self.assertIn('Direct ComfyUI submission', html)
+        self.assertIn('/worker-ui.js', html)
+        with urlopen(self.url + '/worker-ui.js') as response:
+            worker_js = response.read().decode()
+        self.assertIn('Worker Execution', worker_js)
         for removed in ('/production-ui.js', '/editor-ui.js', 'Shot history', 'Continuity rules', 'remoteProductionPanel', 'productionServicesPanel'):
             self.assertNotIn(removed, html)
         for removed_asset in ('/production-ui.js', '/editor-ui.js'):

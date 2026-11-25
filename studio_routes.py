@@ -15,6 +15,7 @@ from workflow_install_remote import redact
 STATIC_ASSETS = {
     "/workspaces.js", "/workspaces.css", "/plugin-manager.js",
     "/connection-ui.js", "/story-ui.js", "/workflow-ui.js", "/workflow-manager-ui.js",
+    "/worker-ui.js",
 }
 
 
@@ -55,6 +56,7 @@ def _get_status(handler, app):
         app.workflow_manager.watch()
     cache = getattr(app, "status_cache", None)
     result = cache.list_results(app.DATA) if cache is not None else worker_runtime.StatusIndexCache(app.DATA).list_results()
+    worker_cfg = getattr(app, "worker_config", None)
     return handler.send(dict(
         running=app.running,
         session=app.session,
@@ -63,6 +65,7 @@ def _get_status(handler, app):
         workflowError=app.workflow_error,
         connection=app.connection.snapshot(),
         credentials=vast_credentials.credentials_status(),
+        worker=worker_cfg.public_state() if worker_cfg is not None else None,
         restartSupported=True,
     ))
 
@@ -115,6 +118,8 @@ def handle_post(handler, app):
         return _post_vast_connection(handler, app, obj)
     if handler.path == "/workflow-manager":
         return handler.send(app.workflow_manager.action(obj))
+    if handler.path == "/worker":
+        return _post_worker(handler, app, obj)
     if handler.path.startswith("/workflow/") or handler.path == "/workflow":
         return _post_workflow(handler, app, obj, blob if binary else None, filename)
     if handler.path in ("/direct-production", "/start"):
@@ -221,6 +226,27 @@ def _post_story(handler, app, obj, raw, filename):
         return handler.send(app.actions.act(handler.path, obj, raw, filename))
 
 
+def _post_worker(handler, app, obj):
+    import worker_config as wcfg
+    action = obj.get("action")
+    if action == "get":
+        return handler.send(app.worker_config.public_state())
+    if action == "save-settings":
+        with app.LOCK:
+            changes = obj.get("settings")
+            if not isinstance(changes, dict):
+                raise ValueError("Provide a settings object.")
+            if app.running:
+                blocked = sorted(set(changes) - wcfg.FLOW_LIVE_SETTINGS)
+                if blocked:
+                    raise ValueError("Pause or stop production before changing input settings: " + ", ".join(blocked))
+            app.worker_config.update(changes)
+            return handler.send(app.worker_config.public_state())
+    if action == "start":
+        return _post_production(handler, app, obj)
+    raise ValueError("Unknown Worker action.")
+
+
 def _post_production(handler, app, obj):
     if handler.path == "/direct-production":
         with app.LOCK:
@@ -241,8 +267,10 @@ def _post_production(handler, app, obj):
                 ]
                 return handler.send(dict(promptId=job.get("ticket"), status=job["status"],
                                          error=redact(job.get("error", "")), messages=messages))
+            if obj.get("action") == "resume" and "minutes" not in obj and getattr(app, "worker_config", None) is not None:
+                obj = dict(obj, minutes=app.worker_config.get().get("sessionMinutes", 0))
             return handler.send(app.direct_session.control(obj))
-    # /start (Direct submission)
+    # /start or /worker {action:"start"} (Single Direct Submission owner)
     with app.LOCK:
         if not app.active_workflow:
             raise ValueError(app.workflow_error)
@@ -255,9 +283,14 @@ def _post_production(handler, app, obj):
         url = (connected or obj.get("url", "")).strip().rstrip("/")
         if urlsplit(url).scheme not in ("http", "https") or not urlsplit(url).hostname:
             raise ValueError("أدخل رابط ComfyUI")
-        minutes = int(obj.get("minutes", 60))
-        if not 2 <= minutes <= 1440:
+        worker_settings = app.worker_config.get() if getattr(app, "worker_config", None) is not None else {}
+        default_minutes = worker_settings.get("sessionMinutes", 60)
+        minutes = int(obj.get("minutes", default_minutes))
+        if minutes != 0 and not 2 <= minutes <= 1440:
             raise ValueError("المدة من دقيقتين إلى ١٤٤٠ دقيقة")
+        run_limit = int(obj.get("runLimit", worker_settings.get("runLimit", 0)) or 0)
+        if run_limit < 0:
+            raise ValueError("Run limit must be 0 or greater.")
         db = app.project()
         ep = next(e for e in db["episodes"] if e["id"] == obj["episode"])
         jobs, skipped = app.actions.approved_jobs(db, ep)
@@ -272,9 +305,12 @@ def _post_production(handler, app, obj):
                 raise ValueError("Retry is only available for a failed shot of the current revision.")
         if not jobs:
             raise ValueError(next((reason for reasons in skipped.values() for reason in reasons), "Approve at least one ready shot."))
-        end = time.time() + 60 * minutes
-        view = dict(end=end, episode=ep["id"], submitted=len(jobs), blocked=skipped,
+        end = time.time() + (86400 * 7 if minutes == 0 else 60 * minutes)
+        view = dict(end=end, unlimited=(minutes == 0), episode=ep["id"], submitted=len(jobs), blocked=skipped,
                     phase="Preparing ComfyUI", completed=0, failed=0)
-        app.direct_session.start(view, jobs, app.active_workflow, target, url, retry=bool(retry))
+        app.direct_session.start(
+            view, jobs, app.active_workflow, target, url,
+            retry=bool(retry), run_limit=run_limit, worker_settings=worker_settings,
+        )
         app.run_direct(url, app.active_workflow, target)
-        return handler.send({"ok": True, "submitted": len(jobs), "blocked": skipped})
+        return handler.send({"ok": True, "submitted": len(jobs), "blocked": skipped, "runLimit": run_limit})

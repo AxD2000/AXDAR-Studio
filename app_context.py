@@ -15,6 +15,7 @@ import vast_connection
 import vast_credentials
 import vast_ssh_ops
 import workflow_profiles
+import worker_config
 import worker_runtime
 from direct_session import DirectSession
 from studio_actions import StudioActions
@@ -83,6 +84,10 @@ class AppContainer:
             ssh_ops=vast_ssh_ops,
             hf_token_fn=vast_credentials.hf_token,
             identity_fn=vast_credentials.identity,
+        )
+        self.worker_config = worker_config.WorkerConfigStore(
+            self.DATA / "production" / "worker-settings.json",
+            self.BASE / "workflow-profiles" / "worker-mappings",
         )
         self.direct_session = DirectSession(self)
         self.status_cache = worker_runtime.StatusIndexCache(self.DATA)

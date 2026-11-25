@@ -44,22 +44,13 @@ async function tryAutoDeploy(forceAlign=false){
 }
 
 function workflowWorkspace(){
-    lastThumbsSignature='';
     return '<div id="wmUnified">'+
         workflowPanel()+
         '<section class="panel" id="wmInstallPanel"><h2>Installation Monitor</h2>'+
         '<div id="wmInstallSummary">'+installSummaryHtml()+'</div>'+
         '<details id="wmTerminalLog" '+(workflowTerminalOpen?'open':'')+'><summary>Live Terminal Logs</summary>'+
         '<pre id="wmTerminalLogPre" class="preserve-lines">'+esc(workflowStatus()?.installation?.log||'No terminal output yet.')+'</pre></details>'+
-        '</section>'+
-        '<section class="panel" id="wmProdPanel"><h2>Production Monitor</h2>'+
-        '<div id="wmProdControls">'+productionControlsHtml()+'</div>'+
-        '<div id="wmThumbsWrap">'+producedThumbsHtml()+'</div>'+
-        '</section>'+
-        '<dialog id="wmVideoZoom" class="wm-zoom-dialog">'+
-        '<div class="top"><strong id="wmZoomTitle"></strong><button type="button" data-wm-zoom-close>Close</button></div>'+
-        '<video id="wmZoomVideo" controls playsinline></video>'+
-        '</dialog></div>';
+        '</section></div>';
 }
 
 function extractMetrics(data, profile){
@@ -143,66 +134,6 @@ function installSummaryHtml(){
             }).join('')+'</tbody></table>':'');
 }
 
-function productionControlsHtml(){
-    const session=state.session?.episode===ep.id?state.session:{};
-    const data=workflowStatus();
-    const phases=data?.installation?.status;
-    const installing=Boolean(phases&&!terminalWorkflowStates.includes(phases));
-    const hasApproved=ep.shots.some(s=>s.approved);
-    const canStart=!installing&&hasApproved&&Boolean(currentProfile()?.executable)&&state.connection?.state==='Ready'&&!state.running;
-    const canStop=Boolean(state.running||(session.episode&&!['Finished','Stopped'].includes(session.phase)));
-    const canSkip=Boolean(state.running||(session.episode&&!['Finished','Stopped'].includes(session.phase)));
-    const targetRegenShot=ep.shots.find(s=>s.id===session.current)||selectedShot()||ep.shots.find(s=>s.approved);
-    const canRegen=Boolean(!installing&&!state.running&&state.connection?.state==='Ready'&&currentProfile()?.executable&&targetRegenShot?.approved);
-    let doneCount=0,failedCount=0;
-    for(const shot of ep.shots){
-        const r=versions(shot).at(-1);
-        if(r?.status==='done')doneCount++;
-        else if(r?.status==='error')failedCount++;
-    }
-    return '<p><strong>'+esc(ep.title)+'</strong> · '+ep.shots.length+' shots · '+doneCount+' produced'+(failedCount?' · '+failedCount+' failed':'')+' · Status: <strong>'+esc(session.phase||'Idle')+'</strong>'+
-        (state.running&&session.requestedAction?' ('+esc(session.requestedAction)+'…)':'')+'</p>'+
-        (session.error?'<p class="danger">'+esc(session.error)+'</p>':'')+
-        '<div class="row">'+
-        '<button type="button" class="primary" data-wm="start" '+(canStart?'':'disabled')+'>Start Production</button>'+
-        '<button type="button" class="danger" data-wm="stop" '+(canStop?'':'disabled')+'>Stop Production</button>'+
-        '<button type="button" data-wm="skip" '+(canSkip?'':'disabled')+'>Skip Shot</button>'+
-        '<button type="button" data-wm="regenerate" data-wm-shot="'+esc(targetRegenShot?.id||'')+'" '+(canRegen?'':'disabled')+'>Regenerate Shot</button>'+
-        '</div>';
-}
-
-function producedItems(){
-    const items=[];
-    ep.shots.forEach((shot,index)=>{
-        const takes=versions(shot).filter(v=>v.video);
-        const latest=takes.at(-1);
-        if(latest){
-            items.push({shot,index,take:latest,label:heading(shot,index)});
-        }
-    });
-    return items;
-}
-
-function producedThumbsSignature(){
-    return ep.id+'|'+producedItems().map(x=>x.shot.id+':'+x.take.version+':'+x.take.video).join(',')+'|'+state.running;
-}
-
-function producedThumbsHtml(){
-    const items=producedItems();
-    lastThumbsSignature=producedThumbsSignature();
-    if(!items.length)return '<p class="muted">No produced shots yet.</p>';
-    const canRegen=!state.running&&state.connection?.state==='Ready'&&Boolean(currentProfile()?.executable);
-    return '<div class="wm-thumbs">'+items.map(({shot,take,label})=>
-        '<figure class="wm-thumb-card">'+
-        '<video muted preload="metadata" src="'+esc(take.video)+'"></video>'+
-        '<figcaption><strong>'+label+'</strong>'+(take.duration?' <small>'+Number(take.duration).toFixed(1)+'s</small>':'')+'</figcaption>'+
-        '<div class="row">'+
-        '<button type="button" data-wm-zoom="'+esc(take.video)+'" data-wm-zoom-title="'+esc(label)+'">Enlarge</button>'+
-        '<button type="button" data-wm="regenerate" data-wm-shot="'+esc(shot.id)+'" '+(canRegen&&shot.approved?'':'disabled')+'>Regenerate</button>'+
-        '</div></figure>'
-    ).join('')+'</div>';
-}
-
 function updateTerminalLogPreservingScroll(nextText){
     const pre=$('#wmTerminalLogPre');
     if(!pre)return;
@@ -230,13 +161,6 @@ async function pollWorkflow(){
         const sum=$('#wmInstallSummary');
         if(sum)sum.innerHTML=installSummaryHtml();
         updateTerminalLogPreservingScroll(data.installation?.log);
-        const ctrl=$('#wmProdControls');
-        if(ctrl)ctrl.innerHTML=productionControlsHtml();
-        const nextSig=producedThumbsSignature();
-        if(nextSig!==lastThumbsSignature){
-            const wrap=$('#wmThumbsWrap');
-            if(wrap)wrap.innerHTML=producedThumbsHtml();
-        }
         if(pendingAutoDeployVersion===version&&state.connection?.state==='Ready'){
             tryAutoDeploy(false);
         }
@@ -253,23 +177,6 @@ document.addEventListener('toggle',event=>{
 },true);
 
 document.addEventListener('click',async event=>{
-    const zoomBtn=event.target.closest('button[data-wm-zoom]');
-    if(zoomBtn){
-        const dialog=$('#wmVideoZoom'), video=$('#wmZoomVideo'), title=$('#wmZoomTitle');
-        if(dialog&&video){
-            title.textContent=zoomBtn.dataset.wmZoomTitle||'Shot Preview';
-            video.src=zoomBtn.dataset.wmZoom;
-            dialog.showModal();
-            video.play().catch(()=>{});
-        }
-        return;
-    }
-    if(event.target.closest('button[data-wm-zoom-close]')){
-        const dialog=$('#wmVideoZoom'), video=$('#wmZoomVideo');
-        if(video){video.pause();video.removeAttribute('src');video.load()}
-        if(dialog?.open)dialog.close();
-        return;
-    }
     const button=event.target.closest('button[data-wm]');
     if(!button)return;
     const action=button.dataset.wm;
@@ -302,32 +209,6 @@ document.addEventListener('click',async event=>{
             reportStatus('Workflow installation state reset.');
             return;
         }
-        if(action==='start'){
-            await flushEdits();
-            const result=await post('/start',{episode:ep.id});
-            reportSubmission(result);
-        }
-        if(action==='stop'||action==='skip'){
-            await post('/direct-production',{action,episode:ep.id});
-        }
-        if(action==='regenerate'){
-            await flushEdits();
-            const shotId=button.dataset.wmShot;
-            if(!shotId)throw Error('Select an approved shot to regenerate.');
-            const result=await post('/direct-production',{action:'regenerate',episode:ep.id,shot:shotId});
-            reportSubmission(result);
-        }
-        if(['start','stop','skip','regenerate'].includes(action)){
-            state=await(await fetch('/status')).json();
-            await pollWorkflow();
-        }
     }catch(error){reportError(error)}
     finally{if(button.isConnected)button.disabled=false}
 });
-
-document.addEventListener('close',event=>{
-    if(event.target.id==='wmVideoZoom'){
-        const video=$('#wmZoomVideo');
-        if(video){video.pause();video.removeAttribute('src');video.load()}
-    }
-},true);

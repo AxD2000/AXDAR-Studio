@@ -2,8 +2,8 @@ const workspaceItems=[
     {title:'Story & Scenes',symbol:'▤',description:'Script, scenes and storyboard'},
     {title:'Shot Lab',symbol:'▣',description:'Prompts, character references and shot approvals'},
     {title:'Asset Vault',symbol:'▧',description:'Project reference photos and voices'},
-    {title:'Production',symbol:'◈',description:'Vast connection and direct ComfyUI submission'},
-    {title:'Workflow',symbol:'❖',description:'Install, validate and monitor ComfyUI workflows'}
+    {title:'Worker',symbol:'◈',description:'Vast connection, execution settings, node controls, monitoring and takes'},
+    {title:'Workflow',symbol:'❖',description:'Import, validate and install ComfyUI workflow packages'}
 ];
 const spaces=workspaceItems.map(item=>item.title);
 const symbols=workspaceItems.map(item=>item.symbol);
@@ -29,7 +29,7 @@ function render(){
     $('#episodeMenu').innerHTML=db.episodes.map((e,i)=>option(e.id,(i+1)+'. '+(e.title||'Untitled episode'),ep.id)).join('');
     $('#projectTitle').textContent=ep.title||'Untitled episode';
     $('#projectCount').textContent=(ep.scenes||[]).length+' scenes · '+ep.shots.length+' shots · '+ep.shots.filter(s=>s.approved).length+' approved';
-    $('#app').innerHTML=[renderStory,renderShots,()=>characterRegistry()+libraryView(),sessionView,workflowWorkspace][page]();
+    $('#app').innerHTML=[renderStory,renderShots,()=>characterRegistry()+libraryView(),workerWorkspace,workflowWorkspace][page]();
     if(page===1&&selectedShot())loadShotReferences();
 }
 document.addEventListener('click',e=>{

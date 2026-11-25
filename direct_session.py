@@ -93,15 +93,19 @@ class DirectSession:
                         connection.retry_saved(plan["instance"])
             time.sleep(2)
 
-    def start(self, view, jobs, workflow, target, url, retry=False, force_new=False):
+    def start(self, view, jobs, workflow, target, url, retry=False, force_new=False, run_limit=0, worker_settings=None):
         saved=self.plan.get("view",{})
         if not force_new and saved.get("phase") in ("Paused","Needs attention") and self.plan.get("index",0)<len(self.plan["jobs"]):
             raise ValueError("Resume the saved production queue or stop it before starting a new session.")
+        limit=int(run_limit or 0)
+        if limit<0:
+            raise ValueError("Run limit must be 0 or greater.")
         self.plan=dict(id=uuid.uuid4().hex,view=view,jobs=jobs,version=workflow["version"],index=0,control="run",
                        instance=identity(target) if target else None,url=url if not target else None,
-                       retry=retry,force_new=force_new,skip_current=False)
+                       retry=retry,force_new=force_new,skip_current=False,
+                       run_limit=limit,worker_settings=dict(worker_settings) if isinstance(worker_settings,dict) else {})
         self.interrupted=False
-        view.update(rate=(target or {}).get("rate"),started=time.time())
+        view.update(rate=(target or {}).get("rate"),started=time.time(),runLimit=limit)
         self.ctx["session"]=view
         self.save()
 
@@ -179,10 +183,15 @@ class DirectSession:
             raise ValueError("Connect the original instance to reconcile its queued shot.")
         wf=ctx["actions"].store.get(self.plan["version"])
         minutes=int(request.get("minutes",60))
-        if not 2<=minutes<=1440:
-            raise ValueError("Choose a session of 2–1440 minutes.")
-        view.update(end=time.time()+60*minutes,phase="Preparing ComfyUI")
+        if minutes!=0 and not 2<=minutes<=1440:
+            raise ValueError("Choose a session of 0 (unlimited) or 2–1440 minutes.")
+        if "runLimit" in request:
+            self.plan["run_limit"]=max(0,int(request["runLimit"] or 0))
+            view["runLimit"]=self.plan["run_limit"]
+        end_time=time.time()+(86400*7 if minutes==0 else 60*minutes)
+        view.update(end=end_time,unlimited=(minutes==0),phase="Preparing ComfyUI")
         view.pop("error",None)
+        view.pop("pauseReason",None)
         view.pop("requestedAction",None)
         view.pop("finished",None)
         self.plan.pop("validated",None)
@@ -192,11 +201,22 @@ class DirectSession:
         ctx["run_direct"](connection.snapshot().get("url") if target else self.plan["url"],wf,target)
         return {"ok":True}
 
+    def _live_worker_settings(self):
+        frozen = dict(self.plan.get("worker_settings") or {})
+        cfg = self.ctx.get("worker_config")
+        if cfg is not None:
+            live = cfg.get()
+            for flow_key in ("autoReconnect", "continuousExecution", "autoRetry", "maxRetries", "consecutiveFailureLimit"):
+                if flow_key in live:
+                    frozen[flow_key] = live[flow_key]
+        return frozen
+
     def target_url(self, deadline, target, original):
         if not target:
             return original
         connection=self.ctx["connection"]
         instance=identity(target)
+        auto_reconnect=self._live_worker_settings().get("autoReconnect",True)
         while time.time()<deadline:
             with connection.lock:
                 try:
@@ -206,6 +226,8 @@ class DirectSession:
                     url=None
                 if url and identity(selected)==instance:
                     return url
+                if not auto_reconnect:
+                    raise ConnectionError("Connection lost and Automatic Reconnection is disabled in Worker settings.")
                 connection.retry_saved(instance)
             self.plan["view"]["phase"]="Waiting for connection"
             time.sleep(min(2,max(0,deadline-time.time())))
@@ -271,6 +293,7 @@ class DirectSession:
                 return False
             render_ctx["cancel_prompt"]=cancel_prompt
             jobs=self.plan["jobs"]
+            run_executed=0
             # An already-submitted attempt must be reconciled before dependency
             # validation. Reconnecting only changes the tunnel, not its owner.
             for i in range(self.plan["index"],len(jobs)):
@@ -368,7 +391,20 @@ class DirectSession:
                 if result=="done":
                     view["completed"]+=1
                 self.plan["index"]=i+1
+                run_executed+=1
                 self.save()
+                live_cfg=self._live_worker_settings()
+                step_limit=int(self.plan.get("run_limit") or 0)
+                if not live_cfg.get("continuousExecution",True):
+                    step_limit=1 if step_limit==0 else min(step_limit,1)
+                if step_limit>0 and run_executed>=step_limit and self.plan["index"]<len(jobs):
+                    self.plan["control"]="pause"
+                    view["phase"]="Paused"
+                    view["pauseReason"]=(
+                        f"Paused after {run_executed} shot(s) (Step / Test Run limit). Click Resume to continue."
+                    )
+                    self.save()
+                    return
             if self.plan["control"]=="stop":
                 view["phase"]="Stopped"
             else:

@@ -127,5 +127,102 @@ class Phase1ShotIdentityAndTakesTests(unittest.TestCase):
             self.assertEqual(worker_runtime.take_download_name(root, "ep1", "sh1", "100"), "EP01S01_T01.mp4")
 
 
+class Phase2WorkerConfigAndUnifiedExecutionTests(unittest.TestCase):
+    def test_mandatory_invariants_cannot_be_disabled_and_optional_settings_persist(self):
+        import worker_config
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = worker_config.WorkerConfigStore(root / "settings.json", root / "overrides")
+            for invariant in worker_config.MANDATORY_INVARIANTS:
+                with self.assertRaisesRegex(ValueError, "mandatory"):
+                    store.update({invariant: False})
+            updated = store.update({
+                "autoRetry": True,
+                "maxRetries": 3,
+                "runLimit": 2,
+                "seedMode": "fixed",
+                "fixedSeed": 12345,
+                "sessionMinutes": 0,
+                "resolutionPreset": "720p",
+                "aspectRatio": "16:9",
+                "fpsOverride": 24,
+            })
+            self.assertEqual(updated["maxRetries"], 3)
+            self.assertEqual(updated["runLimit"], 2)
+            self.assertEqual(updated["fixedSeed"], 12345)
+            reloaded = worker_config.WorkerConfigStore(root / "settings.json", root / "overrides")
+            self.assertEqual(reloaded.get()["resolutionPreset"], "720p")
+            self.assertEqual(reloaded.get()["fpsOverride"], 24)
+            # Sidecar mapping override does not touch .zip packages
+            ver = "a" * 64
+            store.save_mapping_override(ver, {"seed": "63.noise_seed", "fps": "141.frame_rate"})
+            self.assertEqual(store.get_mapping_override(ver)["seed"], "63.noise_seed")
+            store.clear_mapping_override(ver)
+            self.assertEqual(store.get_mapping_override(ver), {})
+
+    def test_run_limit_and_step_mode_pause_and_resume_on_single_direct_session(self):
+        import threading
+        from types import SimpleNamespace
+        import direct_session
+        import workflow_profiles as wprof
+        import worker_config
+
+        eid = str(uuid.uuid4())
+        shots = [
+            [eid, {"id": str(uuid.uuid4()), "revision": f"r{i}", "seconds": 2, "prompt": f"Shot {i}", "shot_code": f"EP01S0{i}"}]
+            for i in range(1, 4)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "production").mkdir()
+            cfg = worker_config.WorkerConfigStore(root / "production" / "ws.json", root / "overrides")
+            submitted_ids = []
+
+            def api(url, path, obj=None):
+                if path == "/object_info":
+                    return {"Output": {}}
+                if path == "/prompt":
+                    submitted_ids.append(obj["prompt"]["id"])
+                    return {"prompt_id": str(uuid.uuid4())}
+                if path.startswith("/history/"):
+                    t = path.rsplit("/", 1)[-1]
+                    return {t: {"status": {"status_str": "success", "completed": True}, "outputs": {"141": {}}}}
+                return {"queue_running": [], "queue_pending": []}
+
+            wf = {"version": "a" * 64, "name": "Fix", "output": "141", "graph": {"141": {"class_type": "Output", "inputs": {}}}}
+            store_stub = SimpleNamespace(get=lambda _v: wf)
+            ctx = {
+                "DATA": root, "LOCK": threading.RLock(), "json_api": api,
+                "prepare_shot": lambda _u, _f, _e, s, _w, _r: {"id": s["id"], "141": {"inputs": {}}},
+                "download_output": lambda _u, f, _h, _j: (f / "video.part").write_bytes(movie(2, False)),
+                "prompt": lambda s: s["prompt"],
+                "take_quality": SimpleNamespace(check=lambda _p, _j: {"technical": "passed"}),
+                "actions": SimpleNamespace(store=store_stub),
+                "connection": SimpleNamespace(snapshot=lambda: {"url": "http://fixture"}, target=lambda: None),
+                "worker_config": cfg,
+                "workflow_manager": SimpleNamespace(busy=lambda: False),
+                "running": True,
+            }
+            session = direct_session.DirectSession(ctx)
+            ctx["run_direct"] = lambda u, w, t: session.run(u, w, t)
+            view = {"end": time.time() + 600, "episode": eid, "submitted": 3, "phase": "Preparing ComfyUI", "completed": 0, "failed": 0}
+            session.start(view, shots, wf, None, "http://fixture", run_limit=1, worker_settings=cfg.get())
+            with patch.object(direct_session, "runtime_requirements", return_value={"graph": wf["graph"]}), \
+                 patch.object(wprof, "timing", return_value={"playback_seconds": 2}), \
+                 patch.object(production.time, "sleep"):
+                session.run("http://fixture", wf)
+                self.assertEqual(len(submitted_ids), 1)
+                self.assertEqual(view["phase"], "Paused")
+                self.assertIn("Paused after 1 shot", view.get("pauseReason", ""))
+                self.assertEqual(session.plan["index"], 1)
+
+                # Resume with runLimit=0 (all remaining) finishes shots 2 and 3
+                session.control({"action": "resume", "episode": eid, "minutes": 0, "runLimit": 0})
+                self.assertEqual(len(submitted_ids), 3)
+                self.assertEqual(view["completed"], 3)
+                self.assertEqual(view["phase"], "Finished")
+                self.assertTrue(view.get("unlimited"))
+
+
 if __name__ == "__main__":
     unittest.main()
