@@ -2,37 +2,52 @@ let discoveredInstances = [];
 
 function connectionPanel(){
     const c=state.connection||{};
+    const creds=state.credentials||{};
     const details=c.instance&&!['Vast starting','Waiting for Vast','Unavailable'].includes(c.state)?
       ' · Instance #'+esc(c.instance)+(c.gpu?' · '+esc(c.gpu):''):'';
     const pending=['Connecting','Reconnecting','Vast starting','ComfyUI Starting'].includes(c.state);
+    const allSaved=creds.vastApiSaved===true&&creds.sshKeySaved===true;
+    const keyBadge=(ok,yes,no)=>'<strong>'+(ok?yes:no)+'</strong>';
+    const keysLine=allSaved
+      ?'<p class="muted"><strong>Automatic connection active</strong> · All keys auto-saved (Vast API · SSH key'+(creds.hfTokenSaved?' · HF Token':'')+') — no manual entry needed.</p>'
+      :'<p class="muted">Keys (auto-saved): Vast API '+keyBadge(creds.vastApiSaved,'Saved','Not set')+
+        ' · SSH key '+keyBadge(creds.sshKeySaved,'Auto-saved','Auto-generated on connect')+
+        ' · HF Token '+keyBadge(creds.hfTokenSaved,'Saved','Not set')+'</p>';
     return '<section class="panel" aria-labelledby="vastConnectionTitle">'+
       '<h2 id="vastConnectionTitle">Vast connection</h2>'+
       '<p role="status">'+esc(c.state||'Looking for an instance')+details+'</p>'+
       connectionIndicators(c,['api','ssh','comfy','gpu'])+
+      keysLine+
       (c.error?'<p class="'+(pending?'muted':'danger')+'">'+esc(c.error)+'</p>':'')+
       '<div class="row"><button data-connection="refresh">Refresh instances</button>'+
       '<button data-connection="reconnect">Reconnect from scratch</button>'+
       '<button data-connection="disconnect">Disconnect tunnel</button>'+
       (state.restartSupported?'<button data-connection="restart-studio">Restart Studio</button>':'')+
       '<button data-tools="open">Terminal &amp; HF Token</button></div>'+
-      '<details '+(c.indicators?.api==='red'?'open':'')+'><summary>Vast API key &amp; instance selector</summary>'+
-      '<label for="vastApiKey">Vast API key</label><input id="vastApiKey" type="password" autocomplete="off" dir="ltr">'+
+      '<details '+(c.indicators?.api==='red'||creds.vastApiSaved===false?'open':'')+'><summary>'+(allSaved?'Advanced: Manage saved keys &amp; instance selector':'Vast API key &amp; instance selector')+'</summary>'+
+      '<p class="muted">'+(creds.vastApiSaved?'Vast API key and SSH key are saved permanently and loaded automatically on every launch. Leave blank unless replacing your key.':'Save your Vast API key once; AXDAR stores it in Windows Credential Manager and auto-registers your SSH key for all future instances.')+'</p>'+
+      '<label for="vastApiKey">Vast API key</label><input id="vastApiKey" type="password" autocomplete="off" dir="ltr" placeholder="'+(creds.vastApiSaved?'Saved automatically — leave blank':'Paste Vast API key')+'">'+
       '<div class="row"><button data-connection="key">Save API key</button>'+
       '<button data-connection="instances">Discover instances</button></div>'+
       (discoveredInstances.length?'<label for="vastInstanceSelect">Rented instance<select id="vastInstanceSelect">'+
         discoveredInstances.map(row=>option(String(row.id),'#'+row.id+' · '+(row.gpu||'GPU')+' · '+(row.status||'unknown')+(row.rate!=null?' · $'+Number(row.rate).toFixed(3)+'/hr':''),String(c.instance||''))).join('')+
         '</select></label><button data-connection="connect">Connect selected instance</button>':'')+
-      '</details>'+
-      '<details><summary>Direct SSH connection (without Vast API)</summary>'+
+      '<details style="margin-top:8px"><summary>Manual SSH fallback (only if not using Vast API)</summary>'+
+      '<p class="muted">Not needed when Vast API is saved — AXDAR connects automatically using your saved SSH key.</p>'+
       '<label for="manualSshInput">Vast SSH command (ssh -p PORT root@HOST)</label>'+
-      '<input id="manualSshInput" type="text" autocomplete="off" dir="ltr" placeholder="ssh -p 12345 root@ssh.vast.ai">'+
-      '<button data-connection="connect-ssh">Connect using SSH</button></details></section>';
+      '<input id="manualSshInput" type="text" autocomplete="off" dir="ltr" placeholder="ssh -p 12345 root@ssh.vast.ai" value="'+esc(c.ssh?'ssh -p '+c.ssh.port+' root@'+c.ssh.host:'')+'">'+
+      '<div class="row"><button data-connection="connect-ssh">Connect using SSH</button>'+
+      (c.ssh?'<button data-connection="refresh">Switch back to automatic Vast API</button>':'')+'</div></details></details></section>';
 }
 
 document.addEventListener('click',async e=>{
     const button=e.target.closest('button');
     if(!button)return;
-    if(button.dataset.tools==='open'){document.getElementById('workflowTools').showModal();return}
+    if(button.dataset.tools==='open'){
+        const saved=document.getElementById('hfSaved');
+        if(saved)saved.textContent=state.credentials?.hfTokenSaved?'Saved in Windows credential vault (auto-loaded)':'';
+        document.getElementById('workflowTools').showModal();return;
+    }
     if(button.dataset.tools==='close'){document.getElementById('hfToken').value='';document.getElementById('workflowTools').close();return}
     const action=button.dataset.connection;
     if(!action)return;
@@ -48,10 +63,10 @@ document.addEventListener('click',async e=>{
         if(action==='key')body.key=document.getElementById('vastApiKey').value;
         if(action==='hf')body.token=document.getElementById('hfToken').value;
         if(action==='command')body.command=document.getElementById('remoteCommand').value;
-        if(action==='connect')body.instance=Number(document.getElementById('vastInstanceSelect')?.value||0);
+        if(action==='connect'){body.instance=Number(document.getElementById('vastInstanceSelect')?.value||0);body.auto=true;}
         if(action==='connect-ssh')body.ssh=document.getElementById('manualSshInput')?.value||'';
         const result=await post('/connection',body);
-        if(action==='hf'){document.getElementById('hfToken').value='';document.getElementById('hfSaved').textContent='Saved in Windows credential vault';return}
+        if(action==='hf'){document.getElementById('hfToken').value='';if(state.credentials)state.credentials.hfTokenSaved=true;document.getElementById('hfSaved').textContent='Saved in Windows credential vault (auto-loaded)';return}
         if(action==='command'){
             document.getElementById('remoteOutput').textContent=result.output;
             return;
@@ -86,54 +101,36 @@ const workspaceLayoutKey='axdar.lastWorkspace';
 
 function rememberWorkspace(){
     if(!ep)return;
-    try{localStorage.setItem(workspaceLayoutKey,JSON.stringify({episode:ep.id,page}))}catch{}
+    try{
+        localStorage.setItem(workspaceLayoutKey,JSON.stringify({
+            episode:ep.id,
+            page,
+            selectedId:typeof selectedId==='string'?selectedId:'',
+            storyTab:typeof storyTab==='string'?storyTab:'Script',
+            workflowTab:typeof workflowTab==='string'?workflowTab:'Setup',
+        }));
+    }catch{}
 }
 
 function restoreWorkspace(previous){
     let saved=null;
     try{saved=JSON.parse(localStorage.getItem(workspaceLayoutKey))}catch{}
-    ep=db.episodes.find(item=>item.id===(previous.episode||saved?.episode))||ep;
+    ep=db.episodes.find(item=>item.id===(saved?.episode||previous?.episode))||ep;
     if(Number.isInteger(saved?.page)&&saved.page>=0&&saved.page<spaces.length)page=saved.page;
+    if(typeof saved?.selectedId==='string'&&ep?.shots?.some(s=>s.id===saved.selectedId))selectedId=saved.selectedId;
+    if(typeof saved?.storyTab==='string'&&['Script','Scenes','Storyboard'].includes(saved.storyTab))storyTab=saved.storyTab;
+    if(typeof saved?.workflowTab==='string'&&typeof workflowTabs!=='undefined'&&workflowTabs.includes(saved.workflowTab))workflowTab=saved.workflowTab;
 }
 
-function chooseWorkspaceSession(){
-    const dialog=document.createElement('dialog');
-    dialog.id='workspaceSession';
-    dialog.setAttribute('aria-labelledby','workspaceSessionTitle');
-    dialog.innerHTML='<h2 id="workspaceSessionTitle">Open AXDAR Studio</h2>'+
-        '<p>Start a fresh connection or pick up your previous workspace. Saved keys and automatic connection settings stay available.</p>'+
-        '<p id="workspaceSessionError" class="danger" role="alert" hidden></p>'+
-        '<div class="row"><button class="primary" data-session-mode="new">New session</button>'+
-        '<button data-session-mode="resume" autofocus>Resume previous session</button></div>';
-    document.body.append(dialog);
-    dialog.addEventListener('cancel',event=>event.preventDefault());
-    dialog.showModal();
-    return new Promise(resolve=>{
-        dialog.addEventListener('click',async event=>{
-            const mode=event.target.closest('button[data-session-mode]')?.dataset.sessionMode;
-            if(!mode)return;
-            const buttons=[...dialog.querySelectorAll('button')];
-            buttons.forEach(button=>button.disabled=true);
-            const message=dialog.querySelector('#workspaceSessionError');
-            message.hidden=true;
-            try{
-                const previous=await post('/workspace-session',{mode});
-                if(mode==='resume')restoreWorkspace(previous);
-                dialog.close();
-                dialog.remove();
-                resolve();
-            }catch(error){
-                message.textContent=error.message;
-                message.hidden=false;
-                buttons.forEach(button=>button.disabled=false);
-            }
-        });
-    });
+async function resumeWorkspaceSession(){
+    const previous=await post('/workspace-session',{mode:'resume'});
+    restoreWorkspace(previous);
+    return previous;
 }
 
 document.addEventListener('change',event=>{
     if(event.target.id==='episodeMenu')queueMicrotask(rememberWorkspace);
 });
 document.addEventListener('click',event=>{
-    if(event.target.closest('button[data-page],button[data-shot],button[data-open-shot]'))queueMicrotask(rememberWorkspace);
+    if(event.target.closest('button[data-page],button[data-shot],button[data-open-shot],button[data-storytab],button[data-wm-tab]'))queueMicrotask(rememberWorkspace);
 });

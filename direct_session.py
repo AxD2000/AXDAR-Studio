@@ -66,12 +66,12 @@ class DirectSession:
                 return
             plan=self.plan
         view=plan["view"]
-        connection=self.ctx["controller"].connection
+        connection=self.ctx["connection"]
         while time.time()<view["end"]-10:
             with self.ctx["LOCK"]:
                 if self.plan is not plan or self.ctx["running"] or plan.get("control")!="run":
                     return
-                if not self.ctx["production_busy"]() and not self.ctx["workflow_manager"].busy():
+                if not self.ctx["workflow_manager"].busy():
                     try:
                         target=connection.target() if plan["instance"] else None
                     except ValueError:
@@ -93,13 +93,13 @@ class DirectSession:
                         connection.retry_saved(plan["instance"])
             time.sleep(2)
 
-    def start(self, view, jobs, workflow, target, url, retry=False):
+    def start(self, view, jobs, workflow, target, url, retry=False, force_new=False):
         saved=self.plan.get("view",{})
-        if saved.get("phase") in ("Paused","Needs attention") and self.plan.get("index",0)<len(self.plan["jobs"]):
+        if not force_new and saved.get("phase") in ("Paused","Needs attention") and self.plan.get("index",0)<len(self.plan["jobs"]):
             raise ValueError("Resume the saved production queue or stop it before starting a new session.")
         self.plan=dict(id=uuid.uuid4().hex,view=view,jobs=jobs,version=workflow["version"],index=0,control="run",
                        instance=identity(target) if target else None,url=url if not target else None,
-                       retry=retry)
+                       retry=retry,force_new=force_new,skip_current=False)
         self.interrupted=False
         view.update(rate=(target or {}).get("rate"),started=time.time())
         self.ctx["session"]=view
@@ -108,9 +108,58 @@ class DirectSession:
     def control(self, request):
         ctx=self.ctx
         action=request.get("action")
+        if action=="regenerate":
+            if ctx["running"] or ctx["workflow_manager"].busy():
+                raise ValueError("Wait for the current production or installation to finish.")
+            wf=ctx.get("active_workflow")
+            if not wf:
+                raise ValueError(ctx.get("workflow_error") or "Select a valid Workflow Package first.")
+            shot_id=request.get("shot")
+            try:
+                valid_shot=isinstance(shot_id,str) and str(uuid.UUID(shot_id))==shot_id
+            except (ValueError,TypeError,AttributeError):
+                valid_shot=False
+            if not valid_shot:
+                raise ValueError("Select a valid shot to regenerate.")
+            connection=ctx["connection"]
+            connected=connection.snapshot().get("url")
+            target=connection.target() if connected else None
+            url=(connected or "").strip().rstrip("/")
+            if not url:
+                raise ValueError("Connect to ComfyUI before regenerating a shot.")
+            db=ctx["project"]()
+            ep=next((e for e in db["episodes"] if e["id"]==request.get("episode")),None)
+            if not ep:
+                raise ValueError("Episode not found.")
+            jobs,skipped=ctx["actions"].approved_jobs(db,ep)
+            chosen=[row for row in jobs if row[1]["id"]==shot_id]
+            if not chosen:
+                reason=next(iter(skipped.get(shot_id) or ()),"Approve this shot before regenerating.")
+                raise ValueError(reason)
+            minutes=int(request.get("minutes",60))
+            if not 2<=minutes<=1440:
+                raise ValueError("Choose a session of 2–1440 minutes.")
+            view=dict(end=time.time()+60*minutes,episode=ep["id"],submitted=1,blocked={},
+                      phase="Preparing ComfyUI",completed=0,failed=0)
+            self.start(view,chosen,wf,target,url,retry=True,force_new=True)
+            ctx["run_direct"](url,wf,target)
+            return {"ok":True,"submitted":1,"blocked":{}}
         view=self.plan.get("view")
         if not view or request.get("episode")!=view["episode"]:
             raise ValueError("This episode has no saved direct production session.")
+        if action=="skip":
+            if self.plan["index"]>=len(self.plan["jobs"]):
+                raise ValueError("No remaining shot to skip.")
+            if ctx["running"]:
+                self.plan["skip_current"]=True
+                view["requestedAction"]="skip"
+            else:
+                self.plan["index"]+=1
+                view["skipped"]=view.get("skipped",0)+1
+                if self.plan["index"]>=len(self.plan["jobs"]):
+                    view["phase"]="Finished"
+            self.save()
+            return {"ok":True}
         if action in ("pause","stop"):
             self.plan["control"]=action
             view["requestedAction"]=action
@@ -120,11 +169,11 @@ class DirectSession:
             return {"ok":True}
         if action!="resume":
             raise ValueError("Unknown direct production control.")
-        if ctx["running"] or ctx["production_busy"]() or ctx["workflow_manager"].busy():
+        if ctx["running"] or ctx["workflow_manager"].busy():
             raise ValueError("Wait for the current production or installation.")
         if self.plan["index"]>=len(self.plan["jobs"]):
             raise ValueError("This queue is complete. Retry an individual failed shot.")
-        connection=ctx["controller"].connection
+        connection=ctx["connection"]
         target=connection.target() if self.plan["instance"] else None
         if target and identity(target)!=self.plan["instance"]:
             raise ValueError("Connect the original instance to reconcile its queued shot.")
@@ -146,7 +195,7 @@ class DirectSession:
     def target_url(self, deadline, target, original):
         if not target:
             return original
-        connection=self.ctx["controller"].connection
+        connection=self.ctx["connection"]
         instance=identity(target)
         while time.time()<deadline:
             with connection.lock:
@@ -172,7 +221,7 @@ class DirectSession:
         status=history.get("status",{})
         if status.get("status_str")!="success" or status.get("completed") is not True:
             return
-        rows=self.ctx["controller"].connection.discover_instances()
+        rows=self.ctx["connection"].discover_instances()
         if any(str(row["id"])==instance for row in rows):
             return
         job.pop("artifact_pending",None)
@@ -204,7 +253,7 @@ class DirectSession:
             render_ctx["download_output"]=on_current(ctx["download_output"])
             cancel_unsupported=set()
             def cancel_prompt(ticket):
-                if self.plan["control"]!="stop" or ticket in cancel_unsupported:
+                if (self.plan["control"]!="stop" and not self.plan.get("skip_current")) or ticket in cancel_unsupported:
                     return False
                 if not re.fullmatch(r"[0-9a-f-]{36}",ticket):
                     return False
@@ -230,7 +279,7 @@ class DirectSession:
                     return
                 if time.time()>=deadline-10:
                     raise TimeoutError("Session time limit reached. Resume to reconcile outstanding work.")
-                eid,shot,rules=jobs[i]
+                eid,shot=jobs[i][0],jobs[i][1]
                 view.update(current=shot["id"],phase="Rendering")
                 self.save()
                 latest=next(iter(sorted((ctx["DATA"]/eid/shot["id"]).glob("*/job.json"),reverse=True)),None)
@@ -243,15 +292,32 @@ class DirectSession:
                     queued=render_ctx["json_api"](url,"/queue")
                     if any(row[1]==prior["ticket"] for row in queued["queue_running"]+queued["queue_pending"]):
                         raise RuntimeError("ComfyUI is still cancelling the original prompt. Resume after it leaves the queue.")
+                wm=ctx.get("workflow_manager")
+                inst_id=identity(target) if target else "local"
                 if not in_flight and i==self.plan["index"] and not self.plan.get("validated"):
+                    if wf.get("packaged") and target and wm and hasattr(wm,"verify_live_environment"):
+                        verified_fp=wm.verify_live_environment(wf.get("version"),target,wf)
+                        if verified_fp:
+                            self.plan["verifiedEnvFingerprint"]=verified_fp
                     graph=runtime_requirements(ctx,{"jobs":jobs[i:]},wf)["graph"]
                     info=dependency_info(render_ctx["json_api"],url,graph,deadline)
-                    dependencies=scan(graph,info)
-                    missing=dependencies["nodes"]+[m["name"] for m in dependencies["models"] if m["status"]!="Installed"]
-                    if missing:
-                        raise ValueError("Resolve the missing workflow dependencies before production: "+", ".join(missing))
+                    if wf.get("packaged"):
+                        missing_classes=sorted({n["class_type"] for n in graph.values()} - info.keys())
+                        if missing_classes:
+                            raise ValueError("Resolve the missing package node classes before production: "+", ".join(missing_classes))
+                    else:
+                        dependencies=scan(graph,info)
+                        missing=dependencies["nodes"]+[m["name"] for m in dependencies["models"] if m["status"]!="Installed"]
+                        if missing:
+                            raise ValueError("Resolve the missing workflow dependencies before production: "+", ".join(missing))
                     self.plan["validated"]=True
-                if wf.get("format")=="ComfyUI UI JSON" and i==0 and not self.plan.get("sampleVerified"):
+                needs_gate=(
+                    (wf.get("format")=="ComfyUI UI JSON" and i==0 and not self.plan.get("sampleVerified"))
+                    or (wf.get("packaged") and i==0 and not self.plan.get("sampleVerified")
+                        and not (wm and hasattr(wm,"is_production_ready")
+                                 and wm.is_production_ready(wf.get("version"),inst_id,self.plan.get("verifiedEnvFingerprint"))))
+                )
+                if needs_gate:
                     self.plan.setdefault("id",uuid.uuid4().hex)
                     self.plan["verifying"]=True
                     view["phase"]="Verifying first shot"
@@ -263,12 +329,40 @@ class DirectSession:
                     if result=="done":
                         self.plan["sampleVerified"]=True
                 else:
-                    result=production.render(render_ctx,url,deadline,eid,shot,rules,wf,2,lambda:None,self.plan["retry"])
+                    result=production.render(render_ctx,url,deadline,eid,shot,wf,2,lambda:None,self.plan["retry"],force_new=bool(self.plan.get("force_new")))
+                if result=="done" and wf.get("packaged") and wm and hasattr(wm,"record_production_readiness"):
+                    done_path=next(iter(sorted((ctx["DATA"]/eid/shot["id"]).glob("*/job.json"),reverse=True)),None)
+                    done_job=production.read(done_path,{}) if done_path else {}
+                    quality=done_job.get("quality") or {}
+                    wm.record_production_readiness(
+                        wf.get("version"),
+                        inst_id,
+                        {
+                            "takeId": done_job.get("take_id"),
+                            "shotId": shot["id"],
+                            "sha256": done_job.get("sha256"),
+                            "duration": done_job.get("duration"),
+                            "width": quality.get("width"),
+                            "height": quality.get("height"),
+                            "frames": quality.get("frames"),
+                            "technical": quality.get("technical"),
+                        },
+                        passed=quality.get("technical")=="passed" and bool(done_job.get("sha256")),
+                        env_fingerprint=self.plan.get("verifiedEnvFingerprint"),
+                    )
                 if result in ("waiting","uncertain"):
                     raise RuntimeError("The original prompt is unresolved. Resume on the same instance to reconcile it.")
                 if result=="cancelled":
+                    if self.plan.pop("skip_current",False) and self.plan["control"]=="run":
+                        view.pop("requestedAction",None)
+                        view["skipped"]=view.get("skipped",0)+1
+                        self.plan["index"]=i+1
+                        self.save()
+                        continue
                     view["phase"]="Stopped"
                     return
+                if self.plan.pop("skip_current",False):
+                    view.pop("requestedAction",None)
                 if result=="error":
                     view["failed"]+=1
                 if result=="done":

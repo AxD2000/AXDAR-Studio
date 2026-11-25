@@ -12,6 +12,14 @@ function renderMigration(){
 }
 function reportError(err){$('#notice').textContent=err.message||String(err);$('#notice').scrollIntoView({block:'nearest'})}
 function reportStatus(msg){$('#notice').textContent='';$('#saved').textContent=msg}
+function reportSubmission(result){
+    reportStatus(result.submitted+' shot(s) queued.');
+    const skipped=Object.entries(result.blocked||{});
+    if(skipped.length)$('#notice').textContent=skipped.map(([id,reasons])=>{
+        const shot=ep.shots.find(s=>s.id===id);
+        return (shot?titleShot(shot):id)+': '+reasons.join(' · ');
+    }).join(' / ');
+}
 function adoptProject(project){
     const episodeId=ep?.id;db=project;ep=db.episodes.find(e=>e.id===episodeId)||db.episodes.at(-1);
     preview=null;
@@ -43,10 +51,12 @@ function sceneShots(id){return ep.shots.filter(s=>s.scene_id===id)}
 function titleShot(s){return s.sourceHeading||s.title||('Shot '+(ep.shots.indexOf(s)+1))}
 function scriptPanel(){
     const proposal=proposals.get(ep.id);
+    const hasStory=Boolean((storyDrafts.get(ep.id)??ep.story??'').trim()||ep.scenes?.length||ep.shots?.length||ep.story_imports?.length||proposal);
     return '<section class="panel"><div class="top"><h2>Episode script</h2><button id="newEp">New episode</button></div>'+
         '<label>Episode title<input id="title" value="'+esc(ep.title)+'"></label>'+
         '<label>Story text<textarea rows="8" id="scriptDraft" dir="auto" placeholder="Paste a story or numbered scenes and shots.">'+esc(storyDrafts.get(ep.id)??ep.story??'')+'</textarea></label>'+
-        '<div class="actions"><button class="primary" data-story-action="parse">Review breakdown</button><button data-story-action="file">Import story file</button></div>'+
+        '<div class="actions"><button class="primary" data-story-action="parse">Review breakdown</button><button data-story-action="file">Import story file</button>'+
+        '<button type="button" class="danger" data-story-action="story-clear" '+(hasStory?'':'disabled')+'>Delete story</button></div>'+
         '<small>TXT, Markdown, Fountain, DOCX or text-based PDF</small></section>'+
         (proposal?proposalPanel(proposal):'')+
         (ep.story_imports?.length?'<details class="panel"><summary>Original story imports ('+ep.story_imports.length+')</summary>'+ep.story_imports.map((s,i)=>'<details><summary>'+esc(s.filename||s.name||('Import '+(i+1)))+'</summary><pre dir="auto">'+esc(s.original)+'</pre></details>').join('')+'</details>':'');
@@ -213,7 +223,11 @@ function proposalScene(element){
 }
 document.addEventListener('input',e=>{
     const t=e.target,field=t.dataset.proposalField;
-    if(t.id==='scriptDraft')storyDrafts.set(ep.id,t.value);
+    if(t.id==='scriptDraft'){
+        storyDrafts.set(ep.id,t.value);
+        const clearBtn=$('button[data-story-action="story-clear"]');
+        if(clearBtn)clearBtn.disabled=!(t.value.trim()||ep.scenes?.length||ep.shots?.length||ep.story_imports?.length||proposals.get(ep.id));
+    }
     if(!field)return;
     const scene=proposalScene(t);
     if(field==='title'){scene.title=t.value;return}
@@ -291,6 +305,12 @@ document.addEventListener('click',async e=>{
             scene.shots=scene.shots.filter(s=>s.id!==id);render();break;
         }
         case 'discard':proposals.delete(episodeId);render();break;
+        case 'story-clear':{
+            if(!confirm('Delete the story text, scenes, and shots for this episode? Saved tokens, keys, workflow, and assets will be kept.'))break;
+            await projectAction('/story/clear',{episode:episodeId});
+            storyDrafts.delete(episodeId);proposals.delete(episodeId);selectedId='';preview=null;
+            render();rememberWorkspace();reportStatus('Story deleted.');break;
+        }
         case 'scene-new':case 'scene-rename':{
             const existing=ep.scenes.find(s=>s.id===b.dataset.scene),title=prompt('Scene title',existing?.title||'');
             if(!title?.trim())break;

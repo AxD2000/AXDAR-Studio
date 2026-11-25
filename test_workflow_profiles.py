@@ -209,6 +209,61 @@ class WorkflowProfiles(unittest.TestCase):
             self.assertEqual(store.active()["version"],current["version"])
             self.assertEqual(store.select(inspected["version"]),store.active())
 
+    def test_ui_to_api_local_conversion_and_deno_minimax_h3(self):
+        ui = {
+            "nodes": [
+                {"id": 1, "type": "MarkdownNote", "mode": 0, "widgets_values": ["note"]},
+                {"id": 10, "type": "UNETLoader", "mode": 0, "inputs": [{"name": "unet_name", "type": "COMBO", "widget": {"name": "unet_name"}, "link": None}, {"name": "weight_dtype", "type": "COMBO", "widget": {"name": "weight_dtype"}, "link": None}], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [1]}], "widgets_values": ["model.safetensors", "default"]},
+                {"id": 11, "type": "LoraLoaderModelOnly", "mode": 0, "inputs": [{"name": "model", "type": "MODEL", "link": 1}], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [2]}], "widgets_values": ["pixar.safetensors", 0.8]},
+                {"id": 12, "type": "LoraLoaderModelOnly", "mode": 4, "inputs": [{"name": "model", "type": "MODEL", "link": 2}], "outputs": [{"name": "MODEL", "type": "MODEL", "links": [3]}], "widgets_values": ["bypassed.safetensors", 0.5]},
+                {"id": 13, "type": "RandomNoise", "mode": 0, "inputs": [{"name": "noise_seed", "type": "INT", "widget": {"name": "noise_seed"}, "link": None}], "outputs": [{"name": "NOISE", "type": "NOISE", "links": [4]}], "widgets_values": [42, "randomize"]},
+                {"id": 14, "type": "PrimitiveFloat", "mode": 0, "title": "Duration", "inputs": [{"name": "value", "type": "FLOAT", "widget": {"name": "value"}, "link": None}], "outputs": [{"name": "FLOAT", "type": "FLOAT", "links": [5]}], "widgets_values": [5]},
+                {"id": 15, "type": "ComfyMathExpression", "mode": 0, "inputs": [{"name": "values.a", "type": "FLOAT", "link": 5}, {"name": "expression", "type": "STRING", "widget": {"name": "expression"}, "link": None}], "outputs": [{"name": "FLOAT", "type": "FLOAT", "links": []}, {"name": "INT", "type": "INT", "links": [6]}], "widgets_values": ["max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17"]},
+                {"id": 16, "type": "DenoMiniMaxH3ReferenceImageLoader", "mode": 0, "inputs": [{"name": "image_paths", "type": "STRING", "widget": {"name": "image_paths"}, "link": None}], "outputs": [{"name": "ref_images", "type": "DENO_MINIMAX_H3_REFERENCE_IMAGES", "links": [7]}], "widgets_values": ["", ""]},
+                {"id": 17, "type": "DenoMiniMaxH3ReferenceToVideo", "mode": 0, "inputs": [{"name": "ref_images", "type": "DENO_MINIMAX_H3_REFERENCE_IMAGES", "link": 7}, {"name": "prompt", "type": "STRING", "widget": {"name": "prompt"}, "link": None}, {"name": "length", "type": "INT", "widget": {"name": "length"}, "link": 6}], "outputs": [{"name": "positive", "type": "CONDITIONING", "links": [8]}], "widgets_values": ["", 124]},
+                {"id": 18, "type": "SamplerCustomAdvanced", "mode": 0, "inputs": [{"name": "model", "type": "MODEL", "link": 3}, {"name": "noise", "type": "NOISE", "link": 4}, {"name": "cond", "type": "CONDITIONING", "link": 8}], "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [9, 10]}]},
+                {"id": 19, "type": "VHS_VideoCombine", "mode": 0, "title": "Save Base Master", "inputs": [{"name": "images", "type": "IMAGE", "link": 9}], "outputs": [], "widgets_values": {"frame_rate": 24, "filename_prefix": "Base", "format": "video/h264-mp4", "save_output": True}},
+                {"id": 20, "type": "ImageScale", "mode": 0, "inputs": [{"name": "image", "type": "IMAGE", "link": 10}], "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [11]}], "widgets_values": ["lanczos", 1920, 1080, "disabled"]},
+                {"id": 21, "type": "VHS_VideoCombine", "mode": 0, "title": "Save Final Upscaled Video", "inputs": [{"name": "images", "type": "IMAGE", "link": 11}], "outputs": [], "widgets_values": {"frame_rate": 24, "filename_prefix": "Final_Upscaled", "format": "video/h264-mp4", "save_output": True}},
+            ],
+            "links": [
+                [1, 10, 0, 11, 0, "MODEL"],
+                [2, 11, 0, 12, 0, "MODEL"],
+                [3, 12, 0, 18, 0, "MODEL"],
+                [4, 13, 0, 18, 1, "NOISE"],
+                [5, 14, 0, 15, 0, "FLOAT"],
+                [6, 15, 1, 17, 2, "INT"],
+                [7, 16, 0, 17, 0, "DENO_MINIMAX_H3_REFERENCE_IMAGES"],
+                [8, 17, 0, 18, 2, "CONDITIONING"],
+                [9, 18, 0, 19, 0, "IMAGE"],
+                [10, 18, 0, 20, 0, "IMAGE"],
+                [11, 20, 0, 21, 0, "IMAGE"],
+            ],
+        }
+        raw = json.dumps(ui).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = profiles.WorkflowStore(tmp)
+            wf = store.import_workflow("deno_v11.json", raw)
+            self.assertTrue(wf["executable"])
+            self.assertEqual(wf["format"], "ComfyUI UI JSON")
+            self.assertEqual(wf["issues"], [])
+            self.assertEqual(wf["adapter"], "minimax-h3")
+            self.assertEqual(wf["output"], "21")
+            self.assertEqual(wf["mapping"]["positive"], "17.prompt")
+            self.assertEqual(wf["mapping"]["duration"], "14.value")
+            self.assertEqual(wf["mapping"]["images"], ["16.image_paths"])
+            self.assertEqual(wf["mapping"]["audio"], ["17.ref_audios"])
+            self.assertEqual(wf["graph"]["18"]["inputs"]["model"], ["11", 0])
+            self.assertEqual(wf["graph"]["13"]["inputs"], {"noise_seed": 42})
+            self.assertEqual(wf["graph"]["20"]["inputs"]["width"], 1920)
+            self.assertEqual(store.active()["version"], wf["version"])
+            with_refs = profiles.runtime_graph(wf, {"seconds": 5}, "pixar scene", ["a.png", "b.png"], ["v.wav"], lambda n: "u/" + n, "p")
+            self.assertEqual(with_refs["16"]["inputs"]["image_paths"], "u/a.png\nu/b.png")
+            self.assertEqual(with_refs["17"]["inputs"]["prompt"], "pixar scene")
+            self.assertEqual(with_refs[with_refs["17"]["inputs"]["ref_audios.ref_audio_0"][0]]["inputs"]["audio"], "u/v.wav")
+            no_refs = profiles.runtime_graph(wf, {"seconds": 5}, "text only", [], [], lambda n: "u/" + n, "p")
+            self.assertNotIn("ref_images", no_refs["17"]["inputs"])
+
 
 if __name__=="__main__":
     unittest.main()

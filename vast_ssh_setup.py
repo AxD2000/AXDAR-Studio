@@ -122,7 +122,7 @@ def trust_host(target):
         out.write(f"{host} {key}\n".encode("ascii"))
 
 
-def attach_key(target):
+def ensure_local_key():
     public = VAST_IDENTITY.with_suffix(".pub")
     if not VAST_IDENTITY.is_file() and not public.exists():
         VAST_IDENTITY.parent.mkdir(exist_ok=True)
@@ -134,6 +134,27 @@ def attach_key(target):
     key = " ".join(public.read_text("utf-8").strip().split()[:2])
     if not re.fullmatch(r"(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp\d+) [A-Za-z0-9+/=]+", key):
         raise ValueError("The local SSH public key is invalid.")
+    return key
+
+
+def ensure_account_ssh_key():
+    """Ensure AXDAR's local SSH public key is saved on the Vast account for all future instances."""
+    key = ensure_local_key()
+    existing = vast("ssh/")
+    if key in json.dumps(existing):
+        return False
+    result = vast("ssh/", {"ssh_key": key})
+    if isinstance(result, dict) and result.get("success") is False:
+        raise ValueError("Vast did not register this computer's SSH public key on the account.")
+    return True
+
+
+def attach_key(target):
+    key = ensure_local_key()
+    try:
+        ensure_account_ssh_key()
+    except Exception:
+        pass
     path = f"instances/{int(target['id'])}/ssh/"
     if key not in json.dumps(vast(path)) and not vast(path, {"ssh_key": key}).get("success"):
         raise ValueError("Vast did not attach this computer's SSH public key.")

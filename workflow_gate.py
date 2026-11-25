@@ -11,7 +11,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def verify_first_shot(ctx, url, deadline, batch, wf, row, retry_failed=False):
-    episode, shot, rules = row
+    episode, shot = row[0], row[1]
     root=ctx["DATA"]/"production"/"workflow-checks"
     folder=root/batch
     folder.mkdir(parents=True,exist_ok=True)
@@ -97,7 +97,7 @@ def verify_first_shot(ctx, url, deadline, batch, wf, row, retry_failed=False):
         return quality
 
     settings=dict(ctx,technical_qc=verify_quality)
-    result=production.render(settings,url,deadline,episode,shot,rules,wf,2,observe,retry_failed)
+    result=production.render(settings,url,deadline,episode,shot,wf,2,observe,retry_failed)
     if result in ("waiting","uncertain","cancelled"):
         return result
     _,attempt=latest_attempt()

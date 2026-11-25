@@ -156,7 +156,7 @@ class ImportTests(unittest.TestCase):
 class PreparationTests(unittest.TestCase):
     def setUp(self):
         self.assets=["ava.png","ava.wav","sam.jpg","sam.mp3","clock.jpg"]
-        self.db=se.new_project([{"scope":"dialog","text":"Keep the doorway visible."}])
+        self.db=se.new_project()
         self.ep=se.new_episode();self.db["episodes"]=[self.ep]
         self.ava=self.character("Ava",["آفا","Artist"],["ava.png"],["ava.wav"])
         self.sam=self.character("Sam",["سام","Artist"],["sam.jpg"],["sam.mp3"])
@@ -184,7 +184,6 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual((p["images"],p["audio"]),(["ava.png"],["sam.mp3"]))
         self.assertEqual(p["dialogue"][0]["text"],"هل آفا هنا؟")
         self.assertTrue(p["dialogue"][0]["offscreen"])
-        self.assertIn("Keep the doorway visible.",p["positive_prompt"])
         self.assertEqual(p["positive_prompt"].count("هل آفا هنا؟"),1)
         s2=self.make_shot("Shot 1\nArtist studies the wall.\nArtist (O.S.): Who?")
         p=self.preview(s2);self.assertFalse(p["ready"])

@@ -1,11 +1,10 @@
 """Pure Vast API and verified OpenSSH transport primitives (zero cross-module imports)."""
-from datetime import datetime, timezone
 import hashlib
 import ipaddress
 import json
-import math
 import re
 import subprocess
+import threading
 import uuid
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -13,6 +12,28 @@ from urllib.request import Request, urlopen
 from vast_credentials import SSH_CONNECT_SECONDS, api_key, identity_options
 
 STORE = "/workspace/axdar-studio"
+_ssh_account_synced = False
+_ssh_sync_lock = threading.Lock()
+
+
+def sync_account_ssh_key_async(force=False):
+    """Best-effort background sync of AXDAR's local SSH public key to the Vast account."""
+    global _ssh_account_synced
+    with _ssh_sync_lock:
+        if _ssh_account_synced and not force:
+            return
+        _ssh_account_synced = True
+
+    def _run():
+        global _ssh_account_synced
+        try:
+            from vast_ssh_setup import ensure_account_ssh_key
+            ensure_account_ssh_key()
+        except Exception:
+            with _ssh_sync_lock:
+                _ssh_account_synced = False
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _digest(path):
@@ -60,59 +81,9 @@ def instances():
         for row in data["instances"]:
             result.append(instance_target(row))
         if not data.get("next_token"):
+            sync_account_ssh_key_async()
             return result
         params["after_token"] = data["next_token"]
-
-
-def month_key():
-    return datetime.now(timezone.utc).strftime("%Y-%m")
-
-
-def billing_charges(instance):
-    key = api_key()
-    if not key:
-        raise ValueError("Save the Vast API key before reading billing.")
-    now = datetime.now(timezone.utc)
-    filters = {"day": {"gte": int(now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()), "lte": int(now.timestamp())}}
-    params = {"select_filters": json.dumps(filters), "limit": 100}
-    account = selected = 0
-    seen = set()
-    while True:
-        req = Request("https://console.vast.ai/api/v0/charges?" + urlencode(params), headers={"Authorization": "Bearer " + key})
-        with urlopen(req, timeout=15) as stream:
-            data = json.load(stream)
-        if not data.get("success"):
-            raise ValueError("Vast did not return confirmed charges.")
-        for row in data["results"]:
-            amount = float(row["amount"])
-            if not math.isfinite(amount):
-                raise ValueError("Vast returned an invalid charge.")
-            account += amount
-            if instance and row.get("source") == f"instance-{int(instance)}":
-                selected += amount
-        next_token = data.get("next_token")
-        if not next_token:
-            return {"month": month_key(), "confirmedAccount": round(account, 4), "confirmedInstance": round(selected, 4) if instance else None}
-        if next_token in seen:
-            raise ValueError("Vast returned a repeated billing page.")
-        seen.add(next_token)
-        params["after_token"] = next_token
-
-
-def request_instance_stop(target):
-    key = api_key()
-    if not key:
-        raise ValueError("VAST_API_KEY is required to stop the selected instance.")
-    instance_id = int(target["id"])
-    req = Request(
-        f"https://console.vast.ai/api/v0/instances/{instance_id}/",
-        method="PUT",
-        data=b'{"state":"stopped"}',
-        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
-    )
-    with urlopen(req, timeout=20) as response:
-        if not json.load(response).get("success"):
-            raise ValueError("Vast did not confirm the stop request")
 
 
 def ssh(target, command, *, data=None, stream=None, out=None, timeout=70):

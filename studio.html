@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AXDAR Studio</title><link rel="stylesheet" href="/workspaces.css"><script>try{document.documentElement.dataset.theme=localStorage.getItem('axdar.theme')==='cream'?'cream':'dark'}catch{}</script></head><body><canvas id="pointer-field" aria-hidden="true"></canvas><div class="shell"><aside><div class="brand"><span class="logo">◈</span> AXDAR STUDIO</div><nav id="nav" aria-label="Workspaces"></nav><div class="sidefoot"><small>Current episode</small><strong id="projectTitle"></strong><small id="projectCount"></small></div></aside><main class="main"><div class="global"><select id="episodeMenu" aria-label="Current episode"></select><div class="row"><span class="status" id="saved" role="status"></span><button id="theme"></button></div></div><div class="workspace-title"><h1 id="heading"></h1><p id="caption"></p></div><div id="notice" role="alert"></div><input id="fileImport" type="file" multiple hidden><input id="workflowInput" type="file" accept=".json,application/json" hidden><input id="storyFile" type="file" accept=".txt,.md,.fountain,.docx,.pdf" hidden><input id="metadataFile" type="file" accept=".json,application/json" hidden><dialog id="workflowTools" aria-labelledby="workflowToolsTitle"><h2 id="workflowToolsTitle">Jupyter Terminal commands</h2><p>Runs Bash commands on the connected Vast instance. Same machine as Jupyter; no second connection.</p><label>Hugging Face token<input id="hfToken" type="password" autocomplete="off" placeholder="hf_..."></label><button data-connection="hf">Save HF token securely</button><small id="hfSaved" role="status"></small><label>Bash command<textarea id="remoteCommand" maxlength="4096" rows="6" placeholder="Paste your Jupyter Terminal command here"></textarea></label><button data-connection="command">Run once</button><pre id="remoteOutput" role="status" style="white-space:pre-wrap;max-height:40vh;overflow:auto"></pre><small>25-second command limit, 64 KiB output. HF_TOKEN is available to this command. Long downloads and interactive programs need Jupyter Terminal.</small><button data-tools="close">Close</button></dialog><div id="app"></div></main></div><script src="/workspaces.js"></script><script src="/connection-ui.js"></script><script src="/production-ui.js"></script><script src="/story-ui.js"></script><script src="/workflow-ui.js"></script><script src="/workflow-manager-ui.js"></script><script src="/editor-ui.js"></script><script defer src="/plugin-manager.js"></script><script>const translations={"المدة من دقيقتين إلى ١٤٤٠ دقيقة": "Set a session length between 2 and 1,440 minutes.", "اعتمد لقطة واحدة على الأقل": "Approve at least one shot first.", "أدخل رابط ComfyUI": "Enter a valid ComfyUI URL.", "الجلسة تعمل حالياً": "A session is already running.", "المشروع أكبر من الحجم المسموح": "The project exceeds the save limit.", "راجع صورة وبرومبت ومدة اللقطة ": "Check the image, prompt and duration of shot ", "العامل ما رجّع MP4 من عقدة الإخراج 141": "The worker returned no MP4 from output node 141.", "حافظ على شكل الشخصية وملابسها حسب الصورة الأساسية المختارة.": "Keep the character’s appearance and wardrobe consistent with the selected primary image.", "حافظ على ترتيب أثاث الغرفة واتجاه الإضاءة.": "Preserve the furniture layout and lighting direction.", "الكاميرا ثابتة أثناء الحوار.": "Keep the camera still during dialogue.", "حلقة جديدة": "New episode"};
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AXDAR Studio</title><link rel="stylesheet" href="/workspaces.css"><script>try{document.documentElement.dataset.theme=localStorage.getItem('axdar.theme')==='cream'?'cream':'dark'}catch{}</script></head><body><canvas id="pointer-field" aria-hidden="true"></canvas><div class="shell"><aside><div class="brand"><span class="logo">◈</span> AXDAR STUDIO</div><nav id="nav" aria-label="Workspaces"></nav><div class="sidefoot"><small>Current episode</small><strong id="projectTitle"></strong><small id="projectCount"></small></div></aside><main class="main"><div class="global"><select id="episodeMenu" aria-label="Current episode"></select><div class="row"><span class="status" id="saved" role="status"></span><button id="theme"></button></div></div><div class="workspace-title"><h1 id="heading"></h1><p id="caption"></p></div><div id="notice" role="alert"></div><input id="fileImport" type="file" multiple hidden><input id="workflowInput" type="file" accept=".zip,application/zip" hidden><input id="storyFile" type="file" accept=".txt,.md,.fountain,.docx,.pdf" hidden><dialog id="workflowTools" aria-labelledby="workflowToolsTitle"><h2 id="workflowToolsTitle">Jupyter Terminal commands</h2><p>Runs Bash commands on the connected Vast instance. Same machine as Jupyter; no second connection.</p><label>Hugging Face token<input id="hfToken" type="password" autocomplete="off" placeholder="hf_..."></label><button data-connection="hf">Save HF token securely</button><small id="hfSaved" role="status"></small><label>Bash command<textarea id="remoteCommand" maxlength="4096" rows="6" placeholder="Paste your Jupyter Terminal command here"></textarea></label><button data-connection="command">Run once</button><pre id="remoteOutput" role="status" style="white-space:pre-wrap;max-height:40vh;overflow:auto"></pre><small>25-second command limit, 64 KiB output. HF_TOKEN is available to this command. Long downloads and interactive programs need Jupyter Terminal.</small><button data-tools="close">Close</button></dialog><div id="app"></div></main></div><script src="/workspaces.js"></script><script src="/connection-ui.js"></script><script src="/story-ui.js"></script><script src="/workflow-ui.js"></script><script src="/workflow-manager-ui.js"></script><script defer src="/plugin-manager.js"></script><script>const translations={"المدة من دقيقتين إلى ١٤٤٠ دقيقة": "Set a session length between 2 and 1,440 minutes.", "اعتمد لقطة واحدة على الأقل": "Approve at least one shot first.", "أدخل رابط ComfyUI": "Enter a valid ComfyUI URL.", "الجلسة تعمل حالياً": "A session is already running.", "المشروع أكبر من الحجم المسموح": "The project exceeds the save limit.", "راجع صورة وبرومبت ومدة اللقطة ": "Check the image, prompt and duration of shot ", "العامل ما رجّع MP4 من عقدة الإخراج 141": "The worker returned no MP4 from output node 141.", "حلقة جديدة": "New episode"};
 function localize(text){for(const [key,value] of Object.entries(translations))if(text?.startsWith(key))return value+text.slice(key.length);return text}
 
 const studioToken='__TOKEN__';
@@ -13,7 +13,6 @@ function savePayload(){
     return {
         id:db.id,
         _edit:db._edit,
-        rules:structuredClone(db.rules||[]),
         episodes:(db.episodes||[]).map(item=>({id:item.id,title:item.title}))
     };
 }
@@ -48,19 +47,15 @@ window.addEventListener('pagehide',()=>{
     editsPending=false;
     fetch('/save',{method:'POST',headers:{'Content-Type':'application/json','X-Studio':studioToken},body,keepalive:true}).catch(()=>{editsPending=true});
 });
-function episode(){return {id:uid(),title:'New episode',story:'',scenes:[],shots:[],story_imports:[]}}
 function versions(s){return state.results.filter(v=>v.episode===ep.id&&v.id===s.id)}
 const statuses={submitting:'Submitting',uncertain:'Check original submission',done:'Complete',error:'Technical error',queued:'Rendering',preparing:'Preparing references',waiting:'Waiting to resume'};
 function results(s){
-    return versions(s).map((v,i)=>{
-        const playable=v.video||(page===3&&v.preview);
-        return '<div><hr><strong>Take '+(i+1)+' · '+esc(v.artifactPending?'Rendered · Waiting for video':statuses[v.status])+'</strong>'+
+    return versions(s).map((v,i)=>
+        '<div><hr><strong>Take '+(i+1)+' · '+esc(v.artifactPending?'Rendered · Waiting for video':statuses[v.status])+'</strong>'+
           (v.error?'<p class="danger">'+esc(localize(v.error))+'</p>':'')+
-          (playable?'<video controls preload="metadata" src="'+esc(playable)+'"></video>':'')+
-          (page===3?'':(v.video?'<button data-review-retake="'+esc(s.id)+'">Retake shot</button>':'')+takeReview(v))+'</div>';
-    }).join('');
+          (v.video?'<video controls preload="metadata" src="'+esc(v.video)+'"></video><button data-review-retake="'+esc(s.id)+'">Retake shot</button>':'')+'</div>'
+    ).join('');
 }
-function bible(){return '<section class="panel"><h2>Continuity rules</h2><p>Choose when each rule applies. Matching rules appear in the final shot prompt.</p>'+db.rules.map((r,i)=>'<div class="rule" data-rule="'+i+'"><select data-scope>'+option('all','All shots',r.scope)+option('dialog','Dialogue shots',r.scope)+assets.map(f=>option(f,name(f),r.scope)).join('')+'</select><textarea data-text>'+esc(translations[r.text]||r.text)+'</textarea><button data-remove="'+i+'">Remove</button></div>').join('')+'<button id="newRule">+ Add rule</button></section>'}
 
 
 function libraryView(){
@@ -97,31 +92,17 @@ function sessionView(){
     const session=state.session?.episode===ep.id?state.session:null;
     const canSubmit=state.connection?.state==='Ready'&&approved&&!state.running&&!state.workflowError;
     return connectionPanel()+
-      remoteProductionPanel()+
-      productionServicesPanel()+
-      '<details class="panel"><summary>Direct ComfyUI submission (single-shot / desktop tunnel mode)</summary>'+
+      '<section class="panel"><h2>Direct ComfyUI submission</h2>'+
       '<p>'+approved+' approved shots in '+esc(ep.title)+' · '+esc(state.workflow||'')+'</p>'+
-      '<button id="start" '+(canSubmit?'':'disabled')+'>Submit directly from desktop</button>'+
+      '<button class="primary" id="start" '+(canSubmit?'':'disabled')+'>Submit directly from desktop</button>'+
       (state.workflowError?'<p class="danger">'+esc(state.workflowError)+'</p>':'')+
       (session?'<p role="status">'+esc(session.phase)+' · '+session.completed+'/'+session.submitted+' complete'+
         (session.failed?' · '+session.failed+' failed':'')+'</p>':'')+
-      (session?.error?'<p class="danger">'+esc(localize(session.error))+'</p>':'')+'</details>'+
-      '<section class="panel"><h2>Shot history</h2>'+ep.shots.filter(s=>versions(s).length).map(s=>
-        '<div><strong>'+heading(s,ep.shots.indexOf(s))+'</strong>'+results(s)+'</div>').join('')+'</section>';
-}
-function invalidate(s){s.revision=uid();s.approved=false}
-function ruleEdit(action){
-    action();
-    for(const e of db.episodes)for(const s of e.shots)if(s.approved)invalidate(s);
+      (session?.error?'<p class="danger">'+esc(localize(session.error))+'</p>':'')+'</section>';
 }
 document.addEventListener('input',e=>{
     const t=e.target;
-    if(t.id==='title')ep.title=t.value;
-    else if(t.closest('[data-rule]')){
-        const r=db.rules[Number(t.closest('[data-rule]').dataset.rule)];
-        ruleEdit(()=>r[t.hasAttribute('data-scope')?'scope':'text']=t.value);
-    }else return;
-    dirty();
+    if(t.id==='title'){ep.title=t.value;dirty();}
 });
 document.addEventListener('change',e=>{
     if(e.target.id==='fileImport')importFiles(e.target);
@@ -143,18 +124,14 @@ document.addEventListener('click',async e=>{
             assets=updated.assets;render();return;
         }
         if(b.id==='newEp'){await projectAction('/project/episode',{title:'New episode'});ep=db.episodes.at(-1);selectedId='';render();return}
-        else if(b.id==='newRule')db.rules.push({scope:'all',text:''});
-        else if(b.hasAttribute('data-remove'))ruleEdit(()=>db.rules.splice(Number(b.dataset.remove),1));
-        else if(b.id==='start'){
+        if(b.id==='start'){
             b.disabled=true;
             try{
                 await flushEdits();
                 const submission=await post('/start',{episode:ep.id});
                 state=await(await fetch('/status')).json();render();reportSubmission(submission);
             }finally{b.disabled=false}
-            return;
-        }else return;
-        await save();render();
+        }
     }catch(err){reportError(err)}
 });
 (async()=>{
@@ -163,17 +140,15 @@ document.addEventListener('click',async e=>{
     state=await(await fetch('/status')).json();
     if(!migrationNeeded()&&!ep){await projectAction('/project/episode',{title:'New episode'});ep=db.episodes.at(-1)}
     if(!migrationNeeded())await loadWorkflows();
-    await chooseWorkspaceSession();
+    await resumeWorkspaceSession();
     state=await(await fetch('/status')).json();
     render();
     rememberWorkspace();
     setInterval(async()=>{
         try{
             const next=await(await fetch('/status')).json(),changed=JSON.stringify(state)!==JSON.stringify(next);
-            const previous=state;
             state=next;
-            if(changed&&!migrationNeeded())prepareFinishedFreecutEpisodes(previous,next);
-            if(changed&&!migrationNeeded()&&(page===3&&![...document.querySelectorAll('video')].some(video=>!video.paused)||page===5)&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!document.querySelector('#workflowFields[open]'))render();
+            if(changed&&!migrationNeeded()&&page===3&&![...document.querySelectorAll('video')].some(video=>!video.paused)&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!document.querySelector('#workflowFields[open]'))render();
         }catch{}
     },4000);
 })().catch(reportError);
@@ -186,7 +161,7 @@ function showTheme() {
 themeButton.addEventListener('click', () => {
     const theme = document.documentElement.dataset.theme === 'dark' ? 'cream' : 'dark';
     document.documentElement.dataset.theme = theme;
-    try { localStorage.setItem('axdar.theme', theme);if($('#themeChoice'))$('#themeChoice').value=theme; } catch {}
+    try { localStorage.setItem('axdar.theme', theme); } catch {}
     showTheme();
 });
 showTheme();

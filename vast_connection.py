@@ -1,6 +1,5 @@
 """Shared local connection lifetime; rendering remains owned by Production."""
 import json
-import os
 import re
 import shlex
 import socket
@@ -201,18 +200,43 @@ class Connection:
     def connect_ssh(self, command, auto=False):
         return self._start(dict(ssh=ssh_address(command),auto=bool(auto)))
 
+    def _persist_settings(self, settings):
+        if settings != self.settings or not self.path.is_file():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp=self.path.with_suffix('.tmp')
+            tmp.write_text(json.dumps(settings),encoding='utf-8')
+            tmp.replace(self.path)
+        self.settings=settings
+
+    def _resolve_active(self):
+        if self.settings.get('ssh'):
+            return self.settings['ssh']
+        try:
+            return self.resolve(self.settings['instance'])
+        except ValueError:
+            if not self.settings.get('auto'):
+                raise
+            rows = self.discover_instances()
+            candidates = []
+            for row in rows:
+                try:
+                    candidates.append(self.resolve(row['id'], [row]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if not candidates:
+                raise
+            target = max(candidates, key=lambda row: int(row['id']))
+            with self.lock:
+                self._persist_settings(dict(instance=int(target['id']), auto=True))
+            return target
+
     def _start(self, settings):
         with self.lock:
             if self.thread and self.thread.is_alive():
                 if all(self.settings.get(key)==settings.get(key) for key in ("instance","ssh")):
                     return self.snapshot()
                 raise ValueError('Disconnect before selecting a different instance')
-            if settings != self.settings or not self.path.is_file():
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                tmp=self.path.with_suffix('.tmp')
-                tmp.write_text(json.dumps(settings),encoding='utf-8')
-                tmp.replace(self.path)
-            self.settings=settings
+            self._persist_settings(settings)
             self.endpoint=None
             self.stop.clear()
             self._indicate(api='grey',ssh='grey',comfy='grey',gpu='grey')
@@ -288,6 +312,17 @@ class Connection:
                 raise ValueError('Connection cancelled')
             return self.remote(target, command, timeout=SSH_CHECK_SECONDS).strip()
 
+        def retry_after_attach():
+            attach_key(target)
+            for attempt in range(4):
+                try:
+                    return check_port()
+                except OSError as retry_exc:
+                    if attempt == 3 or 'permission denied (publickey' not in str(retry_exc).lower():
+                        raise
+                    if self.stop.wait(2):
+                        raise ValueError('Connection cancelled')
+
         try:
             result = check_port()
         except OSError as exc:
@@ -302,11 +337,9 @@ class Connection:
                 except OSError as retry:
                     if 'permission denied (publickey' not in str(retry).lower():
                         raise
-                    attach_key(target)
-                    result = check_port()
+                    result = retry_after_attach()
             elif 'permission denied (publickey' in message:
-                attach_key(target)
-                result = check_port()
+                result = retry_after_attach()
             else:
                 raise
         with self.lock:
@@ -374,7 +407,7 @@ class Connection:
                 stage = 'api'
                 connected = False
                 try:
-                    target = self.settings.get('ssh') or self.resolve(self.settings['instance'])
+                    target = self._resolve_active()
                     stage = 'ssh'
                     self._state(state, 'Waiting for SSH login.')
                     port = self._remote_port(target)

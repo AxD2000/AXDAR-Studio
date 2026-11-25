@@ -33,9 +33,9 @@ def new_episode(title="New episode"):
     return {"id": uid(), "title": title, "story": "", "scenes": [], "shots": [], "story_imports": []}
 
 
-def new_project(rules=()):
+def new_project():
     return {"schema_version": SCHEMA_VERSION, "id": uid(), "episodes": [], "characters": [],
-            "rules": deepcopy(list(rules)), "removedAssets": []}
+            "removedAssets": []}
 
 
 def _version(db):
@@ -847,10 +847,6 @@ def preview_shot(db, episode, shot, assets, limits=None):
     for row in cast["dialogue"]:
         if row["text"] not in "\n".join(details):
             details.append(f"{row['speaker']}: {row['text']}")
-    rules = [r["text"] for r in db.get("rules", []) if r.get("text") and
-             (r["scope"]=="all" or r["scope"]=="dialog" and (cast["dialogue"] or shot.get("dialog"))
-              or r["scope"] in images+audio)]
-    details.extend(rules)
     if shot.get("change"):
         details.append(shot["change"])
     seconds = shot.get("seconds", 0)

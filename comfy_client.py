@@ -30,16 +30,10 @@ def generation_voices(shot):
     ))
 
 
-def prompt(shot, rules):
-    selected = [shot["image"], *shot["refs"]]
-    lines = [
-        r["text"] for r in rules
-        if r["scope"] == "all" or r["scope"] in selected or (r["scope"] == "dialog" and shot["dialog"])
-    ]
+def prompt(shot):
     return "\n".join(x for x in [
         shot["prompt"],
         *[f"<Audio {i}> is the voice reference for {Path(name).stem}." for i, name in enumerate(generation_voices(shot), 1)],
-        *lines,
         shot["change"],
     ] if x)
 

@@ -1,4 +1,4 @@
-"""Explicit dependency-injection container replacing studio.pyw's globals() namespace."""
+"""Explicit dependency-injection container for AXDAR Studio."""
 import json
 import os
 import re
@@ -9,17 +9,13 @@ import uuid
 from pathlib import Path
 
 import comfy_client
-import drive_archive
-import production
 import story_engine
 import take_quality
+import vast_connection
 import vast_credentials
-import vast_deploy
 import vast_ssh_ops
 import workflow_profiles
 from direct_session import DirectSession
-from episode_editor import Editor
-from freecut_bridge import FreecutBridge
 from studio_actions import StudioActions
 from workflow_manager import WorkflowManager
 
@@ -28,7 +24,7 @@ VOICES = comfy_client.VOICES
 
 
 class AppContainer:
-    """Wires the 6 isolated departments via explicit attributes instead of globals()."""
+    """Wires the isolated departments via explicit attributes."""
 
     def __init__(self, base_dir, port=18753):
         self.BASE = Path(base_dir).resolve()
@@ -36,6 +32,7 @@ class AppContainer:
         self.ASSETS = Path(os.environ.get("AXDAR_ASSETS") or (desktop_assets if desktop_assets.is_dir() else self.BASE / "assets"))
         self.DATA = self.BASE / "episodes"
         self.DATA.mkdir(exist_ok=True)
+        (self.DATA / "production").mkdir(exist_ok=True)
         self.DB = self.DATA / "project.json"
         self.LIBRARY = self.BASE / "library"
         self.LIBRARY.mkdir(exist_ok=True)
@@ -46,7 +43,6 @@ class AppContainer:
         self.PORT = port
         self.running = False
         self.session = {}
-        self.drive_pending = None
         self.workspace_started = threading.Event()
         self.restart_requested = threading.Event()
 
@@ -55,7 +51,6 @@ class AppContainer:
         self.files = initial_files
 
         # Pure ComfyUI / Vast / QC collaborators
-        self.vast_deploy = vast_deploy
         self.ssh_ops = vast_ssh_ops
         self.hf_token = vast_credentials.hf_token
         self.identity = vast_credentials.identity
@@ -67,7 +62,7 @@ class AppContainer:
         self.remote = comfy_client.remote
         self.reference_available = comfy_client.reference_available
 
-        # Department wiring (explicit construction, zero globals() leaking)
+        # Department wiring
         self.actions = StudioActions(self)
         try:
             candidate = self.actions.bootstrap_workflow()
@@ -77,9 +72,11 @@ class AppContainer:
             self.active_workflow = None
             self.workflow_error = str(exc)
 
-        self.controller = vast_deploy.Controller(self)
-        self.editor = Editor(self)
-        self.freecut = FreecutBridge(self.editor)
+        self.connection = vast_connection.Connection(
+            self.DATA / "production" / "connection.json",
+            vast_ssh_ops.instances,
+            vast_ssh_ops.ssh,
+        )
         self.workflow_manager = WorkflowManager(
             self,
             ssh_ops=vast_ssh_ops,
@@ -144,7 +141,6 @@ class AppContainer:
 
     def clean_assets(self, db):
         hidden = set(db.get("removedAssets", []))
-        db["rules"] = [rule for rule in db["rules"] if rule["scope"] not in hidden]
         for episode in db["episodes"]:
             for shot in episode["shots"]:
                 if shot["image"] in hidden or hidden.intersection(shot["refs"]):
@@ -161,23 +157,19 @@ class AppContainer:
     def project(self):
         if self.DB.is_file():
             return json.loads(self.DB.read_text("utf-8"))
-        db = story_engine.new_project([
-            {"scope": "all", "text": "حافظ على شكل الشخصية وملابسها حسب الصورة الأساسية المختارة."},
-            {"scope": "dialog", "text": "الكاميرا ثابتة أثناء الحوار."},
-        ])
-        return self.actions.commit(db)
+        return self.actions.commit(story_engine.new_project())
 
     # ComfyUI client bindings wired to this container
     def json_api(self, url, path, obj=None):
         return comfy_client.json_api(url, path, obj, remote_fn=self.remote)
 
     def _stage_fallback(self, url, asset, name):
-        connection = self.controller.connection
+        connection = self.connection
         with connection.lock:
             if connection.snapshot().get("url") != url:
                 raise ConnectionError("Active ComfyUI tunnel changed during upload.")
             target = connection.target()
-        self.vast_deploy.stage_reference(target, asset, name)
+        self.ssh_ops.stage_reference(target, asset, name)
 
     def upload(self, url, asset, name):
         return comfy_client.upload(
@@ -198,47 +190,39 @@ class AppContainer:
     def download_output(self, url, folder, history, record):
         return comfy_client.download_output(url, folder, history, record, remote_fn=self.remote)
 
-    # Production session lifecycle
-    def production_busy(self):
-        return self.controller.current().get("status") in (
-            "waiting for connection", "reconnecting", "deploying", "starting worker",
-            "checking ComfyUI and requirements", "running",
-        )
-
     def run_direct(self, url, wf, target):
         self.running = True
         threading.Thread(target=self.direct_session.run, args=(url, wf, target), daemon=True).start()
 
-    def open_workspace_session(self, mode):
+    def open_workspace_session(self, mode="resume"):
+        mode = mode or "resume"
         if mode not in ("new", "resume"):
             raise ValueError("Choose a new session or resume the previous one.")
         with self.LOCK:
             if mode == "new":
                 if self.running:
                     raise ValueError("Pause the current production before opening a new session.")
-                self.controller.archive_for_new_session()
                 self.direct_session.archive_for_new_session()
-                self.controller.connection.reconnect(discover_new=True)
+                self.connection.reconnect(discover_new=True)
             elif not self.workspace_started.is_set():
-                self.controller.connection.reconnect()
-                self.controller.reconnect()
+                self.connection.reconnect()
                 if self.direct_session.interrupted:
                     threading.Thread(target=self.direct_session.resume_interrupted, daemon=True).start()
             self.workspace_started.set()
             self.workflow_manager.watch()
-            return {"episode": self.session.get("episode") or self.controller.current().get("episode")}
+            return {"episode": self.session.get("episode")}
 
     def discover_vast_loop(self):
         self.workspace_started.wait()
         while True:
-            connection = self.controller.connection
+            connection = self.connection
             view = connection.snapshot()
             if view.get("auto", True) and view["state"] not in ("Ready", "Connecting", "ComfyUI Starting", "Reconnecting"):
                 with self.LOCK:
                     resuming = self.direct_session.interrupted and time.time() < self.direct_session.plan["view"]["end"] - 10
-                    if not (self.running or self.production_busy() or self.workflow_manager.busy() or resuming):
+                    if not (self.running or self.workflow_manager.busy() or resuming):
                         if view.get("ssh"):
                             connection.reconnect()
                         else:
                             connection.refresh()
-            time.sleep(30)
+            time.sleep(10)

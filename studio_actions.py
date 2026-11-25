@@ -34,7 +34,7 @@ def production_prompt(wf, text, voices):
     prefix = str((wf.get("mapping") or {}).get("promptPrefix") or "").strip()
     if prefix:
         parts.insert(0, prefix)
-    if wf.get("reference") and wf.get("graph", {}).get(wf["reference"], {}).get("class_type") == "MiniMaxH3ReferenceToVideo":
+    if wf.get("reference") and wf.get("graph", {}).get(wf["reference"], {}).get("class_type") in ("MiniMaxH3ReferenceToVideo", "DenoMiniMaxH3ReferenceToVideo"):
         parts.extend(f"<Audio {i}> is the voice reference for {Path(name).stem}." for i, name in enumerate(voices, 1))
     return "\n".join(filter(None, parts))
 
@@ -77,19 +77,10 @@ class StudioActions:
         self.check(db, {"edit":incoming.get("_edit")})
         if incoming.get("_edit") != db.get("_edit") or incoming.get("id") != db["id"]:
             raise ValueError("Project changed. Reload before saving.")
-        rules = incoming.get("rules", [])
-        if not isinstance(rules, list) or not all(isinstance(r, dict) and isinstance(r.get("text"), str) and isinstance(r.get("scope"), str) for r in rules):
-            raise ValueError("Invalid continuity rules.")
-        changed = db["rules"] != rules
-        db["rules"] = rules
         titles = {item["id"]:item["title"] for item in incoming["episodes"]}
         for ep in db["episodes"]:
             if ep["id"] in titles:
                 ep["title"] = str(titles[ep["id"]])
-            if changed:
-                for shot in ep["shots"]:
-                    if shot.get("approved"):
-                        shot.update(approved=False, revision=str(uuid.uuid4()))
         return {"edit":self.commit(db)["_edit"]}
 
     def workflow(self, route, obj, raw=None, filename=None):
@@ -98,18 +89,27 @@ class StudioActions:
             entries = [profiles.public_profile(self.store.get(row["version"])) for row in self.store.list()]
             return {"profiles":entries, "active":active.get("version") if active else None}
         if route == "import":
-            wf = self.store.import_workflow(filename or "workflow.json", raw)
+            wf = self.store.import_package(filename or "workflow.zip", raw)
         elif route == "attach":
-            wf = self.store.attach(obj["version"], raw)
+            raise ValueError("Standalone UI JSON attachment is removed. Import a packaged Workflow ZIP (.zip).")
         elif route == "select":
+            candidate = self.store.get(obj["version"])
+            wm = self.ctx.get("workflow_manager")
+            if candidate.get("packaged") and wm is not None:
+                env_state = wm.environment_state(candidate["version"])
+                if env_state and (env_state.get("compatible") is False or env_state.get("installationStatus") == "incompatible"):
+                    reasons = " · ".join(env_state.get("incompatibilities") or ["Environment incompatible with this package."])
+                    raise ValueError(f"Cannot switch to incompatible workflow package on this instance: {reasons}")
             wf = self.store.select(obj["version"])
         elif route == "map":
             wf = self.store.remap(obj["version"], obj["mapping"], select=False)
         elif route == "inspect":
             wf = self.store.get(obj["version"])
+            if wf.get("packaged"):
+                raise ValueError("Packaged workflows use explicit bindings in mapping.json and do not use dynamic /object_info remapping.")
             metadata = obj.get("metadata")
             if metadata is None:
-                url = url_for_comfy(obj.get("url") or self.ctx["controller"].connection.snapshot().get("url"))
+                url = url_for_comfy(obj.get("url") or self.ctx["connection"].snapshot().get("url"))
                 metadata = self.ctx["json_api"](url, "/object_info")
             if not isinstance(metadata, dict) or not metadata:
                 raise ValueError("Supply ComfyUI /object_info JSON.")
@@ -118,7 +118,7 @@ class StudioActions:
             raise ValueError("Unknown workflow operation.")
         active = self.store.active()
         self.ctx["active_workflow"] = active
-        self.ctx["workflow_error"] = "" if active else "Map and select a compatible workflow."
+        self.ctx["workflow_error"] = "" if active else "Import and select a valid Workflow Package (.zip)."
         return {"profile":profiles.public_profile(wf), "active":active["version"] if active else None}
 
     def preview(self, db, ep, shot, assets, graph=True):
@@ -166,7 +166,7 @@ class StudioActions:
                           prompt=view["positive_prompt"], frozenPrompt=view["positive_prompt"], seconds=view["seconds"],
                           negativePrompt=view["negative_prompt"], workflow_version=view["workflow_version"])
             frozen.pop("takes", None)
-            jobs.append([ep["id"], frozen, db["rules"]])
+            jobs.append([ep["id"], frozen])
         return jobs, skipped
 
     @staticmethod
@@ -213,6 +213,12 @@ class StudioActions:
                 ep = story.new_episode(str(obj["newEpisode"]))
                 db["episodes"].append(ep)
             story.apply_story(db, ep["id"], obj["proposal"], assets)
+            result["episode"] = ep["id"]
+        elif path == "/story/clear":
+            ep["story"] = ""
+            ep["scenes"] = []
+            ep["shots"] = []
+            ep["story_imports"] = []
             result["episode"] = ep["id"]
         elif path == "/shots/new":
             scene = find_id(ep["scenes"], obj["scene"], "Scene")

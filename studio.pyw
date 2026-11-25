@@ -109,12 +109,13 @@ if __name__ == "__main__":
         webbrowser.open(address)
     else:
         with server:
+            threading.Thread(target=app.open_workspace_session, args=("resume",), daemon=True).start()
             webbrowser.open(address)
             threading.Thread(target=app.discover_vast_loop, daemon=True).start()
             server.serve_forever()
         if app.restart_requested.is_set():
             try:
-                app.controller.connection.disconnect()
+                app.connection.disconnect()
             finally:
                 subprocess.Popen(
                     [sys.executable, "-B", str(BASE / "studio.pyw")],

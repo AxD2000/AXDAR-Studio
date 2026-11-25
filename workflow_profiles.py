@@ -7,7 +7,8 @@ import re
 import uuid
 from pathlib import Path
 
-from provision import MODEL_SUFFIXES, model_choice
+from provision import MODEL_SUFFIXES
+import workflow_packages
 
 
 def _json(value):
@@ -44,6 +45,182 @@ def _parse(raw):
             if _link(value) and (value[0] not in graph or value[1] < 0):
                 raise ValueError(f"Node {key}.{slot} has a broken connection to {value[0]}.")
     return graph
+
+
+_UI_ONLY_TYPES = frozenset({
+    "MarkdownNote", "Note", "Reroute", "SetNode", "GetNode",
+    "Fast Groups Bypasser (rgthree)", "Fast Groups Muter (rgthree)",
+    "Bookmark (rgthree)", "Label (rgthree)",
+})
+
+_SOCKET_TYPES = frozenset({
+    "MODEL", "CLIP", "VAE", "IMAGE", "LATENT", "CONDITIONING", "AUDIO",
+    "SIGMAS", "SAMPLER", "GUIDER", "NOISE", "UPSCALE_MODEL", "MASK",
+    "CONTROL_NET", "GLIGEN", "STYLE_MODEL", "CLIP_VISION", "CLIP_VISION_OUTPUT",
+    "VIDEO", "VHS_BATCHMANAGER", "VHS_VIDEOINFO", "DENO_MINIMAX_H3_REFERENCE_IMAGES", "*",
+})
+
+_CORE_WIDGET_ORDER = {
+    "LoraLoaderModelOnly": ["lora_name", "strength_model"],
+    "LoraLoader": ["lora_name", "strength_model", "strength_clip"],
+    "ImageScale": ["upscale_method", "width", "height", "crop"],
+    "ImageScaleBy": ["upscale_method", "scale_by"],
+    "CheckpointLoaderSimple": ["ckpt_name"],
+    "UNETLoader": ["unet_name", "weight_dtype"],
+    "CLIPLoader": ["clip_name", "type", "device"],
+    "VAELoader": ["vae_name"],
+    "UpscaleModelLoader": ["model_name"],
+    "CLIPTextEncode": ["text"],
+    "EmptyLatentImage": ["width", "height", "batch_size"],
+    "KSampler": ["seed", "steps", "cfg", "sampler_name", "scheduler", "denoise"],
+    "KSamplerSelect": ["sampler_name"],
+    "BasicScheduler": ["scheduler", "steps", "denoise"],
+    "RandomNoise": ["noise_seed"],
+    "SplitSigmas": ["step"],
+    "PrimitiveFloat": ["value"],
+    "PrimitiveInt": ["value"],
+    "PrimitiveString": ["value"],
+    "PrimitiveStringMultiline": ["value"],
+    "LoadImage": ["image"],
+    "LoadAudio": ["audio"],
+    "DenoMiniMaxH3ReferenceImageLoader": ["image_paths", "disabled_image_paths"],
+}
+
+_SEED_CONTROL_VALUES = frozenset({"fixed", "increment", "decrement", "randomize"})
+
+
+def _info_widget_order(object_info, kind):
+    if not isinstance(object_info, dict) or kind not in object_info:
+        return []
+    inp = object_info[kind].get("input", {})
+    names = []
+    for group in ("required", "optional"):
+        for key, spec in inp.get(group, {}).items():
+            if not isinstance(spec, (list, tuple)) or not spec:
+                continue
+            typ = "COMBO" if isinstance(spec[0], list) else str(spec[0])
+            if typ.upper() not in _SOCKET_TYPES:
+                names.append(key)
+    return names
+
+
+def ui_to_api(raw_or_dict, object_info=None):
+    """Convert a ComfyUI UI/editor JSON (with links) into an executable ComfyUI API graph locally."""
+    if isinstance(raw_or_dict, (bytes, str)):
+        data = json.loads(raw_or_dict.decode("utf-8-sig") if isinstance(raw_or_dict, bytes) else raw_or_dict)
+    else:
+        data = raw_or_dict
+    if not isinstance(data, dict):
+        return None
+    wf = data.get("workflow", data.get("graph", data))
+    if not isinstance(wf, dict):
+        return None
+    nodes = wf.get("nodes")
+    links = wf.get("links")
+    if not isinstance(nodes, list) or not nodes or not isinstance(links, list) or not links:
+        return None
+
+    nodes_by_id = {n["id"]: n for n in nodes if isinstance(n, dict) and isinstance(n.get("id"), (int, str))}
+    links_by_id = {lk[0]: lk for lk in links if isinstance(lk, list) and len(lk) >= 5}
+    set_nodes = {}
+    for n in nodes:
+        if isinstance(n, dict) and n.get("type") == "SetNode" and n.get("mode", 0) == 0:
+            wv = n.get("widgets_values")
+            if isinstance(wv, list) and wv and isinstance(wv[0], str):
+                set_nodes[wv[0]] = n
+
+    def resolve_link(link_id, expected_type=None):
+        seen = set()
+        while link_id is not None:
+            if link_id in seen:
+                return None
+            seen.add(link_id)
+            lk = links_by_id.get(link_id)
+            if not lk:
+                return None
+            src_id, src_slot = lk[1], lk[2]
+            link_type = lk[5] if len(lk) > 5 else expected_type
+            src_node = nodes_by_id.get(src_id)
+            if not src_node:
+                return None
+            mode = src_node.get("mode", 0)
+            kind = src_node.get("type", "")
+            if mode == 2:
+                return None
+            if kind == "GetNode":
+                wv = src_node.get("widgets_values")
+                target_set = set_nodes.get(wv[0]) if isinstance(wv, list) and wv else None
+                if not target_set:
+                    return None
+                next_link = next((i.get("link") for i in target_set.get("inputs", []) if i.get("link") is not None), None)
+                link_id = next_link
+                continue
+            if kind == "Reroute" or mode == 4:
+                inps = src_node.get("inputs", [])
+                chosen = None
+                if link_type:
+                    chosen = next((i.get("link") for i in inps if i.get("link") is not None and i.get("type") == link_type), None)
+                if chosen is None and isinstance(src_slot, int) and 0 <= src_slot < len(inps) and inps[src_slot].get("link") is not None:
+                    chosen = inps[src_slot]["link"]
+                if chosen is None:
+                    chosen = next((i.get("link") for i in inps if i.get("link") is not None), None)
+                link_id = chosen
+                continue
+            if kind in _UI_ONLY_TYPES:
+                return None
+            return [str(src_id), int(src_slot)]
+        return None
+
+    api_graph = {}
+    for n in nodes:
+        if not isinstance(n, dict) or n.get("mode", 0) != 0:
+            continue
+        kind = n.get("type")
+        if not isinstance(kind, str) or not kind or kind in _UI_ONLY_TYPES:
+            continue
+        inputs = {}
+        wv = n.get("widgets_values")
+        inps = n.get("inputs") or []
+        if isinstance(wv, dict):
+            for k, v in wv.items():
+                if k == "videopreview":
+                    continue
+                inputs[k] = v
+        elif isinstance(wv, list) and wv:
+            widget_names = [i["name"] for i in inps if isinstance(i, dict) and i.get("widget") is not None]
+            if not widget_names:
+                widget_names = _info_widget_order(object_info, kind) or list(_CORE_WIDGET_ORDER.get(kind, ()))
+            wi = 0
+            for wname in widget_names:
+                if wi >= len(wv):
+                    break
+                inputs[wname] = wv[wi]
+                wi += 1
+                if wname in ("seed", "noise_seed") and wi < len(wv) and wv[wi] in _SEED_CONTROL_VALUES:
+                    wi += 1
+        for inp in inps:
+            if not isinstance(inp, dict) or inp.get("link") is None:
+                continue
+            resolved = resolve_link(inp["link"], inp.get("type"))
+            if resolved is not None:
+                inputs[inp["name"]] = resolved
+        entry = {"class_type": kind, "inputs": inputs}
+        if n.get("title"):
+            entry["_meta"] = {"title": str(n["title"])}
+        api_graph[str(n["id"])] = entry
+
+    if not api_graph:
+        return None
+    # Strip any dangling links pointing to excluded nodes
+    for node in api_graph.values():
+        for key in list(node["inputs"]):
+            val = node["inputs"][key]
+            if _link(val) and val[0] not in api_graph:
+                del node["inputs"][key]
+    try:
+        return _parse(api_graph)
+    except ValueError:
+        return None
 
 
 def editor_graph(raw):
@@ -120,6 +297,26 @@ def _outputs(graph, info):
 
 def _one(items):
     return items[0] if len(items) == 1 else ""
+
+
+def _default_output(graph, outputs):
+    confirmed = [item["id"] for item in outputs if item["kind"] == "video"]
+    if len(confirmed) <= 1:
+        return _one(confirmed)
+    # Prefer a unique output explicitly titled/prefixed as final or upscaled (and not preview/base).
+    def _tag(ident):
+        node = graph.get(ident, {})
+        return (_title(node) + " " + str(node.get("inputs", {}).get("filename_prefix", ""))).lower()
+    final = [i for i in confirmed if any(w in _tag(i) for w in ("final", "upscale"))
+             and not any(w in _tag(i) for w in ("preview", "base", "draft"))]
+    if len(final) == 1:
+        return final[0]
+    # Otherwise pick a unique output whose upstream subgraph strictly covers another confirmed output's upstream image source.
+    upstreams = {i: _upstream(graph, [i]) for i in confirmed}
+    deepest = [i for i in confirmed if all(
+        other == i or (upstreams[other] - {other}).issubset(upstreams[i]) for other in confirmed
+    )]
+    return _one(deepest)
 
 
 def _fields(graph, branch, info, manual_media=True):
@@ -204,6 +401,7 @@ def _role_hints(field, graph):
 # ComfyUI's MiniMaxH3ReferenceToVideo contract: optional Autogrow groups and a 17k+5
 # frame grid. These constraints apply only to this node, never to an unrelated workflow.
 # https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_minimax_h3.py
+_H3_CLASSES = ("MiniMaxH3ReferenceToVideo", "DenoMiniMaxH3ReferenceToVideo")
 _H3_GROUPS = {"images": ("ref_images","ref_image","LoadImage","image",9),
               "audio": ("ref_audios","ref_audio","LoadAudio","audio",3)}
 _H3_EXPR = "max(5,round(a*24))+(5-(max(5,round(a*24))%17))%17"
@@ -213,6 +411,19 @@ def _h3_fields(graph, ident, fields, suggested, info, fps):
     node = graph[ident]
     inputs = node["inputs"]
     for role, (group, _key, loader_kind, loader_slot, _) in _H3_GROUPS.items():
+        # DenoMiniMaxH3ReferenceToVideo connects a single DenoMiniMaxH3ReferenceImageLoader to ref_images.
+        ref_link = inputs.get(group)
+        if role == "images" and _link(ref_link) and graph.get(ref_link[0], {}).get("class_type") == "DenoMiniMaxH3ReferenceImageLoader":
+            loader_id = ref_link[0]
+            fields[:] = [f for f in fields if not (f["node"] == loader_id and f["key"] in ("image_paths", "disabled_image_paths", "audio_sources"))]
+            field_id = loader_id + ".image_paths"
+            fields.append(dict(id=field_id, node=loader_id, key="image_paths",
+                               label=_title(graph[loader_id]) + " · image_paths",
+                               type="DENO_IMAGE_LIST", roles=["images"], media="images", value=None,
+                               required=False, present=True, bypass=True, group=True,
+                               deno_loader=True, h3_node=ident, h3_slot=group))
+            suggested["images"] = [field_id]
+            continue
         # Reuse only the existing loader nodes already authored in the exported graph.
         wired = []
         for slot, target in inputs.items():
@@ -272,12 +483,11 @@ def inspect_workflow(name, raw_or_dict, object_info=None, mapping=None):
     if not isinstance(info, dict) or not isinstance(override, dict):
         raise ValueError("Workflow metadata and mapping must be objects.")
     outputs = _outputs(graph,info)
-    confirmed = [item["id"] for item in outputs if item["kind"] == "video"]
-    output = override.get("output", _one(confirmed))
+    output = override.get("output", _default_output(graph, outputs))
     if not isinstance(output,str):
         raise ValueError("The output mapping must be a node ID.")
     branch = _upstream(graph, [output]) if isinstance(output,str) and output in graph else set(graph)
-    h3 = _one([k for k in branch if graph[k]["class_type"]=="MiniMaxH3ReferenceToVideo"])
+    h3 = _one([k for k in branch if graph[k]["class_type"] in _H3_CLASSES])
     fields = _fields(graph,branch,info,manual_media=not h3)
     suggested = dict(positive="",negative="",duration="",frames="",images=[],audio=[],output=output,parameters={})
     issues = []
@@ -614,7 +824,21 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, 
             inputs = graph[field["node"]]["inputs"]
             must_remain = sum(not f.get("bypass") for f in selected[index+1:])
             count = len(assets)-must_remain if field["id"] in m[role] else 0
-            if field.get("group"):
+            if field.get("deno_loader"):
+                take = min(max(0, count), cap)
+                if take > 0:
+                    uploaded = [upload(assets.pop(0)) for _ in range(take)]
+                    inputs[field["key"]] = "\n".join(uploaded)
+                    allowed_edits.add((field["node"], field["key"]))
+                    if "disabled_image_paths" in inputs:
+                        inputs["disabled_image_paths"] = ""
+                        allowed_edits.add((field["node"], "disabled_image_paths"))
+                else:
+                    h3_node, h3_slot = field.get("h3_node"), field.get("h3_slot")
+                    if h3_node in graph and h3_slot in graph[h3_node]["inputs"]:
+                        del graph[h3_node]["inputs"][h3_slot]
+                        allowed_edits.add((h3_node, h3_slot))
+            elif field.get("group"):
                 loaders = field.get("loaders", [])
                 take = min(max(0, count), cap)
                 for key in list(inputs):
@@ -653,15 +877,106 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, 
     return graph
 
 
+def inspect_packaged_workflow(package, object_info=None):
+    """Build a workflow profile directly from a validated .zip package with ZERO heuristic mapping or guessing."""
+    manifest = package["manifest"]
+    graph = copy.deepcopy(package["workflow"])
+    mapping = copy.deepcopy(package["mapping"])
+    info = object_info or {}
+    output = mapping["output"]
+    branch = _upstream(graph, [output]) if output in graph else set(graph)
+    outputs = _outputs(graph, info)
+    h3 = _one([k for k in branch if graph[k]["class_type"] in _H3_CLASSES])
+    fields = _fields(graph, branch, info, manual_media=not h3)
+    fps = mapping.get("fps")
+    if h3:
+        dummy_suggested = dict(positive="", negative="", duration="", frames="", images=[], audio=[], output=output, parameters={})
+        _h3_fields(graph, h3, fields, dummy_suggested, info, fps)
+    by_id = {f["id"]: f for f in fields}
+    issues = []
+
+    output_item = next((item for item in outputs if item["id"] == output), {})
+    if not output_item or output_item["kind"] == "unsupported":
+        issues.append("mapping.json output node does not save a supported MP4 video.")
+    for role in ("positive", "negative", "duration", "frames"):
+        val = mapping.get(role)
+        if val and val not in by_id:
+            issues.append(f"mapping.json '{role}' ({val}) is not on the active output branch.")
+    if mapping.get("positive") and mapping["positive"] == mapping.get("negative"):
+        issues.append("mapping.json positive and negative prompts must be distinct.")
+    for role in ("images", "audio"):
+        for fid in mapping.get(role, []):
+            if fid not in by_id:
+                issues.append(f"mapping.json '{role}' binding ({fid}) is not on the active output branch.")
+            elif by_id[fid].get("socket"):
+                issues.append(f"mapping.json '{role}' binding ({fid}) points to an unwired socket; wire a loader node in workflow.json.")
+    for key in ("fps", "fixedSeconds", "minSeconds", "maxSeconds", "minFrames", "maxFrames", "frameStep", "frameBase"):
+        val = mapping.get(key)
+        if val is not None and (not _number(val) or val < 0 or (val == 0 and key not in ("frameBase", "minFrames", "minSeconds"))):
+            issues.append(f"mapping.json has invalid {key}.")
+    if mapping.get("frames") and not mapping.get("fps"):
+        issues.append("mapping.json must specify 'fps' when 'frames' is mapped.")
+
+    wf = dict(
+        name=manifest["name"],
+        version=package["packageHash"],
+        graph=graph,
+        output=output,
+        adapter="minimax-h3" if h3 else manifest["id"],
+        mapping=mapping,
+        fields=fields,
+        outputs=outputs,
+        issues=issues,
+        format="AXDAR Workflow Package (.zip)",
+        nodeCount=len(graph),
+        executable=True,
+        packaged=True,
+        packageKind=package.get("packageKind", manifest.get("packageKind", "declarative")),
+        entrypoint=package.get("entrypoint") or manifest.get("entrypoint") or "",
+        manifest=manifest,
+        packageNodes=package["nodes"],
+        packageModels=package["models"],
+    )
+    if h3:
+        wf["reference"] = h3
+        wf["modelFrames"] = {
+            "minFrames": mapping.get("minFrames", 5),
+            "maxFrames": mapping.get("maxFrames", 3600),
+            "frameStep": mapping.get("frameStep", 17),
+            "frameBase": mapping.get("frameBase", 5),
+        }
+        wf["loader"] = next((v[0] for k, v in graph[h3]["inputs"].items() if k.startswith("ref_images.") and _link(v)), "")
+    for k in ("positive", "duration"):
+        if isinstance(mapping.get(k), str) and mapping[k]:
+            wf["prompt" if k == "positive" else "duration"] = by_id.get(mapping[k], {}).get("node")
+    if not issues:
+        constraints = limits(wf)
+        for minimum, maximum in (("min_frames", "max_frames"), ("min_seconds", "max_seconds")):
+            lo, hi = constraints[minimum], constraints[maximum]
+            if (lo is not None and hi is not None and lo > hi) or (hi is not None and hi <= 0):
+                issues.append(f"Workflow package has incompatible {minimum} and {maximum}.")
+    return wf
+
+
 def public_profile(wf):
-    return {key:wf[key] for key in ("version","name","adapter","mapping","fields","outputs","issues",
-                                    "format","nodeCount","executable")}
+    out = {key: wf[key] for key in ("version", "name", "adapter", "mapping", "fields", "outputs", "issues",
+                                    "format", "nodeCount", "executable")}
+    out["packaged"] = bool(wf.get("packaged"))
+    if wf.get("packaged"):
+        out["packageKind"] = wf.get("packageKind", "declarative")
+        out["entrypoint"] = wf.get("entrypoint", "")
+        out["manifest"] = wf["manifest"]
+        out["packageNodes"] = wf["packageNodes"]
+        out["packageModels"] = wf["packageModels"]
+        out["totalModelBytes"] = sum(int(m.get("bytes") or 0) for m in wf["packageModels"])
+    return out
 
 
 def runtime_requirements(ctx, spec, wf):
     required = {}
-    for _eid, shot, rules in spec["jobs"]:
-        prompt_text = shot.get("frozenPrompt") or ctx["prompt"](shot, rules)
+    for row in spec["jobs"]:
+        shot = row[1]
+        prompt_text = shot.get("frozenPrompt") or ctx["prompt"](shot)
         runtime = runtime_graph(
             wf, shot, prompt_text,
             ctx["generation_images"](shot),
@@ -691,7 +1006,12 @@ class WorkflowStore:
             temp.unlink(missing_ok=True)
 
     def _persist(self, name, raw, info, mapping, select, executable=None):
-        editor = editor_graph(raw.decode("utf-8-sig"))
+        text = raw.decode("utf-8-sig")
+        editor = editor_graph(text)
+        if editor is not None and executable is None:
+            converted = ui_to_api(text, info)
+            if converted is not None and any(item["kind"] != "unsupported" for item in _outputs(converted, info or {})):
+                executable = json.dumps(converted, ensure_ascii=False).encode("utf-8")
         if editor is not None and executable is None:
             version = _digest(_json([_digest(raw), "editor"]))
             wf = dict(version=version, name=name, adapter="UI workflow", mapping={}, fields=[],
@@ -721,6 +1041,37 @@ class WorkflowStore:
             self._write(self.directory/"active.json",_json(wf["version"]))
         return wf
 
+    def import_package(self, name, raw_zip_bytes, select=True):
+        if not isinstance(raw_zip_bytes, bytes):
+            raise ValueError("Import the Workflow Package (.zip) bytes.")
+        package = workflow_packages.parse_package(raw_zip_bytes, name)
+        wf = inspect_packaged_workflow(package)
+        if wf["issues"]:
+            raise ValueError("Workflow Package validation failed: " + " ".join(wf["issues"]))
+        version = wf["version"]
+        pkg_path = self.directory / "packages" / (version + ".zip")
+        if not pkg_path.exists():
+            self._write(pkg_path, raw_zip_bytes)
+        rec_path = self.directory / "versions" / (version + ".json")
+        if not rec_path.exists():
+            rec = {
+                "packaged": True,
+                "packageKind": package.get("packageKind", "declarative"),
+                "entrypoint": package.get("entrypoint", ""),
+                "name": wf["name"],
+                "filename": package["filename"],
+                "zipSha256": _digest(raw_zip_bytes),
+                "manifest": package["manifest"],
+                "workflow": package["workflow"],
+                "nodes": package["nodes"],
+                "models": package["models"],
+                "mapping": package["mapping"],
+            }
+            self._write(rec_path, _json(rec))
+        if select and not wf["issues"]:
+            self._write(self.directory / "active.json", _json(version))
+        return wf
+
     def import_workflow(self,name,raw_bytes,object_info=None,select=True):
         if not isinstance(raw_bytes,bytes):
             raise ValueError("Import the original workflow bytes.")
@@ -736,6 +1087,11 @@ class WorkflowStore:
 
     def original(self,version):
         record = self._record(version)
+        if record.get("packaged"):
+            data = (self.directory / "packages" / (version + ".zip")).read_bytes()
+            if _digest(data) != record["zipSha256"]:
+                raise ValueError("The saved workflow package failed its checksum.")
+            return data
         data = (self.directory/"originals"/(record["source"]+".json")).read_bytes()
         if _digest(data)!=record["source"]:
             raise ValueError("The saved workflow original failed its checksum.")
@@ -743,16 +1099,34 @@ class WorkflowStore:
 
     def get(self,version):
         rec = self._record(version)
+        if rec.get("packaged"):
+            package = {
+                "packageKind": rec.get("packageKind", "declarative"),
+                "entrypoint": rec.get("entrypoint", ""),
+                "filename": rec.get("filename", rec["name"]),
+                "packageHash": version,
+                "manifest": rec["manifest"],
+                "workflow": rec["workflow"],
+                "nodes": rec["nodes"],
+                "models": rec["models"],
+                "mapping": rec["mapping"],
+            }
+            return inspect_packaged_workflow(package)
         raw = self.original(version)
-        editor = editor_graph(raw.decode("utf-8-sig"))
+        text = raw.decode("utf-8-sig")
+        editor = editor_graph(text)
         executable = self._executable(rec)
+        if editor is not None and executable is None:
+            converted = ui_to_api(text, rec.get("metadata"))
+            if converted is not None and any(item["kind"] != "unsupported" for item in _outputs(converted, rec.get("metadata") or {})):
+                executable = converted
         if editor is not None and executable is None:
             return dict(version=version,name=rec["name"],adapter="UI workflow",mapping={},fields=[],outputs=[],
                         issues=["Connect ComfyUI to prepare this original workflow before production."],
-                        graph={},format="ComfyUI UI JSON",nodeCount=len(editor),executable=False)
+                        graph={},format="ComfyUI UI JSON",nodeCount=len(editor),executable=False,packaged=False)
         wf = inspect_workflow(rec["name"],executable or raw,rec["metadata"],rec["mapping"])
         wf.update(version=version,format="ComfyUI UI JSON" if editor is not None else "ComfyUI API JSON",
-                  nodeCount=len(editor if editor is not None else wf["graph"]),executable=True)
+                  nodeCount=len(editor if editor is not None else wf["graph"]),executable=True,packaged=False)
         return wf
 
     def _executable(self, rec):
@@ -792,6 +1166,8 @@ class WorkflowStore:
 
     def remap(self,version,mapping,object_info=None,select=True):
         rec = self._record(version)
+        if rec.get("packaged"):
+            raise ValueError("Packaged workflows use the authoritative mapping.json inside the .zip package and cannot be dynamically remapped.")
         if not self.get(version)["executable"]:
             raise ValueError("Prepare the original workflow on the connected ComfyUI instance first.")
         return self._persist(rec["name"], self.original(version), rec["metadata"] if object_info is None else object_info,
@@ -799,6 +1175,8 @@ class WorkflowStore:
 
     def inspect_metadata(self,version,metadata):
         rec = self._record(version)
+        if rec.get("packaged"):
+            raise ValueError("Packaged workflows declare explicit bindings in mapping.json and do not use dynamic /object_info remapping.")
         if not self.get(version)["executable"]:
             raise ValueError("Prepare the original workflow on the connected ComfyUI instance first.")
         return self._persist(rec["name"],self.original(version),metadata,rec["mapping"],False,self._executable(rec))

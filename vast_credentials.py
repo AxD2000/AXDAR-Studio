@@ -13,10 +13,24 @@ def identity(target):
 
 
 def identity_options(target):
-    if not target.get("id") or not VAST_IDENTITY.is_file():
+    if not VAST_IDENTITY.is_file():
         return []
     files = [VAST_IDENTITY] + [VAST_IDENTITY.with_name(name) for name in ("id_ed25519", "id_rsa", "id_ecdsa")]
     return [arg for file in files if file.is_file() for arg in ("-i", str(file))]
+
+
+def credentials_status():
+    """Return safe boolean status of stored credentials without exposing secrets."""
+    try:
+        has_api = bool(api_key())
+    except Exception:
+        has_api = False
+    try:
+        has_hf = bool(hf_token())
+    except Exception:
+        has_hf = False
+    has_ssh = VAST_IDENTITY.is_file() and VAST_IDENTITY.with_suffix(".pub").is_file()
+    return {"vastApiSaved": has_api, "hfTokenSaved": has_hf, "sshKeySaved": has_ssh}
 
 
 def api_key(value=None):

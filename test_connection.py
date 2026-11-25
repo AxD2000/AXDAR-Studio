@@ -54,6 +54,17 @@ class ConnectionTests(unittest.TestCase):
             connect.assert_called_once_with(19,auto=True)
         self.assertEqual(self.discover.call_count,2)
 
+    def test_auto_mode_switches_immediately_from_stopped_saved_instance_to_new_running_one(self):
+        self.c.settings = dict(instance=12, auto=True)
+        self.discover.return_value = [
+            dict(id=12, host='ssh1.vast.ai', port=1234, status='exited'),
+            dict(id=99, host='ssh9.vast.ai', port=9999, status='running'),
+        ]
+        target = self.c._resolve_active()
+        self.assertEqual(target['id'], 99)
+        self.assertEqual(self.c.settings, dict(instance=99, auto=True))
+        self.assertEqual(json.loads(self.c.path.read_text()), dict(instance=99, auto=True))
+
     def test_first_login_verifies_host_and_attaches_key_when_needed(self):
         self.remote.side_effect = [OSError("Host key verification failed"),
                                    OSError("Permission denied (publickey)."), b"8188"]
@@ -62,6 +73,37 @@ class ConnectionTests(unittest.TestCase):
             self.assertEqual(self.c._remote_port(target),8188)
             trust.assert_called_once_with(target)
             attach.assert_called_once_with(target)
+
+    def test_attach_key_retries_briefly_while_vast_propagates_key(self):
+        self.remote.side_effect = [OSError("Permission denied (publickey)."),
+                                   OSError("Permission denied (publickey)."), b"8188"]
+        with patch("vast_ssh_setup.attach_key") as attach, patch.object(self.c.stop, "wait", return_value=False) as wait:
+            target = self.discover.return_value[0]
+            self.assertEqual(self.c._remote_port(target), 8188)
+            attach.assert_called_once_with(target)
+            wait.assert_called_once_with(2)
+
+    def test_identity_options_uses_saved_axdar_key_even_for_direct_ssh(self):
+        import vast_credentials
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_key = Path(tmp) / "id_axdar_vast"
+            fake_key.write_text("key", encoding="utf-8")
+            with patch.object(vast_credentials, "VAST_IDENTITY", fake_key):
+                opts = vast_credentials.identity_options({"host": "ssh1.vast.ai", "port": 1234})
+                self.assertEqual(opts, ["-i", str(fake_key)])
+
+    def test_ensure_account_ssh_key_registers_missing_key_on_vast_account(self):
+        import vast_ssh_setup
+        pub = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForUnitTestOnly"
+        with patch.object(vast_ssh_setup, "ensure_local_key", return_value=pub), \
+             patch.object(vast_ssh_setup, "vast", side_effect=[[], {"success": True}]) as vast_call:
+            self.assertTrue(vast_ssh_setup.ensure_account_ssh_key())
+            self.assertEqual(vast_call.call_args_list[0].args, ("ssh/",))
+            self.assertEqual(vast_call.call_args_list[1].args, ("ssh/", {"ssh_key": pub}))
+        with patch.object(vast_ssh_setup, "ensure_local_key", return_value=pub), \
+             patch.object(vast_ssh_setup, "vast", return_value=[{"public_key": pub}]) as vast_call:
+            self.assertFalse(vast_ssh_setup.ensure_account_ssh_key())
+            vast_call.assert_called_once_with("ssh/")
 
     def test_running_comfyui_service_gets_time_to_expose_its_api(self):
         self.remote.side_effect=[b'',b'pending',b'',b'',b'18188']
@@ -243,7 +285,7 @@ class ConnectionTests(unittest.TestCase):
 
 class DiagnosticTests(unittest.TestCase):
     def test_ssh_sets_thirty_second_login_timeout(self):
-        from vast_deploy import ssh
+        from vast_ssh_ops import ssh
         with patch('vast_ssh_ops.subprocess.run',return_value=subprocess.CompletedProcess([],0,b'18188',b'')) as run:
             self.assertEqual(ssh({'host':'fixture','port':22},'probe',timeout=45),b'18188')
         args=run.call_args.args[0]
@@ -251,7 +293,7 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs['timeout'],45)
 
     def test_direct_mapping_and_proxy_fallback(self):
-        from vast_deploy import instance_target
+        from vast_ssh_ops import instance_target
         row=dict(id=1,ssh_host='ssh5.vast.ai',ssh_port=123,actual_status='running',public_ipaddr='192.0.2.1',ports={'22/tcp':[{'HostPort':'50860'}]})
         self.assertEqual(instance_target(row)['host'],'192.0.2.1')
         self.assertEqual(instance_target(row)['port'],50860)

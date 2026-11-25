@@ -1,7 +1,5 @@
 """Workflow Manager contracts with a disposable ComfyUI/SSH fixture."""
-import io
 import json
-import runpy
 import subprocess
 import tempfile
 import threading
@@ -86,83 +84,10 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertTrue(model["verified"])
         self.assertEqual(model["source"]["repo"],"Comfy-Org/MiniMax-H3")
 
-    def test_install_checks_actual_registration_and_runs_confirmed_script(self):
-        (self.root/"install.sh").write_text("printf success","utf-8")
-        fixture={"1":node("Lora Loader Stack (rgthree)")}
-        installed=set()
-        verified=False
-        def endpoint(url, **_):
-            if url.endswith("/queue"):
-                data={"queue_running":[],"queue_pending":[]}
-            else:
-                data={key:{} for key in installed} if verified else {}
-            return io.BytesIO(json.dumps(data).encode())
-        def command(argv, **_):
-            nonlocal verified
-            if argv[:2]==["supervisorctl","restart"]:
-                verified=True
-            return subprocess.CompletedProcess(argv,0)
-        def install(root,missing):
-            self.assertEqual(root,self.root)
-            installed.update(missing)
-            return missing
-        config={"port":18188,"graph":fixture,"mode":"install"}
-        with patch.object(remote,"root_path",return_value=self.root),patch.object(remote,"urlopen",side_effect=endpoint), \
-             patch.object(remote.subprocess,"run",side_effect=command) as run,patch.object(provision,"install_nodes",side_effect=install):
-            self.assertEqual(remote.execute(self.root,config),0)
-            self.assertEqual(run.call_args_list[0].args[0][0],"bash")
-            self.assertEqual(run.call_args_list[0].args[0][:2],["bash","-n"])
-            self.assertEqual(run.call_args_list[2].args[0],["supervisorctl","restart","comfyui"])
-            verified=False
-            run.side_effect=lambda args,**_kw:subprocess.CompletedProcess(args,0)
-            self.assertEqual(remote.execute(self.root,config),2)
-        self.assertEqual(production.read(self.root/"stage.json")["report"]["nodes"],["Lora Loader Stack (rgthree)"])
-
-    def test_sage_library_is_checked_and_repaired_independently_of_node_registration(self):
-        name="MiniMaxH3MemoryEfficientSageAttentionPatch"
-        graph={"1":node(name)}
-        ready=False
-        def endpoint(url, **_):
-            payload={"queue_running":[],"queue_pending":[]} if url.endswith("/queue") else {name:{}}
-            return io.BytesIO(json.dumps(payload).encode())
-        def build(root):
-            nonlocal ready
-            self.assertEqual(root,self.root)
-            ready=True
-        config={"port":18188,"graph":graph}
-        with patch.object(remote,"root_path",return_value=self.root), \
-             patch.object(remote,"urlopen",side_effect=endpoint), \
-             patch.object(provision,"sage_ready",side_effect=lambda:ready), \
-             patch.object(provision,"install_sage",side_effect=build) as install, \
-             patch.object(remote.subprocess,"run") as command:
-            self.assertEqual(remote.execute(self.root,dict(config,mode="scan")),2)
-            report=production.read(self.root/"stage.json")["report"]
-            self.assertEqual((report["nodes"],report["sageAttention"]),([],"Missing"))
-            install.assert_not_called()
-            self.assertEqual(remote.execute(self.root,dict(config,mode="install")),0)
-            install.assert_called_once_with(self.root)
-            command.assert_called_once_with(["supervisorctl","restart","comfyui"],check=True,timeout=90)
-        self.assertEqual(production.read(self.root/"stage.json")["report"]["sageAttention"],"Installed")
-
-    def test_script_token_filter_keeps_hf_hub_function_names(self):
-        script="from huggingface_hub import hf_hub_download"
-        self.assertEqual(remote.redact(script),script)
+    def test_token_redaction_keeps_hf_hub_function_names(self):
+        text="from huggingface_hub import hf_hub_download\npip install huggingface_hub hf_transfer\n"
+        self.assertEqual(remote.redact(text),text)
         self.assertEqual(remote.redact("hf_ABCDEFGH12345678"),"[REDACTED]")
-
-    def test_invalid_bash_reports_exact_exit_code_before_script_or_installs(self):
-        (self.root/"install.sh").write_text("echo unsafe if lint fails\\nfi","utf-8")
-        fixture={"1":node("VHS_VideoCombine")}
-        def endpoint(url,**_):
-            return io.BytesIO(b'{"queue_running":[],"queue_pending":[]}' if url.endswith("/queue") else b"{}")
-        with patch.object(remote,"root_path",return_value=self.root),patch.object(remote,"urlopen",side_effect=endpoint), \
-             patch.object(remote.subprocess,"run",return_value=subprocess.CompletedProcess([],2)) as run, \
-             patch.object(provision,"install_nodes") as install:
-            result=remote.execute(self.root,{"port":18188,"graph":fixture,"mode":"install"})
-        self.assertEqual(result,1)
-        self.assertEqual(production.read(self.root/"stage.json")["bashExitCode"],2)
-        self.assertEqual(run.call_count,1)
-        self.assertEqual(run.call_args.args[0][:2],["bash","-n"])
-        install.assert_not_called()
 
     def manager(self):
         store=workflow_profiles.WorkflowStore(self.root/"profiles")
@@ -170,35 +95,11 @@ class WorkflowManagerTests(unittest.TestCase):
         connection=Mock()
         connection.target.return_value={"id":42,"host":"fixture","port":2222,"rate":0.7,"comfy_port":18188}
         connection.ssh_target.return_value=connection.target.return_value
-        ctx={"controller":SimpleNamespace(connection=connection),"BASE":Path.cwd(),"DATA":self.root,
-             "actions":SimpleNamespace(store=store),"production_busy":lambda:False,
+        ctx={"connection":connection,"BASE":Path.cwd(),"DATA":self.root,
+             "actions":SimpleNamespace(store=store),
              "running":False,"LOCK":threading.RLock(),
              "ssh_ops":vast_ssh_ops,"hf_token":vast_credentials.hf_token,"identity":vast_credentials.identity}
         return workflow_manager.WorkflowManager(ctx),wf["version"]
-
-    def test_ui_json_is_converted_automatically_on_the_selected_connection(self):
-        manager,_=self.manager()
-        store=manager.ctx["actions"].store
-        self.graph["10"]["_meta"]={"title":"Positive Prompt"}
-        ui={"nodes":[{"id":int(k),"type":v["class_type"]} for k,v in self.graph.items()]}
-        original=json.dumps(ui,indent=2).encode()+b"\n"
-        profile=store.import_workflow("Only UI JSON",original)
-        manager.connection.snapshot.return_value={"url":"http://127.0.0.1:18799"}
-        manager.ctx["active_workflow"]=None
-        converter=Mock(return_value=self.graph)
-        manager.ctx["json_api"]=converter
-        def workflow(action,obj):
-            self.assertEqual(action,"select")
-            manager.ctx["active_workflow"]=store.select(obj["version"])
-        manager.ctx["actions"].workflow=workflow
-        with patch.object(manager,"action",wraps=manager.action) as operation,patch.object(manager,"launch"):
-            capture=manager.prepare(profile["version"])
-        converted=capture["profile"]["version"]
-        converter.assert_called_once_with("http://127.0.0.1:18799","/workflow/convert",ui)
-        self.assertEqual(capture["active"],converted)
-        self.assertEqual(store.get(converted)["graph"],self.graph)
-        self.assertEqual(store.original(converted),original)
-        operation.assert_called_once_with({"action":"scan","version":converted})
 
     def test_first_shot_gate_detects_lora_error_even_with_successful_mp4(self):
         graph={"1":node("DocumentedFixture"),"141":node("VHS_VideoCombine",audio=["1",0],images=["1",0])}
@@ -222,7 +123,7 @@ class WorkflowManagerTests(unittest.TestCase):
                 self.assertEqual(job["output_node"],"141")
                 (dest/"video.part").write_bytes(movie(2))
             ctx=dict(DATA=self.root,json_api=api,download_output=download,prepare_shot=lambda *_:graph,
-                     prompt=lambda s,_:s["prompt"],technical_qc=lambda *_:{"technical":"passed","audioStreams":1})
+                     prompt=lambda s:s["prompt"],technical_qc=lambda *_:{"technical":"passed","audioStreams":1})
             batch=uuid.uuid4().hex
             row=[batch,shot,[]]
             with patch("workflow_gate.editor_media.tool"):
@@ -356,39 +257,14 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertEqual(wf["graph"]["84"]["inputs"]["value"],"Template text")
         self.assertEqual(wf["graph"]["65"]["inputs"]["vae_name"],linux_vae)
 
-    def test_unconfirmed_script_and_credentials_in_script_never_reach_ssh(self):
+    def test_manual_bash_and_legacy_install_never_reach_ssh(self):
         manager,version=self.manager()
         with patch.object(vast_ssh_ops,"ssh") as ssh:
-            with self.assertRaisesRegex(ValueError,"confirm"):
-                manager.action({"action":"install","version":version,"script":"echo hi"})
-            with self.assertRaisesRegex(ValueError,"Save your Hugging Face token"):
-                manager.action({"action":"install","version":version,"script":"echo hf_secretabcdefgh","confirmed":True})
+            with self.assertRaisesRegex(ValueError,"Manual Bash"):
+                manager.action({"action":"install","version":version,"script":"echo hi","confirmed":True})
+            with self.assertRaisesRegex(ValueError,"Legacy standalone JSON"):
+                manager.action({"action":"install","version":version,"confirmed":True})
         ssh.assert_not_called()
-
-    def test_install_adopts_a_pasted_hf_assignment_without_persisting_it_in_the_script(self):
-        manager,version=self.manager()
-        fixture="hf_fixtureabcdefghijkl"
-        script=f"export HF_TOKEN='{fixture}'\necho installing\n"
-        stored=[]
-        def vault(value=None):
-            if value:
-                stored.append(value)
-            return stored[-1] if stored else None
-        manager._hf_token=vault
-        manager.ctx["hf_token"]=vault
-        launched=threading.Event()
-        with patch.object(manager,"launch",side_effect=lambda *_:launched.set()) as launch:
-            preview=manager.action({"action":"install-preview","script":script})
-            self.assertEqual(stored,[])
-            self.assertTrue(preview["willSaveHfToken"])
-            self.assertNotIn(fixture,json.dumps(preview))
-            manager.action({"action":"install","version":version,"script":script,"confirmed":True})
-            self.assertTrue(launched.wait(2))
-            self.assertEqual(stored,[fixture])
-            self.assertEqual(launch.call_args.args[-1],preview["script"])
-            reopened=workflow_manager.WorkflowManager(manager.ctx)
-            self.assertTrue(reopened.status(version)["hfTokenSaved"])
-            self.assertEqual(reopened.profile(version)["script"],'export HF_TOKEN="$HF_TOKEN"\necho installing\n')
 
     def test_save_and_test_hf_token_reuses_the_persistent_vault(self):
         manager,version=self.manager()
@@ -417,7 +293,7 @@ class WorkflowManagerTests(unittest.TestCase):
         with patch.object(vast_ssh_ops,"ssh") as ssh, \
              patch.object(vast_ssh_ops,"deploy_files"), \
              patch.object(vast_ssh_ops,"put_json"),patch.object(manager,"watch"):
-            manager.launch(record,manager.connection.target(),{"mode":"install"},"echo ready")
+            manager.launch(record,manager.connection.target(),{"mode":"install"})
         self.assertEqual(ssh.call_args.kwargs["data"],(token+"\n").encode())
         self.assertNotIn(token,ssh.call_args.args[1])
         self.assertNotIn(token,manager.path.read_text("utf-8"))
@@ -449,7 +325,7 @@ class WorkflowManagerTests(unittest.TestCase):
             view=manager.status(placeholder)
             self.assertIsNone(view["selectedVersion"])
             self.assertIsNone(view["verification"])
-            self.assertEqual(view["savedScript"],"")
+            self.assertEqual(view["productionReadiness"],"not_verified")
         self.assertEqual(manager.status(version)["selectedVersion"],version)
 
     def test_failed_install_preserves_last_successful_dependency_scan(self):
@@ -552,7 +428,7 @@ class WorkflowManagerTests(unittest.TestCase):
             self.fail(f"Unexpected request: {path}")
         ctx={"DATA":self.root,"LOCK":threading.RLock(),"json_api":api,
              "prepare_shot":lambda *_:{"141":{"inputs":{}}},"download_output":Mock(),
-             "prompt":lambda s,_:s["prompt"],"take_quality":take_quality,"running":True}
+             "prompt":lambda s:s["prompt"],"take_quality":take_quality,"running":True}
         wf=dict(version="a"*64,name="Fixture",output="141",graph={"141":node("Output")})
         view=dict(end=time.time()+60,episode=eid,submitted=2,phase="Preparing ComfyUI",completed=0,failed=0)
         session=direct_session.DirectSession(ctx)
@@ -577,7 +453,7 @@ class WorkflowManagerTests(unittest.TestCase):
         workflow={"version":"a"*64}
         run=Mock()
         ctx={"DATA":self.root,"LOCK":threading.RLock(),"running":False,"run_direct":run,
-             "production_busy":lambda:False,"controller":SimpleNamespace(connection=connection),
+             "connection":connection,
              "actions":SimpleNamespace(store=SimpleNamespace(get=lambda _:workflow)),
              "workflow_manager":SimpleNamespace(busy=lambda:False)}
         direct=direct_session.DirectSession(ctx)
@@ -598,7 +474,7 @@ class WorkflowManagerTests(unittest.TestCase):
         history=self.root/"history.json"
         production.atomic(history,{"status":{"status_str":"success","completed":True}})
         connection=Mock()
-        ctx={"DATA":self.root,"controller":SimpleNamespace(connection=connection)}
+        ctx={"DATA":self.root,"connection":connection}
         session=direct_session.DirectSession(ctx)
         connection.discover_instances.return_value=[{"id":42,"status":"exited"}]
         session.release_unavailable_video(path,job,{"id":73})
@@ -705,9 +581,9 @@ class WorkflowManagerTests(unittest.TestCase):
                             "outputs":{"135":{"videos":[{"filename":"wrong-preview.mp4"}]},
                                        "141":{"videos":[{"filename":"real.mp4","type":"output"}]}}}}
         download=comfy_client.download_output
-        ctx={"DATA":self.root,"LOCK":threading.RLock(),"controller":SimpleNamespace(connection=connection),
+        ctx={"DATA":self.root,"LOCK":threading.RLock(),"connection":connection,
              "json_api":api,"prepare_shot":lambda _u,_f,_e,s,_w,_r:{"id":s["id"],"141":{"inputs":{"audio":["arr",0]}}},
-             "download_output":download,"prompt":lambda s,_:s["prompt"],"take_quality":take_quality,"running":True}
+             "download_output":download,"prompt":lambda s:s["prompt"],"take_quality":take_quality,"running":True}
         # Versioned output, with existing timing checks.
         store=workflow_profiles.WorkflowStore(self.root/"graph")
         wf=store.import_workflow("API",json.dumps(self.graph).encode())

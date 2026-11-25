@@ -3,7 +3,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -43,7 +42,7 @@ def comfy_python():
 
 
 def requires_sage(graph):
-    return any(node["class_type"] == "MiniMaxH3MemoryEfficientSageAttentionPatch" for node in graph.values())
+    return any(node["class_type"] in ("MiniMaxH3MemoryEfficientSageAttentionPatch", "PathchSageAttentionKJ") for node in graph.values())
 
 
 def sage_ready():
@@ -51,8 +50,75 @@ def sage_ready():
                           capture_output=True, timeout=40).returncode == 0
 
 
-def install_sage(root):
+def git_head(path):
+    """Return the 40-char lowercase Git HEAD commit for a directory, or None."""
+    path = Path(path)
+    if not path.is_dir():
+        return None
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True, timeout=15,
+        ).strip().lower()
+        return out if re.fullmatch(r"[0-9a-f]{40}", out) else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def git_is_clean(path):
+    """Return True if path is a Git repo with no modified tracked files."""
+    path = Path(path)
+    if git_head(path) is None:
+        return False
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(path), "status", "--porcelain", "--untracked-files=no"],
+            stderr=subprocess.DEVNULL, text=True, timeout=15,
+        ).strip()
+        return out == ""
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def align_comfyui_revision(root, repo, expected_rev):
+    """Explicitly check out a pinned ComfyUI commit on a clean Git checkout. Never mutates dirty repos."""
+    root = Path(root)
+    if not isinstance(expected_rev, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_rev):
+        raise ValueError("ComfyUI revision must be a pinned 40-char commit SHA.")
+    if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise ValueError("Invalid ComfyUI repository name.")
+    actual = git_head(root)
+    if actual == expected_rev:
+        return False
+    if actual is None:
+        raise ValueError("ComfyUI directory is not a Git repository; cannot align revision automatically.")
+    if not git_is_clean(root):
+        raise ValueError("ComfyUI repository has local uncommitted changes; refusing to overwrite them automatically.")
+    url = "https://github.com/" + repo + ".git"
+    subprocess.run(["git", "-C", str(root), "fetch", "--depth=1", url, expected_rev], check=True, timeout=300)
+    subprocess.run(["git", "-C", str(root), "checkout", "--detach", "FETCH_HEAD"], check=True, timeout=120)
+    verified = git_head(root)
+    if verified != expected_rev:
+        raise ValueError(f"ComfyUI alignment failed: expected {expected_rev}, got {verified}.")
+    return True
+
+
+def installed_pip_packages(py=None):
+    py = str(py or comfy_python())
+    try:
+        out = subprocess.check_output(
+            [py, "-m", "pip", "list", "--format=json"],
+            stderr=subprocess.DEVNULL, text=True, timeout=60,
+        )
+        return {item["name"].lower().replace("_", "-"): item["version"] for item in json.loads(out)}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+
+
+def install_sage(root, revision=SAGE_REVISION):
     """Build the pinned upstream wheel against the instance's installed Torch and CUDA."""
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("SageAttention revision must be a pinned 40-char commit SHA.")
     py = comfy_python()
     with tempfile.TemporaryDirectory(dir=root.parent, prefix="axdar-sage-") as folder:
         path = Path(folder)
@@ -61,12 +127,15 @@ def install_sage(root):
         def step(args, **kwargs):
             print("[sage]", " ".join(str(a) for a in args[:6]), flush=True)
             subprocess.run(args, check=True, timeout=900, **kwargs)
-        step(["git","-C",str(source),"fetch","--depth=1","https://github.com/thu-ml/SageAttention.git",SAGE_REVISION])
-        step(["git","-C",str(source),"checkout","--detach",SAGE_REVISION])
+        step(["git","-C",str(source),"fetch","--depth=1","https://github.com/thu-ml/SageAttention.git",revision])
+        step(["git","-C",str(source),"checkout","--detach",revision])
+        actual = git_head(source)
+        if actual != revision:
+            raise ValueError(f"SageAttention revision mismatch: expected {revision}, got {actual}.")
         pip = [py,"-m","pip","--disable-pip-version-check"]
         step(pip+["install","--index-url","https://pypi.org/simple","--only-binary=:all:","--no-deps","--target",str(helpers),"ninja==1.13.0"])
         env = dict(os.environ, PYTHONPATH=str(helpers), PATH=str(helpers/"bin")+os.pathsep+os.environ["PATH"],
-                   MAX_JOBS="6", EXT_PARALLEL="3")
+                   MAX_JOBS="2", EXT_PARALLEL="1")
         headers = subprocess.check_output([py,"-c","import sysconfig; print(sysconfig.get_path('purelib'))"], text=True).strip()
         include = Path(headers)/"nvidia"/"cu13"/"include"
         if include.is_dir():
@@ -81,9 +150,10 @@ def install_sage(root):
 # Same projects used by the bundled setup.sh. Pin upstream revisions and limit pip
 # to their reviewed public-package requirements. Never run repository install hooks.
 NODE_SOURCES=[
-    ({"MiniMaxChunkFeedForward","MiniMaxH3MemoryEfficientSageAttentionPatch","ResolutionSelector"}, "kijai/ComfyUI-KJNodes","56781c108c520e9c75db140b6886927c1785e3d2",["pillow>=10.3.0","color-matcher","matplotlib","mss","opencv-python-headless"]),
+    ({"MiniMaxChunkFeedForward","MiniMaxH3MemoryEfficientSageAttentionPatch","PathchSageAttentionKJ","ResolutionSelector"}, "kijai/ComfyUI-KJNodes","56781c108c520e9c75db140b6886927c1785e3d2",["pillow>=10.3.0","color-matcher","matplotlib","mss","opencv-python-headless"]),
+    ({"DenoMiniMaxH3ReferenceToVideo","DenoMiniMaxH3ReferenceImageLoader","DenoResolutionSetup","DenoTextEncoderUnload"}, "Deno2026/comfyui-deno-custom-nodes","b43184f41d5aca84808f37da220ccceba4b48bde",[]),
     ({"Lora Loader Stack (rgthree)"}, "rgthree/rgthree-comfy","bc48c6aaeca87bedbc14245d89f9bc6be37a630e",[]),
-    ({"VHS_VideoCombine"}, "Kosinkadink/ComfyUI-VideoHelperSuite","4d907bee61e92c2e65af3bd6383a4e4d356126d1",["opencv-python","imageio-ffmpeg"]),
+    ({"VHS_VideoCombine","VHS_LoadVideo"}, "Kosinkadink/ComfyUI-VideoHelperSuite","4d907bee61e92c2e65af3bd6383a4e4d356126d1",["opencv-python","imageio-ffmpeg"]),
     ({"easy float"}, "yolain/ComfyUI-Easy-Use","d08ce763bc28e952566ecda91235709aa3fc6bbb",["diffusers","accelerate","clip_interrogator>=0.6.0","lark","onnxruntime","opencv-python-headless","sentencepiece","spandrel","matplotlib","peft"]),
     ({"MinimaxH3LatentUpscaler3D"}, "LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler","f34cadb19f10fee7e36091b690cac39b4eb40573",[])
 ]
@@ -171,6 +241,99 @@ def download_weight(url, tmp, expected, progress=None, label=""):
                     last_report = now
 
 
+def install_package_nodes(root, node_specs):
+    """Install strictly pinned custom node repositories declared by a workflow package."""
+    installed = []
+    py = Path(comfy_python())
+    for spec in node_specs:
+        repo = spec["repo"]
+        rev = spec["revision"]
+        requirements = spec.get("requirements", [])
+        dest = root / "custom_nodes" / repo.split("/")[1]
+        if dest.exists():
+            actual = git_head(dest)
+            if actual != rev:
+                raise ValueError(
+                    f"Incompatible custom node revision for {repo}: found {actual or 'untracked'}, expected {rev}."
+                )
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=dest.parent.parent) as staging:
+                with_repo = Path(staging) / "source"
+                subprocess.run(["git", "init", "-q", str(with_repo)], check=True)
+                subprocess.run(["git", "-C", str(with_repo), "fetch", "--depth=1", "https://github.com/" + repo + ".git", rev], check=True, timeout=300)
+                subprocess.run(["git", "-C", str(with_repo), "checkout", "--detach", "FETCH_HEAD"], check=True)
+                actual = git_head(with_repo)
+                if actual != rev:
+                    raise ValueError(f"Revision mismatch in {repo}: expected {rev}, got {actual}.")
+                with_repo.rename(dest)
+            installed.append(repo)
+        if requirements:
+            if not py.is_file():
+                raise ValueError("Set COMFY_PYTHON to the template's Python executable.")
+            pip = [str(py), "-m", "pip", "install", "--only-binary=:all:", "--index-url", "https://pypi.org/simple"]
+            freeze = subprocess.check_output([str(py), "-m", "pip", "list", "--format=json"], text=True, timeout=60)
+            protected = ("torch", "torchvision", "torchaudio", "triton", "xformers")
+            with tempfile.TemporaryDirectory() as temp:
+                constraints = Path(temp) / "gpu-constraints.txt"
+                constraints.write_text(
+                    "".join(
+                        f"{item['name']}=={item['version']}\n"
+                        for item in json.loads(freeze)
+                        if item["name"].lower() in protected or item["name"].lower().startswith(("nvidia-", "cuda-"))
+                    ),
+                    "utf-8",
+                )
+                subprocess.run([*pip, "--constraint", str(constraints), *requirements], check=True, timeout=900)
+    return installed
+
+
+def verify_model_file(root, spec, *, check_hash=True):
+    """Strictly verify a locked model at its exact target path with zero substitution."""
+    dest = root / "models" / spec["folder"] / Path(spec["file"]).name
+    if not dest.exists():
+        return "Missing", dest, ""
+    if not dest.is_file():
+        return "Incompatible", dest, "Target path is not a regular file."
+    actual_size = dest.stat().st_size
+    if actual_size != spec["bytes"]:
+        return "Incompatible", dest, f"Size mismatch: found {actual_size} bytes, expected {spec['bytes']}."
+    if check_hash:
+        actual_sha = digest(dest)
+        if actual_sha != spec["sha256"]:
+            return "Incompatible", dest, f"SHA-256 mismatch at {dest.name}."
+    return "Installed", dest, ""
+
+
+def install_package_models(root, model_specs, progress=None):
+    """Download and SHA-256 verify strictly locked models declared by a workflow package."""
+    changed = False
+    for m in model_specs:
+        status, dest, reason = verify_model_file(root, m, check_hash=True)
+        if status == "Installed":
+            continue
+        if status == "Incompatible":
+            raise ValueError(f"Existing model failed strict verification ({dest}): {reason}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".axdar-part")
+        partial = tmp.stat().st_size if tmp.exists() else 0
+        if shutil.disk_usage(dest.parent).free < max(0, m["bytes"] - partial) + 256 * 1024**2:
+            raise ValueError("Insufficient disk space for " + Path(m["file"]).name)
+        url = "https://huggingface.co/" + m["repo"] + "/resolve/" + m["revision"] + "/" + m["file"]
+        label = Path(m["file"]).name
+        download_weight(url, tmp, m["bytes"], progress=progress, label=label)
+        if tmp.stat().st_size != m["bytes"]:
+            raise ValueError("Model download incomplete. Retry to resume: " + label)
+        print(f"[verify] Checking SHA-256 for {label}...", flush=True)
+        if digest(tmp) != m["sha256"]:
+            tmp.unlink()
+            raise ValueError("Downloaded model failed SHA-256 verification: " + label)
+        tmp.replace(dest)
+        print(f"[verify] Verified {label}", flush=True)
+        changed = True
+    return changed
+
+
 def install_models(root, required, progress=None):
     known=model_sources()
     changed=False
@@ -198,4 +361,3 @@ def install_models(root, required, progress=None):
         print(f"[verify] Verified {name}", flush=True)
         changed=True
     return changed
-
