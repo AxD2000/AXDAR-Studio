@@ -7,7 +7,7 @@ import re
 import uuid
 from pathlib import Path
 
-from provision import MODEL_SUFFIXES
+from provision import MODEL_SUFFIXES, model_choice
 import workflow_packages
 
 
@@ -605,7 +605,8 @@ def _value_error(field, value):
     elif typ not in ("INT","FLOAT","BOOLEAN","STRING","COMBO"):
         return f"{field['id']} requires a connected {typ} node; fix the original API graph."
     if "options" in field and value not in field["options"]:
-        return f"{field['id']} needs one of its declared choices."
+        if not (isinstance(value, str) and value.lower().endswith(MODEL_SUFFIXES) and model_choice(value, field["options"]) is not None):
+            return f"{field['id']} needs one of its declared choices."
     return ""
 
 
@@ -711,17 +712,18 @@ def validate_shot(wf, shot, images, voices):
     return issues
 
 
-def _validate_runtime_contracts(graph, keys, model_info):
-    """Read-only verification against ComfyUI /object_info. Never mutates exported nodes."""
+def _validate_runtime_contracts(graph, keys, model_info, *, normalized_edits=None):
+    """Verify runtime graph against ComfyUI /object_info; normalize only unique full-path OS separators on model choices."""
     contracts = {}
     for ident in keys:
         node = graph[ident]
         kind = node["class_type"]
         inputs = node["inputs"]
-        for key, value in inputs.items():
+        for key, value in list(inputs.items()):
             if _link(value):
                 continue
-            needs_check = (isinstance(value, str) and value.lower().endswith(MODEL_SUFFIXES)) or kind == "MinimaxH3LatentUpscaler3D"
+            is_model_str = isinstance(value, str) and value.lower().endswith(MODEL_SUFFIXES)
+            needs_check = is_model_str or kind == "MinimaxH3LatentUpscaler3D"
             if not needs_check:
                 continue
             if kind not in contracts:
@@ -733,10 +735,16 @@ def _validate_runtime_contracts(graph, keys, model_info):
             if options is not None:
                 choices = [o["key"] if isinstance(o, dict) and "key" in o else o for o in options]
                 if value not in choices:
-                    raise ValueError(
-                        f"Node {ident}.{key} ({value!r}) does not match ComfyUI's registered choices {choices}. "
-                        "Fix and re-export the workflow in ComfyUI; AXDAR does not modify exported workflows."
-                    )
+                    matched = model_choice(value, choices) if is_model_str else None
+                    if matched is not None and matched != value:
+                        inputs[key] = matched
+                        if normalized_edits is not None:
+                            normalized_edits.add((ident, key, value, matched))
+                    else:
+                        raise ValueError(
+                            f"Node {ident}.{key} ({value!r}) does not match ComfyUI's registered choices {choices}. "
+                            "Fix and re-export the workflow in ComfyUI; AXDAR does not modify exported workflows."
+                        )
             typ = spec.get("type")
             if (typ == "BOOLEAN" and not isinstance(value, bool)) or (typ in ("INT", "FLOAT") and not _number(value)):
                 raise ValueError(
@@ -1074,8 +1082,9 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, 
                 raise ValueError(f"Worker override cannot overwrite wired link {fid!r}.")
             inps[key] = val
             allowed_edits.add((nid, key))
+    separator_edits = set()
     if model_info:
-        _validate_runtime_contracts(graph, _upstream(graph, [output]), model_info)
+        _validate_runtime_contracts(graph, _upstream(graph, [output]), model_info, normalized_edits=separator_edits)
     for role,assets in (("images",list(images)),("audio",list(voices))):
         group,stem,kind,slot,cap = _H3_GROUPS[role]
         selected = [fields[key] for key in m[role]]
@@ -1134,6 +1143,9 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, 
                     if key in graph[dest]["inputs"]:
                         graph[dest]["inputs"].pop(key, None)
                         allowed_edits.add((dest, key))
+    for nid, key, orig_val, new_val in separator_edits:
+        if original.get(nid, {}).get("inputs", {}).get(key) == orig_val and graph.get(nid, {}).get("inputs", {}).get(key) == new_val:
+            allowed_edits.add((nid, key))
     verify_strict_integrity(original, graph, allowed_edits, allowed_added_loaders)
     return graph
 

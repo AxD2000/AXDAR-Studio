@@ -264,6 +264,70 @@ class WorkflowProfiles(unittest.TestCase):
             no_refs = profiles.runtime_graph(wf, {"seconds": 5}, "text only", [], [], lambda n: "u/" + n, "p")
             self.assertNotIn("ref_images", no_refs["17"]["inputs"])
 
+    def test_cross_platform_model_path_separator_normalization_in_runtime_json_only(self):
+        graph, metadata = generic_graph()
+        graph["65"] = node("VAELoader", vae_name=r"Minimax\minimax_h3_video_vae_fp16.safetensors")
+        graph["gen"]["inputs"]["vae"] = ["65", 0]
+        wf = profiles.inspect_workflow("win-exported-vae", graph, metadata)
+        self.assertEqual(wf["issues"], [])
+
+        linux_info = lambda kind: {
+            "VAELoader": {"input": {"required": {"vae_name": [[
+                "Minimax/minimax_h3_video_vae_fp16.safetensors",
+                "minimax_h3_audio_vae_fp32.safetensors",
+                "pixel_space",
+            ]]}}}
+        } if kind == "VAELoader" else {}
+
+        # 1) Windows backslash -> Linux forward slash normalized ONLY in runtime JSON; stored wf['graph'] untouched
+        out = profiles.runtime_graph(
+            wf, {"seconds": 2}, "test prompt", ["ref.png"], [], str, "prefix", model_info=linux_info,
+        )
+        self.assertEqual(out["65"]["inputs"]["vae_name"], "Minimax/minimax_h3_video_vae_fp16.safetensors")
+        self.assertEqual(wf["graph"]["65"]["inputs"]["vae_name"], r"Minimax\minimax_h3_video_vae_fp16.safetensors")
+
+        # 2) Linux forward slash -> Windows backslash works symmetrically when running against Windows ComfyUI
+        graph_posix = copy.deepcopy(graph)
+        graph_posix["65"]["inputs"]["vae_name"] = "Minimax/minimax_h3_video_vae_fp16.safetensors"
+        wf_posix = profiles.inspect_workflow("linux-exported-vae", graph_posix, metadata)
+        win_info = lambda kind: {
+            "VAELoader": {"input": {"required": {"vae_name": [[
+                r"Minimax\minimax_h3_video_vae_fp16.safetensors",
+            ]]}}}
+        } if kind == "VAELoader" else {}
+        out_win = profiles.runtime_graph(
+            wf_posix, {"seconds": 2}, "test prompt", ["ref.png"], [], str, "prefix", model_info=win_info,
+        )
+        self.assertEqual(out_win["65"]["inputs"]["vae_name"], r"Minimax\minimax_h3_video_vae_fp16.safetensors")
+        self.assertEqual(wf_posix["graph"]["65"]["inputs"]["vae_name"], "Minimax/minimax_h3_video_vae_fp16.safetensors")
+
+        # 3) Basename-only or different subfolder MUST be rejected (full-path match required)
+        graph_basename = copy.deepcopy(graph)
+        graph_basename["65"]["inputs"]["vae_name"] = "minimax_h3_video_vae_fp16.safetensors"
+        wf_basename = profiles.inspect_workflow("basename-only", graph_basename, metadata)
+        with self.assertRaisesRegex(ValueError, "does not match ComfyUI's registered choices"):
+            profiles.runtime_graph(
+                wf_basename, {"seconds": 2}, "test prompt", ["ref.png"], [], str, "prefix", model_info=linux_info,
+            )
+
+        # 4) Ambiguous registered choices MUST be rejected (never guess when >1 match)
+        ambig_info = lambda kind: {
+            "VAELoader": {"input": {"required": {"vae_name": [[
+                "Minimax/minimax_h3_video_vae_fp16.safetensors",
+                r"Minimax\\minimax_h3_video_vae_fp16.safetensors",
+            ]]}}}
+        } if kind == "VAELoader" else {}
+        with self.assertRaisesRegex(ValueError, "does not match ComfyUI's registered choices"):
+            profiles.runtime_graph(
+                wf, {"seconds": 2}, "test prompt", ["ref.png"], [], str, "prefix", model_info=ambig_info,
+            )
+
+        # 5) verify_strict_integrity MUST still reject any unauthorized model edit (no blanket model edit exemption)
+        tampered = copy.deepcopy(wf["graph"])
+        tampered["65"]["inputs"]["vae_name"] = "Minimax/minimax_h3_video_vae_fp16.safetensors"
+        with self.assertRaisesRegex(ValueError, "Strict workflow integrity violation"):
+            profiles.verify_strict_integrity(wf["graph"], tampered, set())
+
 
 if __name__=="__main__":
     unittest.main()
