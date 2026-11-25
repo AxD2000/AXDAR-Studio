@@ -273,6 +273,22 @@ class DirectSession:
             render_ctx["json_api"]=on_current(ctx["json_api"])
             render_ctx["prepare_shot"]=on_current(ctx["prepare_shot"])
             render_ctx["download_output"]=on_current(ctx["download_output"])
+            detected_cache={}
+            def resolve_worker_overrides(eid, shot, workflow, job_rec):
+                ws=self.plan.get("worker_settings")
+                if not ws:
+                    return {}
+                import worker_runtime
+                from workflow_profiles import detect_worker_nodes
+                if "detected" not in detected_cache:
+                    cfg_store=ctx.get("worker_config")
+                    ovr=cfg_store.get_mapping_override(workflow.get("version","")) if cfg_store is not None else {}
+                    detected_cache["detected"]=detect_worker_nodes(workflow, detected_cache.get("info"), ovr)
+                return worker_runtime.build_shot_worker_overrides(
+                    workflow, ws, detected_cache["detected"],
+                    eid=eid, shot=shot, take_number=job_rec.get("take_number",1),
+                )
+            render_ctx["resolve_worker_overrides"]=resolve_worker_overrides
             cancel_unsupported=set()
             def cancel_prompt(ticket):
                 if (self.plan["control"]!="stop" and not self.plan.get("skip_current")) or ticket in cancel_unsupported:
@@ -324,6 +340,8 @@ class DirectSession:
                             self.plan["verifiedEnvFingerprint"]=verified_fp
                     graph=runtime_requirements(ctx,{"jobs":jobs[i:]},wf)["graph"]
                     info=dependency_info(render_ctx["json_api"],url,graph,deadline)
+                    detected_cache["info"]=info
+                    detected_cache.pop("detected",None)
                     if wf.get("packaged"):
                         missing_classes=sorted({n["class_type"] for n in graph.values()} - info.keys())
                         if missing_classes:

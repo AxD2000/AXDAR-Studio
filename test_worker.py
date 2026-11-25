@@ -224,5 +224,127 @@ class Phase2WorkerConfigAndUnifiedExecutionTests(unittest.TestCase):
                 self.assertTrue(view.get("unlimited"))
 
 
+class Phase3NodeDetectionAndOverridesTests(unittest.TestCase):
+    def test_minimax_h3_package_node_detection_overrides_and_filename_prefix(self):
+        import workflow_profiles as wprof
+        import worker_config
+        pkg_path = Path(__file__).resolve().parent / "packages" / "MiniMax_H3.zip"
+        raw = pkg_path.read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = wprof.WorkflowStore(Path(tmp))
+            wf = store.import_package(pkg_path.name, raw)
+            obj_info = {
+                "ResolutionSelector": {
+                    "input": {
+                        "required": {
+                            "aspect_ratio": [["9:16 (Portrait Widescreen)", "16:9 (Landscape Widescreen)", "1:1 (Square)"]],
+                            "megapixels": ["FLOAT", {"default": 0.5}],
+                            "multiple": ["INT", {"default": 32}],
+                        }
+                    }
+                }
+            }
+            detected = wprof.detect_worker_nodes(wf, obj_info)
+            nodes = detected["nodes"]
+            self.assertEqual(nodes["seed"]["id"], "63.noise_seed")
+            self.assertEqual(nodes["fps"]["id"], "141.frame_rate")
+            self.assertEqual(nodes["fps"]["default"], 24)
+            self.assertEqual(nodes["resolution"]["mode"], "selector")
+            self.assertEqual(nodes["resolution"]["multiple"], 32)
+            self.assertEqual(nodes["resolution"]["aspectRatio"]["id"], "200.aspect_ratio")
+            self.assertEqual(nodes["resolution"]["megapixels"]["id"], "200.megapixels")
+            self.assertTrue(nodes["resolution"]["hasUpscaler"])
+            self.assertEqual(nodes["output"]["filenamePrefix"], "141.filename_prefix")
+            # Warns about hardcoded 24fps ComfyMathExpression and downstream Upscaler
+            joined_warn = "\n".join(detected["warnings"])
+            self.assertIn("ComfyMathExpression", joined_warn)
+            self.assertIn("Upscaler", joined_warn)
+
+            settings = dict(worker_config.DEFAULT_SETTINGS,
+                            seedMode="random", resolutionPreset="720p", aspectRatio="16:9", fpsOverride=30)
+            shot = {"id": "s1", "seconds": 5, "shot_code": "EP01S04"}
+            meta1 = worker_runtime.build_shot_worker_overrides(wf, settings, detected, eid="ep1", shot=shot, take_number=1)
+            meta2 = worker_runtime.build_shot_worker_overrides(wf, settings, detected, eid="ep1", shot=shot, take_number=2)
+            self.assertNotEqual(meta1["seed"], meta2["seed"])
+            self.assertEqual(meta1["output_prefix"], "AXDAR/ep1/EP01S04_T01")
+            self.assertEqual(meta1["worker_overrides"]["200.aspect_ratio"], "16:9 (Landscape Widescreen)")
+            self.assertEqual(meta1["worker_overrides"]["141.frame_rate"], 30)
+            self.assertAlmostEqual(meta1["worker_overrides"]["200.megapixels"], 0.9, places=1)
+            # playback_seconds recalculated from 124 frames / 30 fps
+            self.assertAlmostEqual(meta1["playback_seconds"], 124 / 30.0, places=3)
+
+            # Applying overrides in runtime_graph passes verify_strict_integrity!
+            g = wprof.runtime_graph(
+                wf, shot, "Hero walks", ["hero.png"], ["hero.mp3"],
+                lambda n: "up_" + n, meta1["output_prefix"],
+                worker_overrides=meta1["worker_overrides"], apply_prefix=True,
+            )
+            self.assertEqual(g["63"]["inputs"]["noise_seed"], meta1["seed"])
+            self.assertEqual(g["200"]["inputs"]["aspect_ratio"], "16:9 (Landscape Widescreen)")
+            self.assertEqual(g["200"]["inputs"]["multiple"], 32)
+            self.assertEqual(g["141"]["inputs"]["frame_rate"], 30)
+            self.assertEqual(g["141"]["inputs"]["filename_prefix"], "AXDAR/ep1/EP01S04_T01")
+            # Default runtime_graph without apply_prefix still preserves original filename_prefix
+            g_default = wprof.runtime_graph(wf, shot, "Hero walks", ["hero.png"], [], lambda n: "up_" + n, "AXDAR/ignored")
+            self.assertEqual(g_default["141"]["inputs"]["filename_prefix"], wf["graph"]["141"]["inputs"]["filename_prefix"])
+
+    def test_numeric_width_height_workflow_youtube_preset_snapping_and_qc_compatibility(self):
+        import workflow_profiles as wprof
+        import worker_config
+        import take_quality
+        graph = {
+            "1": {"class_type": "CLIPTextEncode", "inputs": {"text": "pos"}},
+            "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "neg"}},
+            "3": {"class_type": "EmptyLatentImage", "inputs": {"width": 832, "height": 480, "batch_size": 1}},
+            "4": {"class_type": "KSampler", "inputs": {"positive": ["1", 0], "negative": ["2", 0], "latent_image": ["3", 0], "seed": 777}},
+            "5": {"class_type": "CustomVideo", "inputs": {"samples": ["4", 0], "num_frames": 49}},
+            "6": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["5", 0], "frame_rate": 16, "format": "video/h264-mp4", "filename_prefix": "orig"}},
+        }
+        wf = wprof.inspect_workflow("numeric-wf", graph, {}, {
+            "output": "6", "positive": "1.text", "negative": "2.text", "frames": "5.num_frames", "fps": 16,
+        })
+        self.assertEqual(wf["issues"], [])
+        detected = wprof.detect_worker_nodes(wf)
+        self.assertEqual(detected["nodes"]["resolution"]["mode"], "numeric")
+        self.assertEqual(detected["nodes"]["seed"]["id"], "4.seed")
+        self.assertTrue(detected["nodes"]["frames"]["editable"])
+
+        settings = dict(worker_config.DEFAULT_SETTINGS,
+                        seedMode="fixed", fixedSeed=999, resolutionPreset="720p", aspectRatio="16:9", fpsOverride=24, framesOverride=72)
+        meta = worker_runtime.build_shot_worker_overrides(wf, settings, detected, eid="ep1", shot={"id": "s1", "seconds": 3, "shot_code": "EP01S02"}, take_number=1)
+        # 720p @ 16:9 snapped to multiple=32 -> 1280 x 704 (since 720 is not divisible by 32)
+        self.assertEqual(meta["worker_overrides"]["3.width"], 1280)
+        self.assertEqual(meta["worker_overrides"]["3.height"], 704)
+        self.assertEqual(meta["worker_overrides"]["4.seed"], 999)
+        self.assertEqual(meta["worker_overrides"]["5.num_frames"], 72)
+        self.assertEqual(meta["worker_overrides"]["6.frame_rate"], 24)
+        self.assertEqual(meta["playback_seconds"], 3.0)
+
+        g = wprof.runtime_graph(
+            wf, {"seconds": 3}, "Hello", [], [], str, meta["output_prefix"],
+            worker_overrides=meta["worker_overrides"], apply_prefix=True,
+        )
+        self.assertEqual(g["3"]["inputs"]["width"], 1280)
+        self.assertEqual(g["3"]["inputs"]["height"], 704)
+        self.assertEqual(g["6"]["inputs"]["filename_prefix"], "AXDAR/ep1/EP01S02_T01")
+
+        # Verify take_quality accepts selector mode without false mismatch against stale job['resolution']
+        fake_probe = json.dumps({
+            "streams": [{"codec_type": "video", "index": 0, "width": 1280, "height": 704, "duration": "3.0"}],
+            "format": {"duration": "3.0"},
+        }).encode()
+        with patch("take_quality.tool", side_effect=lambda name: name), \
+             patch("take_quality.subprocess.run") as run_mock:
+            run_mock.side_effect = [
+                type("R", (), {"stdout": fake_probe, "check_returncode": lambda self: None})(),
+                type("R", (), {"stdout": b"frame=72\n", "check_returncode": lambda self: None})(),
+            ]
+            qc = take_quality.check(Path("fake.mp4"), {
+                "settings": {"seconds": 3}, "playback_seconds": 3.0,
+                "resolution": [832, 480], "applied_resolution": {"mode": "selector", "megapixels": 0.9},
+            })
+        self.assertEqual(qc["technical"], "passed")
+
+
 if __name__ == "__main__":
     unittest.main()

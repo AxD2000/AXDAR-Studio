@@ -184,6 +184,11 @@ def render(ctx, url, deadline, eid, shot, wf, retries, notify, retry_failed=Fals
             from workflow_profiles import timing
             j.update(workflow_version=wf["version"], workflow_profile=wf, scene_id=shot.get("scene_id"),
                      playback_seconds=timing(wf,shot["seconds"])["playback_seconds"])
+        resolver = ctx.get("resolve_worker_overrides")
+        if callable(resolver):
+            resolved = resolver(eid, shot, wf, j)
+            if isinstance(resolved, dict):
+                j.update(resolved)
         atomic(path,j)
     def finish(status):
         j.update(status=status, completed=time.time(), renderSeconds=max(0,time.time()-j.get("started",time.time())))

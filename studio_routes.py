@@ -242,6 +242,40 @@ def _post_worker(handler, app, obj):
                     raise ValueError("Pause or stop production before changing input settings: " + ", ".join(blocked))
             app.worker_config.update(changes)
             return handler.send(app.worker_config.public_state())
+    if action == "inspect-nodes":
+        import workflow_profiles as wprof
+        wf = app.active_workflow
+        if not wf:
+            raise ValueError(app.workflow_error or "Select a valid Workflow Package first.")
+        object_info = None
+        connected_url = app.connection.snapshot().get("url")
+        if connected_url:
+            try:
+                object_info = app.json_api(connected_url, "/object_info")
+            except Exception:
+                object_info = None
+        override = app.worker_config.get_mapping_override(wf["version"])
+        detected = wprof.detect_worker_nodes(wf, object_info, override)
+        return handler.send({"detected": detected, "worker": app.worker_config.public_state()})
+    if action == "save-mapping-override":
+        with app.LOCK:
+            if app.running:
+                raise ValueError("Pause or stop production before changing node mapping overrides.")
+            wf = app.active_workflow
+            if not wf:
+                raise ValueError("Select a valid Workflow Package first.")
+            override = obj.get("override") or {}
+            saved = app.worker_config.save_mapping_override(wf["version"], override)
+            return handler.send({"ok": True, "override": saved})
+    if action == "clear-mapping-override":
+        with app.LOCK:
+            if app.running:
+                raise ValueError("Pause or stop production before clearing node mapping overrides.")
+            wf = app.active_workflow
+            if not wf:
+                raise ValueError("Select a valid Workflow Package first.")
+            app.worker_config.clear_mapping_override(wf["version"])
+            return handler.send({"ok": True, "override": {}})
     if action == "start":
         return _post_production(handler, app, obj)
     raise ValueError("Unknown Worker action.")

@@ -93,6 +93,11 @@ def upload(url, asset, name, *, fallback_stage=None, remote_fn=None, available_f
 
 def prepare_shot(url, folder, eid, shot, wf, record, *, asset_map, upload_fn=None, json_api_fn=None):
     images, voices = generation_images(shot), generation_voices(shot)
+    limits = workflow_profiles.limits(wf) if wf.get("fields") and wf.get("mapping") else {}
+    if record.get("disable_auto_images") and not limits.get("min_images"):
+        images = []
+    if record.get("disable_auto_audio") and not limits.get("min_audio"):
+        voices = []
     for name in dict.fromkeys([*images, *voices]):
         if name not in asset_map or Path(name).name != name:
             raise ValueError("Missing asset: " + name)
@@ -105,11 +110,14 @@ def prepare_shot(url, folder, eid, shot, wf, record, *, asset_map, upload_fn=Non
         uploaded = "axdar_" + production.digest(asset) + asset.suffix.lower()
         return do_upload(url, asset, uploaded)
 
+    prefix = record.get("output_prefix") or ("AXDAR/" + eid + "/" + shot["id"] + "/" + folder.name)
     return workflow_profiles.runtime_graph(
         wf, shot, record["prompt"], images, voices,
         upload_reference,
-        "AXDAR/" + eid + "/" + shot["id"] + "/" + folder.name,
+        prefix,
         model_info=lambda kind: do_api(url, "/object_info/" + quote(kind, safe="")),
+        worker_overrides=record.get("worker_overrides"),
+        apply_prefix=bool(record.get("apply_prefix")),
     )
 
 

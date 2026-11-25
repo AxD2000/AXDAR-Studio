@@ -774,7 +774,253 @@ def verify_strict_integrity(original_graph, runtime_graph, allowed_edits, allowe
                 )
 
 
-def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, model_info=None):
+def _trace_text_source(graph, start_id, max_hops=4):
+    """Multi-hop upstream trace from a conditioning/prompt node to an editable literal STRING input."""
+    seen = set()
+    queue = [(start_id, 0)]
+    while queue:
+        nid, depth = queue.pop(0)
+        if nid in seen or depth > max_hops or nid not in graph:
+            continue
+        seen.add(nid)
+        node = graph[nid]
+        inputs = node.get("inputs", {})
+        for key in ("text", "prompt", "positive_prompt", "negative_prompt", "value", "string"):
+            if key in inputs:
+                val = inputs[key]
+                if isinstance(val, str):
+                    return f"{nid}.{key}"
+                if _link(val):
+                    queue.append((val[0], depth + 1))
+        for val in inputs.values():
+            if _link(val) and val[0] not in seen:
+                src_ct = graph.get(val[0], {}).get("class_type", "")
+                if any(tok in src_ct.lower() for tok in ("text", "string", "prompt", "clip", "primitive", "concat")):
+                    queue.append((val[0], depth + 1))
+    return ""
+
+
+def detect_worker_nodes(wf, object_info=None, override=None):
+    """Read-only post-install discovery of Worker-controllable input & output nodes on the active output branch."""
+    graph = wf.get("graph") or {}
+    mapping = wf.get("mapping") or {}
+    info = object_info if isinstance(object_info, dict) else {}
+    ovr = override if isinstance(override, dict) else {}
+    output = ovr.get("output") or wf.get("output") or mapping.get("output") or ""
+    branch = _upstream(graph, [output]) if output and output in graph else set(graph)
+    fields = _fields(graph, branch, info, manual_media=True)
+    by_id = {f["id"]: f for f in fields}
+
+    warnings = []
+    # Multi-hop positive/negative detection when not explicitly mapped
+    pos_id = ovr.get("positive") or mapping.get("positive") or ""
+    neg_id = ovr.get("negative") or mapping.get("negative") or ""
+    if not pos_id or not neg_id:
+        for nid in branch:
+            inps = graph[nid].get("inputs", {})
+            if not pos_id and _link(inps.get("positive")):
+                pos_id = _trace_text_source(graph, inps["positive"][0])
+            if not neg_id and _link(inps.get("negative")):
+                neg_id = _trace_text_source(graph, inps["negative"][0])
+
+    # Seed detection (RandomNoise.noise_seed, KSampler.seed, etc.)
+    seed_candidates = []
+    for nid in sorted(branch, key=lambda x: (0, int(x)) if x.isdigit() else (1, x)):
+        inps = graph[nid].get("inputs", {})
+        for key in ("noise_seed", "seed"):
+            if key in inps and not _link(inps[key]):
+                seed_candidates.append(f"{nid}.{key}")
+    seed_id = ovr.get("seed") or (seed_candidates[0] if seed_candidates else "")
+
+    # FPS detection (output node frame_rate/fps or upstream CreateVideo/primitive)
+    fps_candidates = []
+    if output in graph:
+        out_inps = graph[output].get("inputs", {})
+        for key in ("frame_rate", "fps"):
+            if key in out_inps:
+                val = out_inps[key]
+                if _link(val):
+                    src = graph.get(val[0], {})
+                    if "value" in src.get("inputs", {}) and not _link(src["inputs"]["value"]):
+                        fps_candidates.append(f"{val[0]}.value")
+                else:
+                    fps_candidates.append(f"{output}.{key}")
+    for nid in sorted(branch, key=lambda x: (0, int(x)) if x.isdigit() else (1, x)):
+        if nid == output:
+            continue
+        ct = graph[nid].get("class_type", "")
+        inps = graph[nid].get("inputs", {})
+        if ct == "CreateVideo" and "fps" in inps and not _link(inps["fps"]):
+            fps_candidates.append(f"{nid}.fps")
+    fps_candidates = list(dict.fromkeys(fps_candidates))
+    fps_id = ovr.get("fps") or (fps_candidates[0] if fps_candidates else "")
+    fps_default = None
+    if fps_id and "." in fps_id:
+        fn, fk = fps_id.split(".", 1)
+        fv = graph.get(fn, {}).get("inputs", {}).get(fk)
+        if _number(fv):
+            fps_default = fv
+
+    # Detect hardcoded FPS inside ComfyMathExpression nodes (e.g., MiniMax H3 Node 75)
+    math_fps_nodes = []
+    for nid in sorted(branch):
+        node = graph[nid]
+        if node.get("class_type") == "ComfyMathExpression":
+            expr = str(node.get("inputs", {}).get("expression") or "")
+            if re.search(r"\*\s*\d+", expr):
+                math_fps_nodes.append({"node": nid, "title": _title(node), "expression": expr})
+    if math_fps_nodes:
+        desc = ", ".join(f"Node {m['node']} ({m['title']} / ComfyMathExpression)" for m in math_fps_nodes)
+        warnings.append(
+            f"{desc} uses a fixed numeric expression for frame calculation; changing output FPS alone may change playback speed or audio sync."
+        )
+
+    # Resolution & Aspect Ratio detection (Selector mode vs Numeric Width/Height mode)
+    aspect_id = ovr.get("aspectRatio") or ""
+    mp_id = ovr.get("megapixels") or ""
+    width_id = ovr.get("resolutionWidth") or ""
+    height_id = ovr.get("resolutionHeight") or ""
+    multiple_val = 32
+    aspect_options = []
+    default_aspect = None
+    default_mp = None
+    default_width = None
+    default_height = None
+    res_mode = "none"
+
+    if not aspect_id:
+        for nid in sorted(branch, key=lambda x: (0, int(x)) if x.isdigit() else (1, x)):
+            inps = graph[nid].get("inputs", {})
+            if "aspect_ratio" in inps and not _link(inps["aspect_ratio"]):
+                aspect_id = f"{nid}.aspect_ratio"
+                if not mp_id and "megapixels" in inps and not _link(inps["megapixels"]):
+                    mp_id = f"{nid}.megapixels"
+                if _number(inps.get("multiple")) and int(inps["multiple"]) > 0:
+                    multiple_val = int(inps["multiple"])
+                break
+
+    if aspect_id and "." in aspect_id:
+        an, ak = aspect_id.split(".", 1)
+        if an in graph:
+            res_mode = "selector"
+            default_aspect = graph[an]["inputs"].get(ak)
+            spec = _contract(info, graph[an]["class_type"]).get(ak, {})
+            if isinstance(spec.get("options"), list):
+                aspect_options = list(spec["options"])
+            if mp_id and "." in mp_id:
+                mn, mk = mp_id.split(".", 1)
+                mv = graph.get(mn, {}).get("inputs", {}).get(mk)
+                if _number(mv):
+                    default_mp = float(mv)
+            if _number(graph[an]["inputs"].get("multiple")):
+                multiple_val = int(graph[an]["inputs"]["multiple"])
+    else:
+        if not width_id or not height_id:
+            for nid in sorted(branch, key=lambda x: (0, int(x)) if x.isdigit() else (1, x)):
+                inps = graph[nid].get("inputs", {})
+                if "width" in inps and "height" in inps and not _link(inps["width"]) and not _link(inps["height"]):
+                    width_id = width_id or f"{nid}.width"
+                    height_id = height_id or f"{nid}.height"
+                    w_spec = _contract(info, graph[nid]["class_type"]).get("width", {})
+                    if _number(w_spec.get("step")) and int(w_spec["step"]) >= 8:
+                        multiple_val = int(w_spec["step"])
+                    break
+        if width_id and height_id and "." in width_id and "." in height_id:
+            wn, wk = width_id.split(".", 1)
+            hn, hk = height_id.split(".", 1)
+            if wn in graph and hn in graph:
+                res_mode = "numeric"
+                wv = graph[wn]["inputs"].get(wk)
+                hv = graph[hn]["inputs"].get(hk)
+                default_width = int(wv) if _number(wv) else None
+                default_height = int(hv) if _number(hv) else None
+
+    has_upscaler = any(
+        "upscal" in graph[nid].get("class_type", "").lower() or "upscal" in _title(graph[nid]).lower()
+        for nid in branch
+    )
+    if res_mode == "selector" and has_upscaler and default_mp is not None:
+        warnings.append(
+            f"Workflow contains a downstream Upscaler; Resolution Selector default is {default_mp:g} MP (base resolution before upscaling)."
+        )
+
+    out_prefix = None
+    if output in graph and "filename_prefix" in graph[output].get("inputs", {}):
+        out_prefix = f"{output}.filename_prefix"
+
+    duration_id = ovr.get("duration") or mapping.get("duration") or ""
+    frames_id = ovr.get("frames") or mapping.get("frames") or ""
+    frames_editable = False
+    if frames_id and "." in frames_id:
+        fn, fk = frames_id.split(".", 1)
+        frames_editable = fn in graph and not _link(graph[fn].get("inputs", {}).get(fk))
+
+    images_list = ovr.get("images") if "images" in ovr else list(mapping.get("images") or [])
+    audio_list = ovr.get("audio") if "audio" in ovr else list(mapping.get("audio") or [])
+
+    def _entry(fid):
+        if not fid or "." not in fid:
+            return None
+        nid, key = fid.split(".", 1)
+        node = graph.get(nid)
+        if not node:
+            return None
+        return {
+            "id": fid,
+            "node": nid,
+            "key": key,
+            "classType": node.get("class_type", ""),
+            "title": _title(node),
+            "default": node.get("inputs", {}).get(key) if not _link(node.get("inputs", {}).get(key)) else None,
+            "linked": _link(node.get("inputs", {}).get(key)),
+        }
+
+    available_fields = [
+        {"id": f["id"], "label": f["label"], "type": f["type"], "roles": f["roles"], "value": f.get("value")}
+        for f in fields if f.get("present")
+    ]
+    return {
+        "version": wf.get("version", ""),
+        "name": wf.get("name", ""),
+        "packaged": bool(wf.get("packaged")),
+        "liveSchemaLoaded": bool(info),
+        "nodes": {
+            "positive": _entry(pos_id),
+            "negative": _entry(neg_id),
+            "images": [_entry(x) or {"id": x} for x in images_list],
+            "audio": [_entry(x) or {"id": x} for x in audio_list],
+            "duration": _entry(duration_id),
+            "frames": {**(_entry(frames_id) or {"id": frames_id}), "editable": frames_editable} if frames_id else None,
+            "fps": {**(_entry(fps_id) or {"id": fps_id}), "default": fps_default, "mathNodes": math_fps_nodes} if fps_id else None,
+            "seed": _entry(seed_id),
+            "resolution": {
+                "mode": res_mode,
+                "multiple": multiple_val,
+                "hasUpscaler": has_upscaler,
+                "aspectRatio": _entry(aspect_id),
+                "aspectOptions": aspect_options,
+                "defaultAspectRatio": default_aspect,
+                "megapixels": _entry(mp_id),
+                "defaultMegapixels": default_mp,
+                "width": _entry(width_id),
+                "height": _entry(height_id),
+                "defaultWidth": default_width,
+                "defaultHeight": default_height,
+            },
+            "output": {
+                "id": output,
+                "title": _title(graph[output]) if output in graph else "",
+                "classType": graph[output].get("class_type", "") if output in graph else "",
+                "filenamePrefix": out_prefix,
+            } if output else None,
+        },
+        "warnings": warnings,
+        "availableFields": available_fields,
+        "override": ovr,
+    }
+
+
+def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, model_info=None, worker_overrides=None, apply_prefix=False):
     """Strict slot-only binding: preserve all authored nodes and unmapped settings verbatim."""
     errors = validate_shot(wf,shot,images,voices)
     if not str(positive_prompt or "").strip():
@@ -813,6 +1059,21 @@ def runtime_graph(wf, shot, positive_prompt, images, voices, upload, prefix, *, 
         set_field(m["duration"],int(value) if fields[m["duration"]]["type"]=="INT" else value)
     if m.get("frames"):
         set_field(m["frames"],timing(wf,shot["seconds"])["frames"])
+    if apply_prefix and prefix and output in graph and "filename_prefix" in graph[output].get("inputs", {}):
+        graph[output]["inputs"]["filename_prefix"] = str(prefix)
+        allowed_edits.add((output, "filename_prefix"))
+    if isinstance(worker_overrides, dict):
+        for fid, val in worker_overrides.items():
+            if not isinstance(fid, str) or "." not in fid:
+                continue
+            nid, key = fid.split(".", 1)
+            if nid not in graph:
+                raise ValueError(f"Worker override references missing node {nid!r}.")
+            inps = graph[nid].get("inputs", {})
+            if key in inps and _link(inps[key]):
+                raise ValueError(f"Worker override cannot overwrite wired link {fid!r}.")
+            inps[key] = val
+            allowed_edits.add((nid, key))
     if model_info:
         _validate_runtime_contracts(graph, _upstream(graph, [output]), model_info)
     for role,assets in (("images",list(images)),("audio",list(voices))):

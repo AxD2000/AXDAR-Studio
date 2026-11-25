@@ -149,9 +149,80 @@ function workerFinancialHtml(){
 function workerNodesHtml(){
     return '<section class="panel" id="workerNodesPanel">'+
         '<div class="top"><h2>Detected Workflow Nodes &amp; Session Controls</h2>'+
-        '<button type="button" data-worker="inspect-nodes">Refresh Detected Nodes</button></div>'+
-        '<div id="workerNodesBody"><p class="muted">Click Refresh Detected Nodes after installing the Workflow Package to inspect and override Resolution, Aspect Ratio, FPS, Seed, and Node bindings.</p></div>'+
+        '<div class="row"><button type="button" data-worker="inspect-nodes">Inspect / Refresh Nodes</button>'+
+        (workerNodesCache?.detected?.override && Object.keys(workerNodesCache.detected.override).length
+            ?'<button type="button" data-worker="clear-mapping-override">Reset Node Overrides</button>':'')+
+        '</div></div>'+
+        '<div id="workerNodesBody">'+workerNodesBodyHtml()+'</div>'+
         '</section>';
+}
+
+function workerNodesBodyHtml(){
+    const det = workerNodesCache?.detected;
+    if(!det) return '<p class="muted">Click <strong>Inspect / Refresh Nodes</strong> after installing the Workflow Package to view detected input/output nodes and configure Resolution, Aspect Ratio, FPS, and Seed.</p>';
+    const n = det.nodes || {};
+    const res = n.resolution || {};
+    const cfg = workerSettings();
+    const presets = state.worker?.presets?.resolutions || [
+        {id:'workflow_default',label:'Workflow Default'},
+        {id:'360p',label:'360p (Fast Test)'},{id:'480p',label:'480p (SD)'},
+        {id:'540p',label:'540p (0.5 MP Base)'},{id:'720p',label:'720p (HD)'},
+        {id:'1080p',label:'1080p (Full HD)'},{id:'custom',label:'Custom'},
+    ];
+    const locked = state.running;
+    const aspectChoices = (res.aspectOptions && res.aspectOptions.length)
+        ? ['', ...res.aspectOptions]
+        : (state.worker?.presets?.aspectRatios || ['','16:9','9:16','1:1','4:3','3:4','21:9']);
+    const nodeSummary = x => x ? (x.id + (x.title ? ' · '+x.title : '') + (x.default!=null ? ' ['+String(x.default).slice(0,32)+']' : '')) : 'Not detected';
+    const fieldsOpts = (selected) => option('', 'Auto / Package Default', selected||'') +
+        (det.availableFields||[]).map(f=>option(f.id, f.label, selected||'')).join('');
+    const ovr = det.override || {};
+
+    return '<p class="muted"><strong>'+esc(det.name)+'</strong> · '+
+        (det.liveSchemaLoaded?'Live ComfyUI /object_info loaded':'Offline package graph (connect ComfyUI for live dropdown options)')+
+        ' · Resolution mode: <strong>'+esc(res.mode||'none')+'</strong> (multiple '+esc(res.multiple||32)+')</p>'+
+        (det.warnings?.length?'<ul class="danger">'+det.warnings.map(w=>'<li>'+esc(w)+'</li>').join('')+'</ul>':'')+
+        '<div class="form-pair">'+
+        '<label>Resolution Preset (YouTube Style)<select data-wk-setting="resolutionPreset" '+(locked?'disabled':'')+'>'+
+        presets.map(p=>option(p.id, p.label, cfg.resolutionPreset||'workflow_default')).join('')+
+        '</select></label>'+
+        '<label>Aspect Ratio<select data-wk-setting="aspectRatio" '+(locked?'disabled':'')+'>'+
+        aspectChoices.map(a=>option(a, a||'Workflow Default'+(res.defaultAspectRatio?' ('+res.defaultAspectRatio+')':''), cfg.aspectRatio||'')).join('')+
+        '</select></label>'+
+        (cfg.resolutionPreset==='custom'&&res.mode==='selector'
+            ?'<label>Custom Megapixels<input type="number" step="any" min="0.05" max="16" data-wk-setting="customMegapixels" value="'+esc(cfg.customMegapixels??'')+'" '+(locked?'disabled':'')+'></label>':'')+
+        (cfg.resolutionPreset==='custom'&&res.mode==='numeric'
+            ?'<label>Custom Width<input type="number" min="64" max="8192" data-wk-setting="customWidth" value="'+esc(cfg.customWidth??'')+'" '+(locked?'disabled':'')+'></label>'+
+             '<label>Custom Height<input type="number" min="64" max="8192" data-wk-setting="customHeight" value="'+esc(cfg.customHeight??'')+'" '+(locked?'disabled':'')+'></label>':'')+
+        '<label>FPS Override (Frames / Second · blank = default'+(n.fps?.default!=null?' '+n.fps.default:'')+')<input type="number" step="any" min="1" max="120" data-wk-setting="fpsOverride" value="'+esc(cfg.fpsOverride??'')+'" '+(locked?'disabled':'')+'></label>'+
+        (n.frames?.editable?'<label>Total Frames Override (blank = per-shot duration)<input type="number" min="1" max="10000" data-wk-setting="framesOverride" value="'+esc(cfg.framesOverride??'')+'" '+(locked?'disabled':'')+'></label>':'')+
+        '</div>'+
+        '<div class="row"><button type="button" class="primary" data-worker="save-settings" '+(locked?'disabled':'')+'>Apply Session Controls</button></div>'+
+        '<details style="margin-top:10px"><summary>Detected Input / Output Nodes &amp; Manual Mapping Override</summary>'+
+        '<table class="wm-table"><thead><tr><th>Role</th><th>Detected Node</th><th>Manual Override</th></tr></thead><tbody>'+
+        [
+            ['Positive Prompt','positive',n.positive],
+            ['Negative Prompt','negative',n.negative],
+            ['Seed','seed',n.seed],
+            ['FPS (Frames/Sec)','fps',n.fps],
+            ['Duration','duration',n.duration],
+            ['Total Frames','frames',n.frames],
+            ['Aspect Ratio','aspectRatio',res.aspectRatio],
+            ['Megapixels','megapixels',res.megapixels],
+            ['Width','resolutionWidth',res.width],
+            ['Height','resolutionHeight',res.height],
+        ].map(([label,role,info])=>'<tr><td>'+esc(label)+'</td><td>'+esc(nodeSummary(info))+'</td><td><select data-wk-ovr="'+role+'" '+(locked?'disabled':'')+'>'+fieldsOpts(ovr[role])+'</select></td></tr>').join('')+
+        '<tr><td>Character Images</td><td colspan="2">'+esc((n.images||[]).map(x=>x.id).join(', ')||'None')+'</td></tr>'+
+        '<tr><td>Character Audio</td><td colspan="2">'+esc((n.audio||[]).map(x=>x.id).join(', ')||'None')+'</td></tr>'+
+        '<tr><td>Final Output Node</td><td colspan="2">'+esc(n.output?(n.output.id+' · '+n.output.title+(n.output.filenamePrefix?' ('+n.output.filenamePrefix+')':'')):'None')+'</td></tr>'+
+        '</tbody></table>'+
+        '<div class="row" style="margin-top:8px"><button type="button" data-worker="save-mapping-override" '+(locked?'disabled':'')+'>Save Mapping Override for This Package</button></div>'+
+        '</details>';
+}
+
+function renderWorkerNodesBody(){
+    const el = $('#workerNodesBody');
+    if(el) el.innerHTML = workerNodesBodyHtml();
 }
 
 function workerTakesHtml(){
@@ -338,7 +409,27 @@ document.addEventListener('click', async event => {
         }
         if(action==='inspect-nodes'){
             workerNodesCache = await post('/worker', {action:'inspect-nodes'});
-            if(typeof renderWorkerNodesBody === 'function') renderWorkerNodesBody();
+            if(workerNodesCache.worker) state.worker = workerNodesCache.worker;
+            renderWorkerNodesBody();
+            reportStatus('Workflow nodes inspected.');
+            return;
+        }
+        if(action==='save-mapping-override'){
+            const override = {};
+            for(const sel of document.querySelectorAll('[data-wk-ovr]')){
+                if(sel.value) override[sel.dataset.wkOvr] = sel.value;
+            }
+            await post('/worker', {action:'save-mapping-override', override});
+            workerNodesCache = await post('/worker', {action:'inspect-nodes'});
+            renderWorkerNodesBody();
+            reportStatus('Mapping override saved for this workflow version.');
+            return;
+        }
+        if(action==='clear-mapping-override'){
+            await post('/worker', {action:'clear-mapping-override'});
+            workerNodesCache = await post('/worker', {action:'inspect-nodes'});
+            renderWorkerNodesBody();
+            reportStatus('Mapping override cleared.');
             return;
         }
         if(action==='export-downloads'){

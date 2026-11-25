@@ -26,7 +26,13 @@ def check(path, job, timeout=180):
             raise ValueError("Required audio stream is missing.")
         settings = job["settings"]
         width, height = int(video["width"]), int(video["height"])
-        expected = job.get("resolution")
+        applied_res = job.get("applied_resolution") if isinstance(job.get("applied_resolution"), dict) else None
+        if applied_res and applied_res.get("mode") == "selector":
+            expected = None
+        elif applied_res and applied_res.get("mode") == "numeric" and applied_res.get("width") and applied_res.get("height"):
+            expected = [int(applied_res["width"]), int(applied_res["height"])]
+        else:
+            expected = job.get("resolution")
         if min(width, height) <= 0 or expected and [width, height] != expected:
             raise ValueError(f"Unexpected resolution {width}×{height}.")
         duration = float(video.get("duration", info["format"]["duration"]))
