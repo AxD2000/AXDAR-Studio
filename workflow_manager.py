@@ -16,7 +16,7 @@ from workflow_profiles import _upstream
 INSTALL_ROOT = "/workspace/axdar-studio/installations"
 SSH_CHECK_SECONDS = 45
 TERMINAL = {"installed", "ready", "incompatible", "needs attention", "failed", "cancelled", "timed out"}
-FILES = ("workflow_install_remote.py", "production.py", "provision.py", "workflow_packages.py")
+FILES = ("workflow_install_remote.py", "workflow_comfy_manager.py", "production.py", "provision.py", "workflow_packages.py")
 HF_VALUE = r"hf_[A-Za-z0-9]{10,256}"
 
 
@@ -376,7 +376,7 @@ class WorkflowManager:
             return {"ok": True}
         if mode == "reset-install":
             return self.reset_installation(request.get("instance"), request.get("version"))
-        if mode not in ("scan", "install"):
+        if mode not in ("scan", "install", "sync-nodes"):
             raise ValueError("Unknown Workflow Manager action.")
         if request.get("script"):
             raise ValueError("Manual Bash execution is removed from production workflow installation. Declare pinned dependencies in the Workflow Package (.zip).")

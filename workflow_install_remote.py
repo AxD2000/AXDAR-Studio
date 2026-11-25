@@ -15,6 +15,7 @@ from urllib.request import urlopen
 
 import production
 import provision
+import workflow_comfy_manager
 import workflow_packages
 
 PHASES = (
@@ -718,16 +719,123 @@ def _execute_bootstrap(folder, config, api, idle, stage, report_fn, metrics_fn=N
         "environmentFingerprint": fp,
     }
     report_fn(final_result)
-    available = not missing_after and all(m["status"] == "Installed" for m in final_models)
+    models_ok = all(m["status"] == "Installed" for m in final_models)
+    if models_ok:
+        sync = _run_post_install_manager_sync(
+            root=root, graph=graph, api=api, idle=idle, port=config["port"],
+            manifest=manifest, node_specs=node_specs, stage=stage,
+            result_dict=final_result, report_fn=report_fn,
+        )
+        if sync.get("restarted") or sync.get("finalStatus") in ("passed", "failed"):
+            missing_after = list(sync.get("remainingMissingClasses", missing_after))
+            final_result["nodes"] = missing_after
+            if sync.get("restarted"):
+                final_env = probe_environment(root, api)
+                fp = _canonical_hash({
+                    "base": final_env["environmentFingerprint"],
+                    "packageKind": "bootstrap",
+                    "nodes": {r["repo"]: r["actualRevision"] for r in final_nodes},
+                    "models": [m["name"] for m in final_models if m["status"] == "Installed"],
+                })
+                final_env["environmentFingerprint"] = fp
+                final_result["environment"] = final_env
+                final_result["environmentFingerprint"] = fp
+            report_fn(final_result)
+        sync_failed = sync.get("finalStatus") == "failed"
+    else:
+        sync_failed = False
+
+    available = not missing_after and models_ok and not sync_failed
     stage(
         PHASES[6],
         "Completed" if available else "Failed",
         (
             "Bootstrap package installed and verified. Production readiness still requires a verified real video."
-            if available else "Missing workflow nodes or models after installation."
+            if available else (
+                "Custom node manager sync reported issues. Retry Sync Custom Nodes without reinstalling the package."
+                if sync_failed else "Missing workflow nodes or models after installation."
+            )
         ),
     )
     return 0 if available else 2
+
+
+def _make_existing_comfyui_restarter(idle):
+    """Reuse AXDAR's existing supervisorctl restart mechanism when present."""
+    if _supervisor_has_comfyui():
+        def _restart():
+            idle()
+            subprocess.run(["supervisorctl", "restart", "comfyui"], check=True, timeout=90)
+        return _restart
+    return None
+
+
+def _run_post_install_manager_sync(*, root, graph, api, idle, port, manifest, node_specs, stage, result_dict, report_fn):
+    """Run additive ComfyUI-Manager sync after successful package installation without altering existing steps."""
+    token = os.environ.get("HF_TOKEN", "")
+
+    def on_sync_progress(sync_state):
+        result_dict["managerSync"] = sync_state
+        report_fn(result_dict)
+
+    sync = workflow_comfy_manager.run_post_install_sync(
+        root=root,
+        graph=graph,
+        api=api,
+        port=port,
+        manifest=manifest,
+        node_specs=node_specs,
+        stage=stage,
+        on_progress=on_sync_progress,
+        restart_fn=_make_existing_comfyui_restarter(idle),
+        client=workflow_comfy_manager.ComfyManagerClient(f"http://127.0.0.1:{port}", urlopen_fn=urlopen),
+        redact_fn=lambda text: redact(text, token),
+    )
+    result_dict["managerSync"] = sync
+    report_fn(result_dict)
+    return sync
+
+
+def _execute_sync_nodes(folder, config, api, idle, stage, report_fn):
+    """Independently retryable ComfyUI-Manager custom-node sync (preserves installed package & models)."""
+    root = root_path()
+    api("/object_info")
+    stage(PHASES[0], "Completed", str(root))
+    env = probe_environment(root, api)
+    result = {
+        "packaged": bool(config.get("packaged")),
+        "packageKind": config.get("packageKind", "declarative"),
+        "nodes": [],
+        "compatible": True,
+        "incompatibilities": [],
+        "environment": env,
+        "environmentFingerprint": env["environmentFingerprint"],
+    }
+    sync = _run_post_install_manager_sync(
+        root=root,
+        graph=config["graph"],
+        api=api,
+        idle=idle,
+        port=config["port"],
+        manifest=config.get("manifest"),
+        node_specs=config.get("nodes") or (),
+        stage=stage,
+        result_dict=result,
+        report_fn=report_fn,
+    )
+    result["nodes"] = list(sync.get("remainingMissingClasses") or [])
+    if sync.get("restarted"):
+        env = probe_environment(root, api)
+        result["environment"] = env
+        result["environmentFingerprint"] = env["environmentFingerprint"]
+    report_fn(result)
+    ok = sync.get("finalStatus") in ("passed", "skipped") and not result["nodes"]
+    stage(
+        PHASES[6],
+        "Completed" if ok else "Failed",
+        "Custom node manager sync verified." if ok else "Review ComfyUI-Manager custom node sync issues.",
+    )
+    return 0 if ok else 2
 
 
 def _execute_packaged(folder, config, api, idle, stage, report_fn, metrics_fn=None):
@@ -929,7 +1037,27 @@ def _execute_packaged(folder, config, api, idle, stage, report_fn, metrics_fn=No
     att_ok = result["attention"]["status"] in ("Installed", "SDPA", "Not required", "Fallback (SDPA — authorized by manifest)")
     all_nodes_ok = not result["nodes"] and all(r["status"] == "Installed" for r in result["nodeRepos"])
     all_models_ok = all(m["status"] == "Installed" for m in result["models"])
-    available = result["compatible"] and all_nodes_ok and all_models_ok and att_ok
+    sync_failed = False
+    if result["compatible"] and all_models_ok and att_ok:
+        sync = _run_post_install_manager_sync(
+            root=root, graph=graph, api=api, idle=idle, port=config["port"],
+            manifest=manifest, node_specs=node_specs, stage=stage,
+            result_dict=result, report_fn=report_fn,
+        )
+        if sync.get("restarted"):
+            final_env = probe_environment(root, api)
+            result = scan_package(graph, api("/object_info"), root, manifest, node_specs, model_specs, env=final_env, verify_hashes=True)
+            if sage_fallback_used and att_cfg.get("allowSdpaFallback") is True and result["attention"]["status"] == "Missing":
+                result["attention"]["status"] = "Fallback (SDPA — authorized by manifest)"
+                result["sageAttention"] = "Fallback (SDPA — authorized by manifest)"
+            result["environmentFingerprint"] = compute_verified_fingerprint(final_env, result)
+            result["environment"]["environmentFingerprint"] = result["environmentFingerprint"]
+            result["managerSync"] = sync
+            report_fn(result)
+            all_nodes_ok = not result["nodes"] and all(r["status"] == "Installed" for r in result["nodeRepos"])
+        sync_failed = sync.get("finalStatus") == "failed"
+
+    available = result["compatible"] and all_nodes_ok and all_models_ok and att_ok and not sync_failed
     stage(
         PHASES[6],
         "Completed" if available else "Failed",
@@ -973,6 +1101,8 @@ def execute(folder, config):
         production.atomic(folder / "stage.json", state)
 
     stage(PHASES[0], "Running")
+    if config.get("mode") == "sync-nodes":
+        return _execute_sync_nodes(folder, config, api, idle, stage, report_fn)
     if config.get("packaged"):
         if config.get("packageKind") == "bootstrap" or (isinstance(config.get("manifest"), dict) and config["manifest"].get("entrypoint")):
             return _execute_bootstrap(folder, config, api, idle, stage, report_fn, metrics_fn=metrics_fn)

@@ -1,4 +1,5 @@
 """Comprehensive local tests for Workflow Packages (.zip), strict preflight, non-MiniMax portability, and readiness."""
+import copy
 import hashlib
 import io
 import json
@@ -909,7 +910,8 @@ class CompatibilityAndReadinessTests(unittest.TestCase):
             with patch.object(remote, "root_path", return_value=root), \
                  patch.object(remote, "probe_environment", return_value=dict(fake_env)), \
                  patch.object(remote, "_supervisor_has_comfyui", return_value=False), \
-                 patch.object(remote, "_stream_bootstrap_command", side_effect=fake_stream):
+                 patch.object(remote, "_stream_bootstrap_command", side_effect=fake_stream), \
+                 patch.object(remote.workflow_comfy_manager.ComfyManagerClient, "version", return_value=None):
                 rc = remote._execute_bootstrap(
                     folder, config, lambda _p: info_obj, lambda: None,
                     lambda name, st, msg="", c=None, t=None: stages.__setitem__(name, st),
@@ -922,6 +924,277 @@ class CompatibilityAndReadinessTests(unittest.TestCase):
             self.assertEqual(metrics["filesCompleted"], 3)
             self.assertEqual(stages[remote.PHASES[6]], "Completed")
             self.assertTrue(reports[-1]["environmentFingerprint"])
+
+    def test_post_install_comfy_manager_sync_install_update_protect_and_restart(self):
+        import workflow_comfy_manager as wcm
+
+        graph = {
+            "1": {"class_type": "DenoMiniMaxH3ReferenceToVideo", "inputs": {}},
+            "2": {"class_type": "PathchSageAttentionKJ", "inputs": {}},
+            "3": {"class_type": "MissingCustomNodeX", "inputs": {}},
+            "4": {"class_type": "SolAttnMiniMax", "inputs": {}},
+            "5": {"class_type": "BadGpuDepNode", "inputs": {}},
+        }
+        node_specs = [
+            {"name": "comfyui-deno-custom-nodes", "repo": "Deno2026/comfyui-deno-custom-nodes", "revision": "v0.7.91"},
+            {"name": "ComfyUI-KJNodes", "repo": "kijai/ComfyUI-KJNodes", "revision": ""},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "ComfyUI"
+            (root / "custom_nodes" / "sol_attn_minimax_pr117").mkdir(parents=True)
+            (root / "models" / "vae").mkdir(parents=True)
+            model_file = root / "models" / "vae" / "kept.safetensors"
+            model_file.write_bytes(b"MODEL_DATA_PRESERVED")
+
+            events = []
+            installed_packs = {
+                "comfyui-deno-custom-nodes": {"ver": "0.7.91", "enabled": True},
+                "comfyui-kjnodes": {"ver": "1.4.0", "enabled": True},
+                "sol_attn_minimax_pr117": {"ver": "unknown", "enabled": True},
+                "bad-gpu-pack": {"ver": "1.0.0", "enabled": True},
+                "unrelated-pack": {"ver": "1.0.0", "enabled": True},
+            }
+            packs = {
+                "comfyui-deno-custom-nodes": {
+                    "id": "comfyui-deno-custom-nodes", "title": "Deno Nodes",
+                    "repository": "https://github.com/Deno2026/comfyui-deno-custom-nodes",
+                    "state": "installed", "version": "0.8.0", "active_version": "0.7.91", "updatable": True,
+                },
+                "comfyui-kjnodes": {
+                    "id": "comfyui-kjnodes", "title": "ComfyUI-KJNodes",
+                    "repository": "https://github.com/kijai/ComfyUI-KJNodes",
+                    "state": "installed", "version": "1.5.0", "active_version": "1.4.0", "updatable": True,
+                },
+                "missing-pack-x": {
+                    "id": "missing-pack-x", "title": "Missing Pack X",
+                    "repository": "https://github.com/example/missing-pack-x",
+                    "state": "not-installed", "version": "2.0.0", "files": ["https://github.com/example/missing-pack-x"],
+                },
+                "sol_attn_minimax_pr117": {
+                    "id": "sol_attn_minimax_pr117", "title": "sol_attn_minimax_pr117",
+                    "repository": "", "state": "installed", "version": "1.1.0", "active_version": "1.0.0", "updatable": True,
+                },
+                "bad-gpu-pack": {
+                    "id": "bad-gpu-pack", "title": "Bad GPU Pack",
+                    "repository": "https://github.com/example/bad-gpu-pack",
+                    "state": "installed", "version": "2.0.0", "active_version": "1.0.0", "updatable": True,
+                    "pip": ["torch==2.3.0"],
+                },
+                "unrelated-pack": {
+                    "id": "unrelated-pack", "title": "Unrelated Pack",
+                    "repository": "https://github.com/example/unrelated",
+                    "state": "installed", "version": "9.0.0", "active_version": "1.0.0", "updatable": True,
+                },
+            }
+            mappings = {
+                "comfyui-deno-custom-nodes": [["DenoMiniMaxH3ReferenceToVideo"], {}],
+                "comfyui-kjnodes": [["PathchSageAttentionKJ"], {}],
+                "missing-pack-x": [["MissingCustomNodeX"], {}],
+                "sol_attn_minimax_pr117": [["SolAttnMiniMax"], {}],
+                "bad-gpu-pack": [["BadGpuDepNode"], {}],
+                "unrelated-pack": [["SomeUnrelatedNode"], {}],
+            }
+
+            state_box = {"queue_polls": 0, "pending_op": None, "restarted": False}
+
+            def fake_request(method, path, payload, timeout, expect_json):
+                events.append((method, path, payload))
+                if path == "/manager/version":
+                    return 200, "V3.32"
+                if path.startswith("/customnode/getmappings"):
+                    return 200, mappings
+                if path.startswith("/customnode/getlist"):
+                    return 200, {"channel": "default", "node_packs": copy.deepcopy(packs)}
+                if path == "/customnode/installed":
+                    return 200, dict(installed_packs)
+                if path == "/customnode/import_fail_info":
+                    return 400, ""
+                if path == "/manager/queue/install":
+                    self.assertNotEqual(payload.get("id"), "unrelated-pack")
+                    state_box["pending_op"] = ("install", payload["id"])
+                    return 200, ""
+                if path == "/manager/queue/update":
+                    self.assertEqual(payload["id"], "comfyui-kjnodes")
+                    state_box["pending_op"] = ("update", payload["id"])
+                    return 200, ""
+                if path == "/manager/queue/start":
+                    state_box["queue_polls"] = 1
+                    return 200, ""
+                if path == "/manager/queue/status":
+                    if state_box["queue_polls"] > 0:
+                        state_box["queue_polls"] -= 1
+                        return 200, {"total_count": 1, "done_count": 0, "in_progress_count": 1, "is_processing": True}
+                    if state_box["pending_op"]:
+                        op, pid = state_box["pending_op"]
+                        state_box["pending_op"] = None
+                        if op == "install":
+                            packs[pid]["state"] = "installed"
+                            installed_packs[pid] = {"ver": packs[pid]["version"], "enabled": True}
+                        elif op == "update":
+                            packs[pid]["active_version"] = packs[pid]["version"]
+                            packs[pid]["updatable"] = False
+                            installed_packs[pid]["ver"] = packs[pid]["version"]
+                    return 200, {"total_count": 1, "done_count": 1, "in_progress_count": 0, "is_processing": False}
+                raise AssertionError(f"Unexpected ComfyUI-Manager endpoint: {method} {path}")
+
+            def fake_api(path):
+                if path == "/object_info":
+                    base = {
+                        "DenoMiniMaxH3ReferenceToVideo": {},
+                        "PathchSageAttentionKJ": {},
+                        "SolAttnMiniMax": {},
+                        "BadGpuDepNode": {},
+                    }
+                    if state_box["restarted"] and packs["missing-pack-x"]["state"] == "installed":
+                        base["MissingCustomNodeX"] = {}
+                    return base
+                raise AssertionError(f"Unexpected ComfyUI API path: {path}")
+
+            def fake_restart():
+                # Restart MUST NEVER run while queue is still processing
+                self.assertEqual(state_box["queue_polls"], 0)
+                self.assertIsNone(state_box["pending_op"])
+                events.append(("RESTART", "comfyui", None))
+                state_box["restarted"] = True
+
+            client = wcm.ComfyManagerClient("http://127.0.0.1:8188", request_fn=fake_request)
+            stages = {}
+            sync = wcm.run_post_install_sync(
+                root=root, graph=graph, api=fake_api, port=8188,
+                manifest={}, node_specs=node_specs,
+                stage=lambda name, st, msg="", c=None, t=None: stages.__setitem__(name, (st, msg)),
+                restart_fn=fake_restart, client=client, poll_interval=0.0,
+            )
+
+            self.assertEqual(sync["finalStatus"], "passed")
+            self.assertEqual(sync["installedNodepacks"], ["Missing Pack X"])
+            self.assertEqual(sync["updatedNodepacks"], ["ComfyUI-KJNodes"])
+            skipped_names = {s["name"] for s in sync["skippedProtected"]}
+            self.assertIn("sol_attn_minimax_pr117", skipped_names)
+            self.assertIn("Deno Nodes", skipped_names)
+            self.assertIn("Bad GPU Pack", skipped_names)
+            self.assertTrue(sync["restarted"])
+            self.assertEqual(sync["remainingMissingClasses"], [])
+            # Verify forbidden endpoints were NEVER called
+            called_paths = [p for _, p, _ in events]
+            self.assertNotIn("/manager/queue/update_all", called_paths)
+            self.assertNotIn("/manager/queue/uninstall", called_paths)
+            self.assertNotIn("/manager/queue/disable", called_paths)
+            self.assertNotIn("/manager/queue/reinstall", called_paths)
+            # Restart occurred strictly AFTER install and update finished
+            restart_idx = called_paths.index("comfyui")
+            self.assertGreater(restart_idx, called_paths.index("/manager/queue/install"))
+            self.assertGreater(restart_idx, called_paths.index("/manager/queue/update"))
+            # Downloaded model preserved untouched
+            self.assertEqual(model_file.read_bytes(), b"MODEL_DATA_PRESERVED")
+
+            # Idempotency check: repeated execution performs ZERO installs, ZERO updates, ZERO restarts
+            events.clear()
+            sync2 = wcm.run_post_install_sync(
+                root=root, graph=graph, api=fake_api, port=8188,
+                manifest={}, node_specs=node_specs,
+                restart_fn=lambda: (_ for _ in ()).throw(AssertionError("Redundant restart on idempotent run")),
+                client=client, poll_interval=0.0,
+            )
+            self.assertEqual(sync2["finalStatus"], "passed")
+            self.assertEqual(sync2["installedNodepacks"], [])
+            self.assertEqual(sync2["updatedNodepacks"], [])
+            self.assertFalse(sync2["restarted"])
+
+    def test_post_install_manager_failure_preserves_models_and_supports_independent_retry(self):
+        import workflow_comfy_manager as wcm
+
+        graph = {"1": {"class_type": "BrokenMissingNode", "inputs": {}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "ComfyUI"
+            root.mkdir()
+            (root / "main.py").write_text("", encoding="utf-8")
+            (root / "models" / "vae").mkdir(parents=True)
+            model_file = root / "models" / "vae" / "existing.safetensors"
+            model_file.write_bytes(b"KEEP_ME")
+
+            def failing_request(method, path, payload, timeout, expect_json):
+                if path == "/manager/version":
+                    return 200, "V3.32"
+                if path.startswith("/customnode/getmappings"):
+                    return 200, {"broken-pack": [["BrokenMissingNode"], {}]}
+                if path.startswith("/customnode/getlist"):
+                    return 200, {"channel": "default", "node_packs": {
+                        "broken-pack": {"id": "broken-pack", "title": "Broken Pack", "state": "not-installed", "version": "1.0.0"}
+                    }}
+                if path == "/customnode/installed":
+                    return 200, {}
+                if path == "/manager/queue/status":
+                    return 200, {"total_count": 0, "done_count": 0, "in_progress_count": 0, "is_processing": False}
+                if path == "/manager/queue/install":
+                    return 500, "git clone failed: network error"
+                if path == "/customnode/import_fail_info":
+                    return 400, ""
+                raise AssertionError(f"Unexpected endpoint: {path}")
+
+            client = wcm.ComfyManagerClient("http://127.0.0.1:8188", request_fn=failing_request)
+            sync = wcm.run_post_install_sync(
+                root=root, graph=graph, api=lambda _p: {}, port=8188,
+                restart_fn=lambda: (_ for _ in ()).throw(AssertionError("Must not restart on failed install")),
+                client=client, poll_interval=0.0,
+            )
+            self.assertEqual(sync["finalStatus"], "failed")
+            self.assertFalse(sync["restarted"])
+            self.assertEqual(len(sync["errors"]), 1)
+            self.assertEqual(sync["errors"][0]["nodepack"], "Broken Pack")
+            self.assertIn("git clone failed", sync["errors"][0]["error"])
+            # Models preserved, no package reinstall triggered
+            self.assertEqual(model_file.read_bytes(), b"KEEP_ME")
+
+        # Verify WorkflowManager ships workflow_comfy_manager.py and exposes independent sync-nodes mode
+        self.assertIn("workflow_comfy_manager.py", workflow_manager.FILES)
+        wm_js = (ROOT / "workflow-manager-ui.js").read_text("utf-8")
+        self.assertIn("managerSyncHtml", wm_js)
+        self.assertIn('data-wm="sync-nodes"', wm_js)
+        self.assertIn("ComfyUI-Manager sync", wm_js)
+
+        # Verify post-install sync does NOT run when package install.sh itself fails
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "ComfyUI"
+            root.mkdir()
+            (root / "main.py").write_text("", encoding="utf-8")
+            (root / "custom_nodes").mkdir()
+            (root / "models").mkdir()
+            folder = Path(tmp) / "failed-run"
+            folder.mkdir()
+            buf = io.BytesIO()
+            wf_api = {"1": {"class_type": "VHS_VideoCombine", "inputs": {"format": "video/h264-mp4", "frame_rate": 24, "prompt": ""}}}
+            manifest = {
+                "schema_version": 1, "package_id": "fail-pkg", "version": "1.0.0",
+                "entrypoint": "install.sh", "workflow_api": "workflow_api.json",
+                "inputs": {"prompt": {"node": "1", "field": "prompt"}},
+                "fixedSeconds": 5, "output_node": "1",
+            }
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("manifest.json", json.dumps(manifest))
+                zf.writestr("workflow_api.json", json.dumps(wf_api))
+                zf.writestr("install.sh", "#!/usr/bin/env bash\nexit 1\n")
+            (folder / "package.zip").write_bytes(buf.getvalue())
+            fake_env = {
+                "comfyuiRoot": str(root), "comfyuiRevision": "a" * 40, "comfyuiGitClean": True,
+                "pythonVersion": "3.12.0", "torchVersion": "2.10.0+cu130", "cudaVersion": "13.0",
+                "gpuName": "NVIDIA", "gpuArch": "12.0", "vramGb": 32.0,
+                "diskFreeBytes": 200 * 10**9, "environmentFingerprint": "f" * 64,
+            }
+            config = {"packaged": True, "packageKind": "bootstrap", "mode": "install", "port": 8188,
+                      "manifest": manifest, "graph": wf_api, "nodes": [], "models": []}
+            with patch.object(remote, "root_path", return_value=root), \
+                 patch.object(remote, "probe_environment", return_value=dict(fake_env)), \
+                 patch.object(remote, "_supervisor_has_comfyui", return_value=False), \
+                 patch.object(remote, "_stream_bootstrap_command", return_value=1), \
+                 patch.object(remote, "_run_post_install_manager_sync") as sync_mock:
+                rc = remote._execute_bootstrap(
+                    folder, config, lambda _p: {}, lambda: None,
+                    lambda *_a, **_k: None, lambda *_a, **_k: None,
+                )
+            self.assertEqual(rc, 1)
+            sync_mock.assert_not_called()
 
 
 @unittest.skipUnless(
