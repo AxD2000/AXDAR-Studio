@@ -248,6 +248,21 @@ def build_shot_worker_overrides(wf, settings, detected, *, eid, shot, take_numbe
     return meta
 
 
+_UNCERTAIN_ERROR_PATTERNS = (
+    ("reconciliation_required", re.compile(
+        r"original\s+prompt\s+is\s+unresolved|"
+        r"submission\s+acknowledgement\s+missing|"
+        r"prior\s+submission\s+belongs\s+to\s+another\s+server|"
+        r"invalid\s+comfyui\s+acknowledgement|"
+        r"recorded\s+prompt\s+id\s+could\s+not\s+be\s+checked|"
+        r"comfyui\s+no\s+longer\s+lists\s+this\s+ticket|"
+        r"prompt\s+has\s+no\s+completed\s+execution\s+history|"
+        r"reconcile\s+(?:it|before\s+retrying|the\s+saved\s+shot)",
+        re.I,
+    ),
+     "Execution state is uncertain; reconcile the original prompt on the same instance before resubmitting."),
+)
+
 _SYSTEM_ERROR_PATTERNS = (
     ("cuda_oom", re.compile(r"cuda\s+out\s+of\s+memory|outofmemoryerror|cublas_status_alloc_failed|hip\s+out\s+of\s+memory", re.I),
      "GPU ran out of VRAM (CUDA OOM). Lower Resolution / Megapixels or duration before resuming."),
@@ -259,8 +274,6 @@ _SYSTEM_ERROR_PATTERNS = (
      "Remote ComfyUI environment does not match the verified Workflow Package."),
     ("workflow_integrity", re.compile(r"strict\s+workflow\s+integrity\s+violation|worker\s+override\s+references\s+missing|cannot\s+overwrite\s+wired\s+link", re.I),
      "Workflow graph integrity guard blocked an invalid node binding."),
-    ("comfy_restarted", re.compile(r"comfyui\s+no\s+longer\s+lists\s+this\s+ticket|prompt\s+has\s+no\s+completed\s+execution\s+history", re.I),
-     "ComfyUI restarted or cleared its queue/history while the prompt was in flight."),
 )
 
 _CONNECTION_ERROR_PATTERNS = (
@@ -270,7 +283,7 @@ _CONNECTION_ERROR_PATTERNS = (
 
 
 def classify_error(message, *, history=None, comfy_log="", remote_log=""):
-    """Classify an execution error into system_wide, connection, or shot_specific without auto-mutating code/models."""
+    """Classify an execution error into uncertain, system_wide, connection, or shot_specific without auto-mutating code/models."""
     parts = [str(message or "")]
     if isinstance(history, dict):
         for name, meta in (history.get("status") or {}).get("messages", []):
@@ -281,6 +294,17 @@ def classify_error(message, *, history=None, comfy_log="", remote_log=""):
     combined = "\n".join(p for p in parts if p).strip()
     evidence_pool = "\n".join(x for x in (combined, str(comfy_log or "")[-2000:], str(remote_log or "")[-1000:]) if x)
 
+    for code, pattern, summary in _UNCERTAIN_ERROR_PATTERNS:
+        m = pattern.search(combined)
+        if m:
+            return {
+                "category": "uncertain",
+                "code": code,
+                "summary": summary,
+                "shouldHalt": True,
+                "allowRetry": False,
+                "evidence": redact(combined or m.group(0))[:500],
+            }
     for code, pattern, summary in _SYSTEM_ERROR_PATTERNS:
         m = pattern.search(evidence_pool)
         if m:
@@ -289,6 +313,7 @@ def classify_error(message, *, history=None, comfy_log="", remote_log=""):
                 "code": code,
                 "summary": summary,
                 "shouldHalt": True,
+                "allowRetry": False,
                 "evidence": redact(combined or m.group(0))[:500],
             }
     for code, pattern, summary in _CONNECTION_ERROR_PATTERNS:
@@ -299,6 +324,7 @@ def classify_error(message, *, history=None, comfy_log="", remote_log=""):
                 "code": code,
                 "summary": summary,
                 "shouldHalt": False,
+                "allowRetry": False,
                 "evidence": redact(combined)[:500],
             }
     return {
@@ -306,6 +332,7 @@ def classify_error(message, *, history=None, comfy_log="", remote_log=""):
         "code": "shot_error",
         "summary": redact(combined)[:300] or "Shot execution failed.",
         "shouldHalt": False,
+        "allowRetry": True,
         "evidence": redact(combined)[:500],
     }
 

@@ -422,12 +422,16 @@ class DirectSession:
                         cls=worker_runtime.classify_error(err_job.get("error",""),history=err_hist)
                         log_event("error", f"Shot {shot.get('shot_code') or shot['id']} failed [{cls['category']}/{cls['code']}]: {cls['summary']}")
                         if cls["shouldHalt"]:
-                            view["failed"]+=1
+                            if cls["category"] != "uncertain":
+                                view["failed"]+=1
                             view["errorClassification"]=cls
                             view.update(phase="Needs attention",error=f"[{cls['code']}] {cls['summary']}")
                             self.save()
                             return
-                        if shot_retry_count<max_retries and err_job.get("status")=="error" and not production.pending_prompt(err_job, err_path.parent):
+                        if (shot_retry_count<max_retries and cls.get("allowRetry") is True
+                                and cls["category"]=="shot_specific"
+                                and err_job.get("status")=="error"
+                                and not production.pending_prompt(err_job, err_path.parent)):
                             shot_retry_count+=1
                             log_event("info", f"Auto-retrying shot {shot.get('shot_code') or shot['id']} (retry {shot_retry_count}/{max_retries}) as new Take.")
                             result=production.render(render_ctx,url,deadline,eid,shot,wf,2,lambda:None,retry_failed=True,force_new=True)

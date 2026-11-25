@@ -772,5 +772,76 @@ class RcaFix1ConnectionProbeToleranceTests(unittest.TestCase):
             self.assertTrue(any("did not answer 6 consecutive checks" in line for line in conn3.recent_logs()))
 
 
+class RcaFix2UncertainClassificationTests(unittest.TestCase):
+    def test_unresolved_and_reconciliation_errors_classify_as_uncertain_never_shot_specific(self):
+        samples = [
+            "The original prompt is unresolved. Resume on the same instance to reconcile it.",
+            "Submission acknowledgement missing. Inspect the original ComfyUI queue/history before retrying.",
+            "Prior submission belongs to another server; reconcile it before generating again.",
+            "ComfyUI no longer lists this ticket in its queue or history; verify before resubmitting.",
+            "Invalid ComfyUI acknowledgement; reconcile before retrying.",
+        ]
+        for msg in samples:
+            cls = worker_runtime.classify_error(msg)
+            self.assertEqual(cls["category"], "uncertain", msg)
+            self.assertEqual(cls["code"], "reconciliation_required", msg)
+            self.assertTrue(cls["shouldHalt"], msg)
+            self.assertFalse(cls["allowRetry"], msg)
+
+    def test_uncertain_prompt_halts_without_resubmitting_even_when_auto_retry_enabled(self):
+        import threading
+        from types import SimpleNamespace
+        import direct_session
+        import workflow_profiles as wprof
+        import worker_config
+
+        eid = str(uuid.uuid4())
+        wf = {"version": "a" * 64, "name": "Fix", "output": "141", "graph": {"141": {"class_type": "Output", "inputs": {}}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "production").mkdir()
+            cfg = worker_config.WorkerConfigStore(root / "production" / "ws.json", root / "overrides")
+            cfg.update({"autoRetry": True, "maxRetries": 3})
+            logs = worker_runtime.WorkerLogStore(root / "production" / "worker.log")
+            shots = [
+                [eid, {"id": str(uuid.uuid4()), "revision": "r1", "seconds": 2, "prompt": "One", "shot_code": "EP01S01"}],
+                [eid, {"id": str(uuid.uuid4()), "revision": "r2", "seconds": 2, "prompt": "Two", "shot_code": "EP01S02"}],
+            ]
+            prompt_submits = []
+
+            def api_lost_ack(_url, path, obj=None):
+                if path == "/object_info":
+                    return {"Output": {}}
+                if path == "/prompt":
+                    prompt_submits.append(obj)
+                    raise ConnectionError("lost ack")
+                if path == "/queue":
+                    return {"queue_running": [], "queue_pending": []}
+                return {}
+
+            ctx = {
+                "DATA": root, "LOCK": threading.RLock(), "json_api": api_lost_ack,
+                "prepare_shot": lambda _u, _f, _e, s, _w, _r: {"id": s["id"], "141": {"inputs": {}}},
+                "download_output": lambda _u, _f, _h, _j: None,
+                "prompt": lambda s: s["prompt"],
+                "take_quality": SimpleNamespace(check=lambda _p, _j: {"technical": "passed"}),
+                "worker_config": cfg, "worker_logs": logs, "running": True,
+            }
+            session = direct_session.DirectSession(ctx)
+            view = {"end": time.time() + 600, "episode": eid, "submitted": 2, "phase": "Preparing ComfyUI", "completed": 0, "failed": 0}
+            session.start(view, shots, wf, None, "http://fx", worker_settings=cfg.get())
+            with patch.object(direct_session, "runtime_requirements", return_value={"graph": wf["graph"]}), \
+                 patch.object(wprof, "timing", return_value={"playback_seconds": 2}), \
+                 patch.object(production.time, "sleep"):
+                session.run("http://fx", wf)
+
+            # Strictly 1 submission attempt — NEVER resubmits and NEVER advances to shot 2!
+            self.assertEqual(len(prompt_submits), 1)
+            self.assertEqual(view["phase"], "Needs attention")
+            self.assertEqual(view["errorClassification"]["category"], "uncertain")
+            self.assertEqual(view["errorClassification"]["code"], "reconciliation_required")
+            self.assertFalse(view["errorClassification"]["allowRetry"])
+
+
 if __name__ == "__main__":
     unittest.main()

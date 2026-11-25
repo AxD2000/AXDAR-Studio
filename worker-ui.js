@@ -68,7 +68,7 @@ function workerControlsHtml(){
         (session.pauseReason?'<p class="status">'+esc(session.pauseReason)+'</p>':'')+
         (session.exportDestination?'<p class="status">Exported '+esc(session.exportedCount||0)+' take(s) to: <code>'+esc(session.exportDestination)+'</code></p>':'')+
         (session.error?'<p class="danger">'+esc(localize(session.error))+'</p>':'')+
-        (session.errorClassification?'<p class="danger"><strong>['+esc(session.errorClassification.category)+']</strong> '+esc(session.errorClassification.summary||'')+'</p>':'')+
+        (session.errorClassification?'<p class="'+(session.errorClassification.category==='uncertain'?'status':'danger')+'"><strong>['+esc(String(session.errorClassification.category||'').toUpperCase())+' · '+esc(session.errorClassification.code||'')+']</strong> '+esc(session.errorClassification.summary||'')+'</p>':'')+
         '<div class="row">'+
         '<label class="wk-inline">Run Limit <select id="wkRunLimit">'+
         option('0','All Approved',String(runLimit))+
@@ -237,8 +237,11 @@ function renderWorkerLogsModal(){
     }
     if(clsBox){
         const cls = data.classification;
+        const suffix = cls?.category==='uncertain'
+            ? ' (Reconciliation Required — Do Not Resubmit Blindly)'
+            : (cls?.shouldHalt ? ' (Production Halted)' : '');
         clsBox.innerHTML = cls
-            ? '<p class="'+(cls.category==='system_wide'?'danger':'status')+'"><strong>['+esc(String(cls.category||'').toUpperCase())+' · '+esc(cls.code||'')+']</strong> '+esc(cls.summary||'')+(cls.shouldHalt?' (Production Halted)':'')+'</p>'
+            ? '<p class="'+(cls.category==='system_wide'?'danger':'status')+'"><strong>['+esc(String(cls.category||'').toUpperCase())+' · '+esc(cls.code||'')+']</strong> '+esc(cls.summary||'')+suffix+'</p>'
             : '<p class="muted">No active error classification.</p>';
     }
     if(pre){
