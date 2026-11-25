@@ -146,12 +146,15 @@ class StudioActions:
         view["ready"] = not view["blockers"]
         return view
 
-    def approved_jobs(self, db, ep):
+    def approved_jobs(self, db, ep, include_skipped=False):
         self.check(db, {})
+        story.assign_shot_codes(db, ep)
         assets = self.ctx["active_assets"](db)
         jobs, skipped = [], {}
         for shot in ep["shots"]:
             if not shot.get("approved"):
+                continue
+            if shot.get("skipped") and not include_skipped:
                 continue
             view = self.preview(db, ep, shot, assets, graph=False)
             if shot.get("workflow_version") != view.get("workflow_version"):
@@ -229,6 +232,11 @@ class StudioActions:
             shot = shots[0]
             shot["scene_id"] = scene["id"]
             ep["shots"].append(shot)
+            story.assign_shot_codes(db, ep)
+        elif path == "/shots/select-take":
+            story.select_take(db, ep["id"], obj["shot"], obj.get("takeId") or obj.get("take_id") or "")
+        elif path == "/shots/skip":
+            story.set_shot_skipped(db, ep["id"], obj["shot"], bool(obj.get("skipped", True)))
         elif path == "/shots/preview":
             shot = find_id(ep["shots"], obj["shot"], "Shot")
             return self.preview(db, ep, shot, assets, graph=obj.get("graph") is not False)

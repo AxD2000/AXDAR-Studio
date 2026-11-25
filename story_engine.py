@@ -66,25 +66,137 @@ def _take_id(project_id, episode, shot, version):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "/".join(("axdar-take", project_id, episode, shot, version))))
 
 
+def episode_number(db, episode):
+    explicit = episode.get("episode_number")
+    if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit > 0:
+        return explicit
+    title = str(episode.get("title") or "")
+    match = re.search(r"\b(?:EP|Episode|الحلقة)\s*#?\s*(\d+)\b", title, re.I)
+    if match:
+        num = int(match.group(1))
+        if num > 0:
+            return num
+    episodes = db.get("episodes", [])
+    try:
+        return episodes.index(episode) + 1
+    except ValueError:
+        return len(episodes) + 1
+
+
+def format_shot_code(ep_num, shot_num):
+    return f"EP{int(ep_num):02d}S{int(shot_num):02d}"
+
+
+def assign_shot_codes(db, episode):
+    """Assign stable human-readable shot_code (e.g. EP01S04) without altering existing codes on reorder."""
+    changed = False
+    ep_num = episode_number(db, episode)
+    if episode.get("episode_number") != ep_num:
+        episode["episode_number"] = ep_num
+        changed = True
+    used_nums = []
+    for s in episode.get("shots", []):
+        code = s.get("shot_code")
+        if isinstance(code, str):
+            m = re.search(r"S(\d+)$", code)
+            if m:
+                used_nums.append(int(m.group(1)))
+    next_num = max([int(episode.get("next_shot_number") or 1), *(n + 1 for n in used_nums)])
+    used_codes = {s.get("shot_code") for s in episode.get("shots", []) if s.get("shot_code")}
+    for s in episode.get("shots", []):
+        if not s.get("shot_code"):
+            candidate = format_shot_code(ep_num, next_num)
+            while candidate in used_codes:
+                next_num += 1
+                candidate = format_shot_code(ep_num, next_num)
+            s["shot_code"] = candidate
+            used_codes.add(candidate)
+            next_num += 1
+            changed = True
+        if "selected_take_id" not in s:
+            s["selected_take_id"] = ""
+            changed = True
+        if "skipped" not in s:
+            s["skipped"] = False
+            changed = True
+    if episode.get("next_shot_number") != next_num:
+        episode["next_shot_number"] = next_num
+        changed = True
+    return changed
+
+
+def select_take(db, episode_id, shot_id, take_id):
+    episode = next((e for e in db.get("episodes", []) if e["id"] == episode_id), None)
+    if not episode:
+        raise ValueError("Episode not found.")
+    shot = _find_shot(episode, shot_id)
+    if take_id:
+        takes = shot.get("takes", [])
+        if not any(t.get("id") == take_id for t in takes):
+            raise ValueError("Selected take was not found for this shot.")
+    shot["selected_take_id"] = str(take_id or "")
+    return shot
+
+
+def set_shot_skipped(db, episode_id, shot_id, skipped):
+    episode = next((e for e in db.get("episodes", []) if e["id"] == episode_id), None)
+    if not episode:
+        raise ValueError("Episode not found.")
+    shot = _find_shot(episode, shot_id)
+    shot["skipped"] = bool(skipped)
+    return shot
+
+
 def sync_takes(db, data_dir):
     if _version(db) < SCHEMA_VERSION:
         return False
-    shots = {(e["id"], s["id"]): s for e in db["episodes"] for s in e["shots"]}
     changed = False
+    for ep in db.get("episodes", []):
+        if assign_shot_codes(db, ep):
+            changed = True
+    shots = {(e["id"], s["id"]): s for e in db["episodes"] for s in e["shots"]}
     orphaned = db.get("archived_takes", [])
     for eid, sid, version in _records(data_dir):
         shot = shots.get((eid, sid))
         entries = shot.setdefault("takes", []) if shot is not None else orphaned
-        if any(entry.get("version")==version and entry.get("shot_id")==sid and entry.get("episode_id")==eid for entry in entries):
-            continue
-        file=Path(data_dir)/eid/sid/version/"job.json"
+        existing = next((entry for entry in entries if entry.get("version") == version and entry.get("shot_id") == sid and entry.get("episode_id") == eid), None)
+        file = Path(data_dir) / eid / sid / version / "job.json"
         try:
-            recorded=json.loads(file.read_bytes()).get("take_id")
-        except (OSError,ValueError,AttributeError):
-            recorded=None
-        take_id=recorded or _take_id(db["id"], eid, sid, version)
-        entries.append({"id": take_id, "episode_id": eid, "shot_id": sid, "version": version,
-                        "job": "/".join((eid, sid, version, "job.json"))})
+            job_data = json.loads(file.read_bytes())
+            if not isinstance(job_data, dict):
+                job_data = {}
+        except (OSError, ValueError, AttributeError):
+            job_data = {}
+        shot_code = (shot.get("shot_code") if shot else "") or job_data.get("shot_code") or ""
+        if existing is not None:
+            if "take_number" not in existing:
+                used = {e.get("take_number") for e in entries if isinstance(e.get("take_number"), int)}
+                tnum = job_data.get("take_number")
+                if not isinstance(tnum, int) or tnum <= 0 or tnum in used:
+                    tnum = max(used, default=0) + 1
+                existing["take_number"] = tnum
+                changed = True
+            if shot_code and not existing.get("display_filename"):
+                existing["display_filename"] = f"{shot_code}_T{existing['take_number']:02d}.mp4"
+                changed = True
+            continue
+        recorded = job_data.get("take_id")
+        take_id = recorded or _take_id(db["id"], eid, sid, version)
+        used = {e.get("take_number") for e in entries if isinstance(e.get("take_number"), int)}
+        tnum = job_data.get("take_number")
+        if not isinstance(tnum, int) or tnum <= 0 or tnum in used:
+            tnum = max(used, default=0) + 1
+        entry = {
+            "id": take_id,
+            "episode_id": eid,
+            "shot_id": sid,
+            "version": version,
+            "take_number": tnum,
+            "job": "/".join((eid, sid, version, "job.json")),
+        }
+        if shot_code:
+            entry["display_filename"] = f"{shot_code}_T{tnum:02d}.mp4"
+        entries.append(entry)
         changed = True
     if orphaned:
         db["archived_takes"] = orphaned
@@ -635,6 +747,7 @@ def apply_story(db, episode_id, proposal, assets=()):
         raise ValueError("The breakdown must contain at least one shot.")
     episode.setdefault("scenes", []).extend(scene_rows)
     episode["shots"].extend(shots)
+    assign_shot_codes(db, episode)
     episode.setdefault("story_imports", []).append({"id": uid(), "original": source,
                                                    "filename": str(proposal.get("filename") or ""),
                                                    "scene_ids":[s["id"] for s in scene_rows]})
@@ -979,6 +1092,9 @@ def split_shot(db, episode, shot_id, assets, limits=None):
     if not pieces:
         raise ValueError("No source-based split is available. Edit the duration or add narrative cut points.")
     index = episode["shots"].index(shot)
-    pieces[0].update(id=shot["id"],takes=deepcopy(shot.get("takes",[])))
+    pieces[0].update(id=shot["id"], takes=deepcopy(shot.get("takes", [])))
+    if shot.get("shot_code"):
+        pieces[0]["shot_code"] = shot["shot_code"]
     episode["shots"][index:index+1] = pieces
+    assign_shot_codes(db, episode)
     return pieces

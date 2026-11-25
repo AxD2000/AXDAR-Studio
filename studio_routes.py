@@ -4,11 +4,12 @@ import re
 import threading
 import time
 import uuid
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import production
 import story_engine
 import vast_credentials
+import worker_runtime
 from workflow_install_remote import redact
 
 STATIC_ASSETS = {
@@ -52,19 +53,8 @@ def handle_get(handler, app):
 def _get_status(handler, app):
     if app.workspace_started.is_set():
         app.workflow_manager.watch()
-    result = []
-    for p in sorted(app.DATA.glob("*/*/*/job.json")):
-        j = json.loads(p.read_text("utf-8"))
-        relative = p.parent.relative_to(app.DATA).as_posix()
-        video = (p.parent / "video.mp4").exists()
-        result.append(dict(
-            episode=p.parents[2].name, id=j["shot"], version=p.parent.name, status=j["status"],
-            error=redact(j.get("error", "")), revision=j["revision"], takeId=j.get("take_id"),
-            promptId=j.get("ticket"), started=j.get("started"), workflowVersion=j.get("workflow_version"),
-            duration=j.get("duration"), quality=j.get("quality"), renderSeconds=j.get("renderSeconds"),
-            video="/video/" + relative if video else "",
-            artifactPending=bool(j.get("artifact_pending")),
-        ))
+    cache = getattr(app, "status_cache", None)
+    result = cache.list_results(app.DATA) if cache is not None else worker_runtime.StatusIndexCache(app.DATA).list_results()
     return handler.send(dict(
         running=app.running,
         session=app.session,
@@ -79,11 +69,19 @@ def _get_status(handler, app):
 
 def _get_media(handler, app, route):
     p = app.files_snapshot().get(route[7:]) if route.startswith("/asset/") else None
+    download_name = None
     if re.fullmatch(r"/video/[a-f0-9-]+/[a-f0-9-]+/\d+", route):
         _, eid, sid, version = route[1:].split("/")
         p = app.DATA / eid / sid / version / "video.mp4"
+        query = parse_qs(urlsplit(handler.path).query)
+        if query.get("download"):
+            try:
+                db = app.project()
+            except Exception:
+                db = None
+            download_name = worker_runtime.take_download_name(app.DATA, eid, sid, version, db=db)
     if p and p.is_file():
-        return handler.send_file(p)
+        return handler.send_file(p, download=download_name)
     return handler.send({}, status=404)
 
 

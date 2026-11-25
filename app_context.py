@@ -15,6 +15,7 @@ import vast_connection
 import vast_credentials
 import vast_ssh_ops
 import workflow_profiles
+import worker_runtime
 from direct_session import DirectSession
 from studio_actions import StudioActions
 from workflow_manager import WorkflowManager
@@ -84,6 +85,7 @@ class AppContainer:
             identity_fn=vast_credentials.identity,
         )
         self.direct_session = DirectSession(self)
+        self.status_cache = worker_runtime.StatusIndexCache(self.DATA)
 
     # Dict-style compatibility adapter for subsystems using ctx["..."]
     def __getitem__(self, key):

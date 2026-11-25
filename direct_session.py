@@ -131,7 +131,7 @@ class DirectSession:
             ep=next((e for e in db["episodes"] if e["id"]==request.get("episode")),None)
             if not ep:
                 raise ValueError("Episode not found.")
-            jobs,skipped=ctx["actions"].approved_jobs(db,ep)
+            jobs,skipped=ctx["actions"].approved_jobs(db,ep,include_skipped=True)
             chosen=[row for row in jobs if row[1]["id"]==shot_id]
             if not chosen:
                 reason=next(iter(skipped.get(shot_id) or ()),"Approve this shot before regenerating.")

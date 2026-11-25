@@ -160,13 +160,26 @@ def render(ctx, url, deadline, eid, shot, wf, retries, notify, retry_failed=Fals
     else:
         versions = []
     if not versions:
+        all_existing = sorted(root.glob("*/job.json"))
+        existing_nums = []
+        for ep_job in all_existing:
+            try:
+                rec = read(ep_job, {})
+                if isinstance(rec, dict) and isinstance(rec.get("take_number"), int) and rec["take_number"] > 0:
+                    existing_nums.append(rec["take_number"])
+            except (OSError, ValueError):
+                pass
+        take_number = max(existing_nums, default=len(all_existing)) + 1
+        shot_code = str(shot.get("shot_code") or "").strip()
+        display_filename = f"{shot_code}_T{take_number:02d}.mp4" if shot_code else f"take_{take_number:02d}.mp4"
         folder = root/str(time.time_ns())
         folder.mkdir()
         path = folder/"job.json"
         j = dict(shot=shot["id"], revision=shot["revision"], url=url, status="preparing",
                  prompt=shot.get("frozenPrompt") or ctx["prompt"](shot), settings=shot, workflow=wf["name"],
                  output_node=wf["output"], marker=uuid.uuid4().hex,
-                 take_id=str(uuid.uuid4()), started=time.time(), resolution=shot.get("resolution"))
+                 take_id=str(uuid.uuid4()), take_number=take_number, shot_code=shot_code,
+                 display_filename=display_filename, started=time.time(), resolution=shot.get("resolution"))
         if wf.get("version"):
             from workflow_profiles import timing
             j.update(workflow_version=wf["version"], workflow_profile=wf, scene_id=shot.get("scene_id"),
