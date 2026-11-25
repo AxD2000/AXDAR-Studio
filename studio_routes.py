@@ -285,6 +285,11 @@ def _post_worker(handler, app, obj):
             return handler.send({"ok": True, "override": {}})
     if action == "logs":
         return handler.send(worker_runtime.collect_three_logs(app, include_remote_ssh=bool(obj.get("includeRemote"))))
+    if action == "export-downloads":
+        eid = obj.get("episode")
+        if not valid_id(eid):
+            raise ValueError("Select a valid episode to export.")
+        return handler.send(app.export_downloads(eid, all_takes=bool(obj.get("allTakes"))))
     if action == "start":
         return _post_production(handler, app, obj)
     raise ValueError("Unknown Worker action.")

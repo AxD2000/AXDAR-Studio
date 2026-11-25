@@ -66,6 +66,7 @@ function workerControlsHtml(){
         (state.running&&session.requestedAction?' ('+esc(session.requestedAction)+'…)':'')+'</p>'+
         (state.workflowError?'<p class="danger">'+esc(state.workflowError)+'</p>':'')+
         (session.pauseReason?'<p class="status">'+esc(session.pauseReason)+'</p>':'')+
+        (session.exportDestination?'<p class="status">Exported '+esc(session.exportedCount||0)+' take(s) to: <code>'+esc(session.exportDestination)+'</code></p>':'')+
         (session.error?'<p class="danger">'+esc(localize(session.error))+'</p>':'')+
         (session.errorClassification?'<p class="danger"><strong>['+esc(session.errorClassification.category)+']</strong> '+esc(session.errorClassification.summary||'')+'</p>':'')+
         '<div class="row">'+

@@ -198,6 +198,12 @@ class AppContainer:
     def download_output(self, url, folder, history, record):
         return comfy_client.download_output(url, folder, history, record, remote_fn=self.remote)
 
+    def export_downloads(self, episode_id, *, all_takes=False, downloads_root=None):
+        return worker_runtime.export_episode_to_downloads(
+            self.DATA, self.project(), episode_id,
+            downloads_root=downloads_root, all_takes=all_takes,
+        )
+
     def run_direct(self, url, wf, target):
         self.running = True
         threading.Thread(target=self.direct_session.run, args=(url, wf, target), daemon=True).start()

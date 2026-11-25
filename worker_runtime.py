@@ -1,7 +1,9 @@
 """Worker orchestration runtime: status index cache, canonical shot states, and take naming."""
 import json
+import os
 import re
 import secrets
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -506,4 +508,106 @@ def compute_financial_summary(connection_snapshot, session, results, settings=No
         "estimatedRemainingCost": round(est_remaining_cost, 4) if est_remaining_cost is not None else None,
         "estimatedTotalCost": round(est_total_cost, 4) if est_total_cost is not None else None,
         "isEstimate": True,
+    }
+
+
+def safe_folder_name(title, fallback="AXDAR_Episode"):
+    """Sanitize a project or episode title into a safe Windows/POSIX folder name."""
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(title or "")).strip(" .")
+    cleaned = cleaned[:80].strip(" .")
+    if not cleaned:
+        return fallback
+    if re.match(r"^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)", cleaned, re.I):
+        cleaned = "_" + cleaned
+    return cleaned
+
+
+def _link_or_copy(src, dst):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def export_episode_to_downloads(data_dir, db, episode_id, *, downloads_root=None, all_takes=False):
+    """Assemble completed verified takes with EP01S04_T01.mp4 names into Downloads and emit Take Delivery manifest."""
+    import production
+    import story_engine
+
+    root = Path(data_dir)
+    ep = next((e for e in (db or {}).get("episodes", []) if e.get("id") == episode_id), None)
+    if not ep:
+        raise ValueError("Episode not found.")
+    story_engine.assign_shot_codes(db, ep)
+
+    dl_base = Path(downloads_root) if downloads_root is not None else (Path.home() / "Downloads")
+    dest = dl_base / "AXDAR_Exports" / safe_folder_name(ep.get("title"), f"EP{ep.get('episode_number', 1):02d}")
+    dest.mkdir(parents=True, exist_ok=True)
+
+    exported_items = []
+    for idx, shot in enumerate(ep.get("shots", []), 1):
+        sid = shot["id"]
+        shot_code = shot.get("shot_code") or story_engine.format_shot_code(ep.get("episode_number", 1), idx)
+        shot_dir = root / episode_id / sid
+        if not shot_dir.is_dir():
+            continue
+        completed = []
+        for pos, job_path in enumerate(sorted(shot_dir.glob("*/job.json")), 1):
+            video_path = job_path.parent / "video.mp4"
+            if not video_path.is_file():
+                continue
+            job = production.read(job_path, {})
+            if not isinstance(job, dict) or job.get("status") != "done":
+                continue
+            tnum = job.get("take_number") if isinstance(job.get("take_number"), int) and job["take_number"] > 0 else pos
+            fname = job.get("display_filename") or display_filename_for_take(shot_code, tnum)
+            completed.append({
+                "shotId": sid,
+                "shotCode": shot_code,
+                "takeId": job.get("take_id") or "",
+                "takeNumber": tnum,
+                "version": job_path.parent.name,
+                "filename": fname,
+                "sourceVideo": video_path,
+                "duration": job.get("duration"),
+                "seed": job.get("seed"),
+            })
+        if not completed:
+            continue
+        selected_id = shot.get("selected_take_id") or ""
+        preferred = next((c for c in completed if selected_id and c["takeId"] == selected_id), completed[-1])
+        chosen_list = completed if all_takes else [preferred]
+        for item in chosen_list:
+            target = dest / item["filename"]
+            _link_or_copy(item["sourceVideo"], target)
+            exported_items.append({
+                "shotId": item["shotId"],
+                "shotCode": item["shotCode"],
+                "takeId": item["takeId"],
+                "takeNumber": item["takeNumber"],
+                "filename": item["filename"],
+                "exportedPath": str(target),
+                "sourceVideo": str(item["sourceVideo"]),
+                "duration": item["duration"],
+                "seed": item["seed"],
+                "selected": item is preferred,
+            })
+
+    manifest = {
+        "schemaVersion": 1,
+        "episodeId": episode_id,
+        "episodeTitle": ep.get("title") or "",
+        "exportedAt": time.time(),
+        "exportedCount": len(exported_items),
+        "items": exported_items,
+    }
+    production.atomic(dest / "manifest.json", manifest)
+    return {
+        "ok": True,
+        "destination": str(dest),
+        "exportedCount": len(exported_items),
+        "items": exported_items,
     }

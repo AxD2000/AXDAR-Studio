@@ -477,6 +477,16 @@ class DirectSession:
                 view["phase"]="Stopped"
             else:
                 view["phase"]="Finished" if not view["failed"] else "Needs attention"
+            if view["phase"]=="Finished" and self._live_worker_settings().get("autoExportDownloads",True):
+                exporter=ctx.get("export_downloads")
+                if callable(exporter):
+                    try:
+                        exp=exporter(view["episode"])
+                        view["exportDestination"]=exp.get("destination","")
+                        view["exportedCount"]=exp.get("exportedCount",0)
+                        log_event("info", f"Auto-exported {view['exportedCount']} take(s) to {view['exportDestination']}")
+                    except Exception as exp_exc:
+                        log_event("error", f"Auto-export to Downloads failed: {redact(str(exp_exc))[:300]}")
             log_event("info", f"Session ended with phase={view['phase']} (completed={view['completed']}, failed={view['failed']}).")
         except Exception as exc:
             import worker_runtime

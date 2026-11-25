@@ -525,5 +525,169 @@ class Phase5FinancialMonitorTests(unittest.TestCase):
             self.assertEqual(snap["uptime"], 22.0)
 
 
+class Phase6DownloadsDeliveryAndEndToEndTests(unittest.TestCase):
+    def test_downloads_export_respects_selected_take_all_takes_and_safe_folder_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "episodes"
+            dl = root / "Downloads"
+            db = se.new_project()
+            ep = se.new_episode('Episode 1: <Storm>? "Cut"')
+            db["episodes"] = [ep]
+            s1_id = str(uuid.uuid4())
+            ep["shots"] = [{"id": s1_id, "shot_code": "EP01S04", "selected_take_id": "t-one", "takes": []}]
+
+            for ts, tid, tnum, payload in (("100", "t-one", 1, b"take1-mp4"), ("200", "t-two", 2, b"take2-mp4")):
+                f = data / ep["id"] / s1_id / ts
+                f.mkdir(parents=True)
+                (f / "video.mp4").write_bytes(payload)
+                (f / "job.json").write_text(json.dumps({
+                    "shot": s1_id, "revision": "r1", "status": "done",
+                    "take_id": tid, "take_number": tnum, "shot_code": "EP01S04",
+                    "display_filename": f"EP01S04_T{tnum:02d}.mp4", "duration": 5.0, "seed": 100 + tnum,
+                }), "utf-8")
+
+            # Default export delivers selected take (T01)
+            res = worker_runtime.export_episode_to_downloads(data, db, ep["id"], downloads_root=dl)
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["exportedCount"], 1)
+            dest = Path(res["destination"])
+            self.assertTrue((dest / "EP01S04_T01.mp4").is_file())
+            self.assertEqual((dest / "EP01S04_T01.mp4").read_bytes(), b"take1-mp4")
+            manifest = json.loads((dest / "manifest.json").read_text("utf-8"))
+            self.assertEqual(manifest["items"][0]["filename"], "EP01S04_T01.mp4")
+            self.assertTrue(manifest["items"][0]["selected"])
+
+            # all_takes=True delivers both T01 and T02 without removing anything
+            res_all = worker_runtime.export_episode_to_downloads(data, db, ep["id"], downloads_root=dl, all_takes=True)
+            self.assertEqual(res_all["exportedCount"], 2)
+            self.assertTrue((dest / "EP01S04_T02.mp4").is_file())
+            self.assertEqual((dest / "EP01S04_T02.mp4").read_bytes(), b"take2-mp4")
+
+    def test_end_to_end_minimax_h3_worker_pipeline_without_vast_spend(self):
+        import threading
+        from types import SimpleNamespace
+        import comfy_client
+        import direct_session
+        import workflow_profiles as wprof
+        import worker_config
+
+        pkg_path = Path(__file__).resolve().parent / "packages" / "MiniMax_H3.zip"
+        raw_zip = pkg_path.read_bytes()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "episodes"
+            (data / "production").mkdir(parents=True)
+            dl = root / "Downloads"
+            lib = root / "library"
+            lib.mkdir()
+            for fname, blob in (("tom.png", b"TOM-PNG"), ("emma.png", b"EMMA-PNG"), ("jack.png", b"JACK-PNG")):
+                (lib / fname).write_bytes(blob)
+
+            store = wprof.WorkflowStore(root / "profiles")
+            wf = store.import_package(pkg_path.name, raw_zip)
+            cfg = worker_config.WorkerConfigStore(data / "production" / "worker-settings.json", root / "overrides")
+            cfg.update({
+                "seedMode": "random",
+                "resolutionPreset": "720p",
+                "aspectRatio": "16:9",
+                "autoExportDownloads": True,
+                "continuousExecution": True,
+            })
+            logs = worker_runtime.WorkerLogStore(data / "production" / "worker.log")
+
+            db = se.new_project()
+            ep = se.new_episode("Episode 1: Pilot")
+            db["episodes"] = [ep]
+            s1 = {"id": str(uuid.uuid4()), "revision": "rev1", "scene_id": "sc1", "shot_code": "EP01S01",
+                  "seconds": 5, "prompt": "Tom and Emma talk.", "change": "", "image": "tom.png", "refs": ["emma.png"],
+                  "approved": True, "skipped": False, "takes": [], "selected_take_id": ""}
+            s2 = {"id": str(uuid.uuid4()), "revision": "rev2", "scene_id": "sc1", "shot_code": "EP01S02",
+                  "seconds": 5, "prompt": "Tom walks alone.", "change": "", "image": "tom.png", "refs": [],
+                  "approved": True, "skipped": False, "takes": [], "selected_take_id": ""}
+            ep["shots"] = [s1, s2]
+
+            uploaded_names = set()
+            upload_count = {"n": 0}
+            submitted_graphs = []
+            obj_info = {
+                "ResolutionSelector": {
+                    "input": {"required": {"aspect_ratio": [["9:16 (Portrait Widescreen)", "16:9 (Landscape Widescreen)"]], "megapixels": ["FLOAT"], "multiple": ["INT"]}}
+                },
+                "MinimaxH3LatentUpscaler3D": {"input": {"required": {}}},
+            }
+
+            def fake_upload(_url, _asset, name):
+                if name not in uploaded_names:
+                    uploaded_names.add(name)
+                    upload_count["n"] += 1
+                return name
+
+            def fake_api(_url, path, obj=None):
+                if path == "/object_info":
+                    return {n["class_type"]: obj_info.get(n["class_type"], {}) for n in wf["graph"].values()}
+                if path.startswith("/object_info/"):
+                    kind = path.split("/object_info/", 1)[1]
+                    return {kind: obj_info.get(kind, {})}
+                if path == "/prompt":
+                    submitted_graphs.append(obj["prompt"])
+                    return {"prompt_id": f"ticket-{len(submitted_graphs)}"}
+                if path == "/queue":
+                    return {"queue_running": [], "queue_pending": []}
+                if path == "/internal/logs/raw":
+                    return {"entries": [{"t": "2026-11-25T10:00:00", "m": "Ready"}]}
+                if path.startswith("/history/"):
+                    t = path.rsplit("/", 1)[-1]
+                    return {t: {"status": {"status_str": "success", "completed": True}, "outputs": {"141": {"gifs": [{"filename": "out.mp4"}]}}}}
+                raise AssertionError(f"Unexpected path {path}")
+
+            asset_map = {p.name: p for p in lib.iterdir()}
+            ctx = {
+                "DATA": data, "LOCK": threading.RLock(), "json_api": fake_api,
+                "prompt": comfy_client.prompt,
+                "generation_images": comfy_client.generation_images,
+                "generation_voices": comfy_client.generation_voices,
+                "prepare_shot": lambda u, f, e, s, w, r: comfy_client.prepare_shot(
+                    u, f, e, s, w, r, asset_map=asset_map, upload_fn=fake_upload, json_api_fn=fake_api
+                ),
+                "download_output": lambda _u, f, _h, j: (f / "video.part").write_bytes(movie(j["playback_seconds"], True)),
+                "take_quality": SimpleNamespace(check=lambda _p, _j: {"technical": "passed", "width": 1280, "height": 704, "frames": 124, "audioStreams": 1}),
+                "worker_config": cfg,
+                "worker_logs": logs,
+                "export_downloads": lambda eid: worker_runtime.export_episode_to_downloads(data, db, eid, downloads_root=dl),
+                "running": True,
+            }
+            session = direct_session.DirectSession(ctx)
+            jobs = [[ep["id"], s1], [ep["id"], s2]]
+            view = {"end": time.time() + 600, "episode": ep["id"], "submitted": 2, "phase": "Preparing ComfyUI", "completed": 0, "failed": 0}
+            session.start(view, jobs, wf, None, "http://fixture", worker_settings=cfg.get())
+            session.plan["sampleVerified"] = True  # Skip first-shot log gate (tested separately in test_workflow_manager)
+            with patch.object(production.time, "sleep"):
+                session.run("http://fixture", wf)
+
+            self.assertEqual(view["phase"], "Finished")
+            self.assertEqual(view["completed"], 2)
+            # Deduplicated uploads: tom.png uploaded ONCE (reused in shot 2), emma.png ONCE, jack.png NEVER uploaded!
+            self.assertEqual(upload_count["n"], 2)
+            # Both graphs applied 16:9 aspect ratio, distinct random seeds, unique filename_prefix, and skipped unused refs!
+            self.assertEqual(len(submitted_graphs), 2)
+            self.assertEqual(submitted_graphs[0]["200"]["inputs"]["aspect_ratio"], "16:9 (Landscape Widescreen)")
+            self.assertEqual(submitted_graphs[0]["141"]["inputs"]["filename_prefix"], f"AXDAR/{ep['id']}/EP01S01_T01")
+            self.assertEqual(submitted_graphs[1]["141"]["inputs"]["filename_prefix"], f"AXDAR/{ep['id']}/EP01S02_T01")
+            self.assertNotEqual(submitted_graphs[0]["63"]["inputs"]["noise_seed"], submitted_graphs[1]["63"]["inputs"]["noise_seed"])
+            # Shot 1 had 2 ref images (Tom, Emma); Shot 2 had only 1 ref image (Tom)
+            s1_refs = [k for k in submitted_graphs[0]["56"]["inputs"] if k.startswith("ref_images.")]
+            s2_refs = [k for k in submitted_graphs[1]["56"]["inputs"] if k.startswith("ref_images.")]
+            self.assertEqual(len(s1_refs), 2)
+            self.assertEqual(len(s2_refs), 1)
+            # Auto-export delivered both organized MP4s + manifest into Downloads
+            dest = Path(view["exportDestination"])
+            self.assertEqual(view["exportedCount"], 2)
+            self.assertTrue((dest / "EP01S01_T01.mp4").is_file())
+            self.assertTrue((dest / "EP01S02_T01.mp4").is_file())
+            self.assertTrue((dest / "manifest.json").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()
