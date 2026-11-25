@@ -276,6 +276,8 @@ def _post_worker(handler, app, obj):
                 raise ValueError("Select a valid Workflow Package first.")
             app.worker_config.clear_mapping_override(wf["version"])
             return handler.send({"ok": True, "override": {}})
+    if action == "logs":
+        return handler.send(worker_runtime.collect_three_logs(app, include_remote_ssh=bool(obj.get("includeRemote"))))
     if action == "start":
         return _post_production(handler, app, obj)
     raise ValueError("Unknown Worker action.")

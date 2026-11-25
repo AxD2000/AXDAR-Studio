@@ -310,6 +310,12 @@ class DirectSession:
             render_ctx["cancel_prompt"]=cancel_prompt
             jobs=self.plan["jobs"]
             run_executed=0
+            consecutive_failures=0
+            wlogs=ctx.get("worker_logs")
+            def log_event(level, msg):
+                if wlogs is not None:
+                    wlogs.record(level, msg)
+            log_event("info", f"Session started: {len(jobs)} shot(s), workflow={wf.get('name','')}")
             # An already-submitted attempt must be reconciled before dependency
             # validation. Reconnecting only changes the tunnel, not its owner.
             for i in range(self.plan["index"],len(jobs)):
@@ -405,9 +411,52 @@ class DirectSession:
                 if self.plan.pop("skip_current",False):
                     view.pop("requestedAction",None)
                 if result=="error":
-                    view["failed"]+=1
+                    import worker_runtime
+                    live_cfg=self._live_worker_settings()
+                    max_retries=int(live_cfg.get("maxRetries") or 0) if live_cfg.get("autoRetry") else 0
+                    shot_retry_count=0
+                    while result=="error":
+                        err_path=next(iter(sorted((ctx["DATA"]/eid/shot["id"]).glob("*/job.json"),reverse=True)),None)
+                        err_job=production.read(err_path,{}) if err_path else {}
+                        err_hist=production.read(err_path.parent/"history.json",{}) if err_path else {}
+                        cls=worker_runtime.classify_error(err_job.get("error",""),history=err_hist)
+                        log_event("error", f"Shot {shot.get('shot_code') or shot['id']} failed [{cls['category']}/{cls['code']}]: {cls['summary']}")
+                        if cls["shouldHalt"]:
+                            view["failed"]+=1
+                            view["errorClassification"]=cls
+                            view.update(phase="Needs attention",error=f"[{cls['code']}] {cls['summary']}")
+                            self.save()
+                            return
+                        if shot_retry_count<max_retries and err_job.get("status")=="error" and not production.pending_prompt(err_job, err_path.parent):
+                            shot_retry_count+=1
+                            log_event("info", f"Auto-retrying shot {shot.get('shot_code') or shot['id']} (retry {shot_retry_count}/{max_retries}) as new Take.")
+                            result=production.render(render_ctx,url,deadline,eid,shot,wf,2,lambda:None,retry_failed=True,force_new=True)
+                            if result in ("waiting","uncertain"):
+                                raise RuntimeError("The original prompt is unresolved. Resume on the same instance to reconcile it.")
+                            continue
+                        break
+                    if result=="error":
+                        view["failed"]+=1
+                        consecutive_failures+=1
+                        breaker=int(live_cfg.get("consecutiveFailureLimit") or 2)
+                        if consecutive_failures>=breaker and i+1<len(jobs):
+                            cls={
+                                "category":"system_wide",
+                                "code":"consecutive_failures",
+                                "summary":f"Production halted after {consecutive_failures} consecutive shot failures.",
+                                "shouldHalt":True,
+                                "evidence":err_job.get("error","")[:400],
+                            }
+                            view["errorClassification"]=cls
+                            log_event("error", cls["summary"])
+                            self.plan["index"]=i+1
+                            view.update(phase="Needs attention",error=cls["summary"])
+                            self.save()
+                            return
                 if result=="done":
                     view["completed"]+=1
+                    consecutive_failures=0
+                    log_event("info", f"Shot {shot.get('shot_code') or shot['id']} completed.")
                 self.plan["index"]=i+1
                 run_executed+=1
                 self.save()
@@ -421,13 +470,20 @@ class DirectSession:
                     view["pauseReason"]=(
                         f"Paused after {run_executed} shot(s) (Step / Test Run limit). Click Resume to continue."
                     )
+                    log_event("info", view["pauseReason"])
                     self.save()
                     return
             if self.plan["control"]=="stop":
                 view["phase"]="Stopped"
             else:
                 view["phase"]="Finished" if not view["failed"] else "Needs attention"
+            log_event("info", f"Session ended with phase={view['phase']} (completed={view['completed']}, failed={view['failed']}).")
         except Exception as exc:
+            import worker_runtime
+            cls=worker_runtime.classify_error(str(exc))
+            view["errorClassification"]=cls
+            if ctx.get("worker_logs") is not None:
+                ctx["worker_logs"].record("error", f"Session exception [{cls['category']}/{cls['code']}]: {redact(str(exc))[:300]}")
             view.update(phase="Needs attention",error=redact(str(exc))[:900])
         finally:
             with ctx["LOCK"]:

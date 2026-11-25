@@ -346,5 +346,132 @@ class Phase3NodeDetectionAndOverridesTests(unittest.TestCase):
         self.assertEqual(qc["technical"], "passed")
 
 
+class Phase4ErrorClassifierAndLogsTests(unittest.TestCase):
+    def test_error_classifier_distinguishes_system_wide_connection_and_shot_errors(self):
+        oom = worker_runtime.classify_error("RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB")
+        self.assertEqual((oom["category"], oom["code"], oom["shouldHalt"]), ("system_wide", "cuda_oom", True))
+
+        missing_model = worker_runtime.classify_error("FileNotFoundError: model.safetensors not found")
+        self.assertEqual((missing_model["category"], missing_model["code"], missing_model["shouldHalt"]), ("system_wide", "missing_model", True))
+
+        conn = worker_runtime.classify_error("SSH tunnel ended during the session.")
+        self.assertEqual((conn["category"], conn["shouldHalt"]), ("connection", False))
+
+        shot = worker_runtime.classify_error("Invalid MP4 or unexpected duration 1.00s (expected 5s)")
+        self.assertEqual((shot["category"], shot["shouldHalt"]), ("shot_specific", False))
+
+    def test_system_wide_error_halts_immediately_while_shot_error_retries_with_new_take(self):
+        import threading
+        from types import SimpleNamespace
+        import direct_session
+        import workflow_profiles as wprof
+        import worker_config
+
+        eid = str(uuid.uuid4())
+        wf = {"version": "a" * 64, "name": "Fix", "output": "141", "graph": {"141": {"class_type": "Output", "inputs": {}}}}
+
+        # Part A: System-Wide error on shot 1 MUST halt immediately without submitting shot 2
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "production").mkdir()
+            cfg = worker_config.WorkerConfigStore(root / "production" / "ws.json", root / "overrides")
+            logs = worker_runtime.WorkerLogStore(root / "production" / "worker.log")
+            shots = [
+                [eid, {"id": str(uuid.uuid4()), "revision": "r1", "seconds": 2, "prompt": "One", "shot_code": "EP01S01"}],
+                [eid, {"id": str(uuid.uuid4()), "revision": "r2", "seconds": 2, "prompt": "Two", "shot_code": "EP01S02"}],
+            ]
+            submitted = []
+
+            def api_oom(url, path, obj=None):
+                if path == "/object_info":
+                    return {"Output": {}}
+                if path == "/prompt":
+                    submitted.append(obj["prompt"]["id"])
+                    return {"prompt_id": "t1"}
+                if path == "/history/t1":
+                    return {"t1": {"status": {"status_str": "error", "messages": [
+                        ["execution_error", {"node_type": "KSampler", "exception_message": "CUDA out of memory"}]
+                    ]}}}
+                return {"queue_running": [], "queue_pending": []}
+
+            ctx = {
+                "DATA": root, "LOCK": threading.RLock(), "json_api": api_oom,
+                "prepare_shot": lambda _u, _f, _e, s, _w, _r: {"id": s["id"], "141": {"inputs": {}}},
+                "download_output": lambda _u, f, _h, _j: None,
+                "prompt": lambda s: s["prompt"],
+                "take_quality": SimpleNamespace(check=lambda _p, _j: {"technical": "passed"}),
+                "worker_config": cfg, "worker_logs": logs, "running": True,
+            }
+            session = direct_session.DirectSession(ctx)
+            view = {"end": time.time() + 600, "episode": eid, "submitted": 2, "phase": "Preparing ComfyUI", "completed": 0, "failed": 0}
+            session.start(view, shots, wf, None, "http://fx", worker_settings=cfg.get())
+            with patch.object(direct_session, "runtime_requirements", return_value={"graph": wf["graph"]}), \
+                 patch.object(wprof, "timing", return_value={"playback_seconds": 2}), \
+                 patch.object(production.time, "sleep"):
+                session.run("http://fx", wf)
+            self.assertEqual(len(submitted), 1)  # Shot 2 NEVER submitted!
+            self.assertEqual(view["phase"], "Needs attention")
+            self.assertEqual(view["errorClassification"]["code"], "cuda_oom")
+            self.assertTrue(any("cuda_oom" in line for line in logs.tail()))
+
+        # Part B: Shot-specific error retries automatically as Take 2 when autoRetry=True, then succeeds
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "production").mkdir()
+            cfg = worker_config.WorkerConfigStore(root / "production" / "ws.json", root / "overrides")
+            cfg.update({"autoRetry": True, "maxRetries": 1})
+            logs = worker_runtime.WorkerLogStore(root / "production" / "worker.log")
+            s1 = str(uuid.uuid4())
+            shots = [[eid, {"id": s1, "revision": "r1", "seconds": 2, "prompt": "One", "shot_code": "EP01S01"}]]
+            attempt_n = {"n": 0}
+
+            def api_retry(url, path, obj=None):
+                if path == "/object_info":
+                    return {"Output": {}}
+                if path == "/prompt":
+                    attempt_n["n"] += 1
+                    return {"prompt_id": f"t{attempt_n['n']}"}
+                if path == "/history/t1":
+                    return {"t1": {"status": {"status_str": "error", "messages": [
+                        ["execution_error", {"node_type": "Render", "exception_message": "Transient single-shot render glitch"}]
+                    ]}}}
+                if path == "/history/t2":
+                    return {"t2": {"status": {"status_str": "success", "completed": True}, "outputs": {"141": {}}}}
+                return {"queue_running": [], "queue_pending": []}
+
+            ctx = {
+                "DATA": root, "LOCK": threading.RLock(), "json_api": api_retry,
+                "prepare_shot": lambda _u, _f, _e, s, _w, _r: {"id": s["id"], "141": {"inputs": {}}},
+                "download_output": lambda _u, f, _h, _j: (f / "video.part").write_bytes(movie(2, False)),
+                "prompt": lambda s: s["prompt"],
+                "take_quality": SimpleNamespace(check=lambda _p, _j: {"technical": "passed"}),
+                "worker_config": cfg, "worker_logs": logs, "running": True,
+            }
+            session = direct_session.DirectSession(ctx)
+            view = {"end": time.time() + 600, "episode": eid, "submitted": 1, "phase": "Preparing ComfyUI", "completed": 0, "failed": 0}
+            session.start(view, shots, wf, None, "http://fx", worker_settings=cfg.get())
+            with patch.object(direct_session, "runtime_requirements", return_value={"graph": wf["graph"]}), \
+                 patch.object(wprof, "timing", return_value={"playback_seconds": 2}), \
+                 patch.object(production.time, "sleep"):
+                session.run("http://fx", wf)
+            self.assertEqual(attempt_n["n"], 2)
+            self.assertEqual(view["completed"], 1)
+            self.assertEqual(view["phase"], "Finished")
+            takes = sorted((root / eid / s1).glob("*/job.json"))
+            self.assertEqual(len(takes), 2)
+            self.assertEqual(production.read(takes[1])["take_number"], 2)
+
+            # Verify 3-log aggregator returns comfyui, remote, and studio tabs cleanly
+            bundle = worker_runtime.collect_three_logs({
+                "worker_logs": logs,
+                "connection": SimpleNamespace(snapshot=lambda: {"url": "http://fx"}, recent_logs=lambda n=120: ["[12:00:00] Ready"]),
+                "json_api": lambda _u, _p: {"entries": [{"t": "12:00:01", "m": "Prompt executed"}]},
+                "session": view,
+            })
+            self.assertIn("Prompt executed", bundle["comfyui"])
+            self.assertIn("Ready", bundle["remote"])
+            self.assertIn("Auto-retrying shot EP01S01", bundle["studio"])
+
+
 if __name__ == "__main__":
     unittest.main()

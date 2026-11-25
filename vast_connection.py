@@ -103,6 +103,7 @@ class Connection:
         self.comfy_port = None
         self.state, self.error = 'Disconnected', ''
         self.indicators = dict(api='grey', ssh='grey', comfy='grey', gpu='grey')
+        self._event_log = []
         try:
             self.settings = json.loads(self.path.read_text('utf-8'))
         except (OSError, ValueError):
@@ -121,7 +122,18 @@ class Connection:
 
     def _state(self, state, error=''):
         with self.lock:
+            changed = (state != self.state or error != self.error)
             self.state, self.error = state, error
+            if changed:
+                stamp = time.strftime('%H:%M:%S')
+                line = f"[{stamp}] {state}" + (f" — {error}" if error else "")
+                self._event_log.append(line)
+                if len(self._event_log) > 120:
+                    self._event_log = self._event_log[-120:]
+
+    def recent_logs(self, limit=120):
+        with self.lock:
+            return list(self._event_log[-max(1, int(limit)):])
 
     def target(self):
         with self.lock:

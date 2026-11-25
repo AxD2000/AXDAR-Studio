@@ -225,6 +225,26 @@ function renderWorkerNodesBody(){
     if(el) el.innerHTML = workerNodesBodyHtml();
 }
 
+function renderWorkerLogsModal(){
+    const data = workerLogsData || {};
+    const clsBox = $('#workerLogsClassification');
+    const pre = $('#workerLogsPre');
+    for(const b of document.querySelectorAll('button[data-worker-log-tab]')){
+        b.classList.toggle('on', b.dataset.workerLogTab === workerLogsTab);
+    }
+    if(clsBox){
+        const cls = data.classification;
+        clsBox.innerHTML = cls
+            ? '<p class="'+(cls.category==='system_wide'?'danger':'status')+'"><strong>['+esc(String(cls.category||'').toUpperCase())+' · '+esc(cls.code||'')+']</strong> '+esc(cls.summary||'')+(cls.shouldHalt?' (Production Halted)':'')+'</p>'
+            : '<p class="muted">No active error classification.</p>';
+    }
+    if(pre){
+        const text = data[workerLogsTab] || 'No log lines available.';
+        pre.textContent = text;
+        pre.scrollTop = pre.scrollHeight;
+    }
+}
+
 function workerTakesHtml(){
     const canRegen = !state.running && state.connection?.state==='Ready' && Boolean(currentProfile()?.executable);
     if(!ep.shots.length) return '<section class="panel"><h2>Shots &amp; Takes</h2><p class="muted">Import a story and approve shots first.</p></section>';

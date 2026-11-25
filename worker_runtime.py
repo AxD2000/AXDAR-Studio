@@ -1,7 +1,9 @@
 """Worker orchestration runtime: status index cache, canonical shot states, and take naming."""
 import json
+import re
 import secrets
 import threading
+import time
 from pathlib import Path
 
 import worker_config
@@ -242,3 +244,167 @@ def build_shot_worker_overrides(wf, settings, detected, *, eid, shot, take_numbe
     if overrides:
         meta["worker_overrides"] = overrides
     return meta
+
+
+_SYSTEM_ERROR_PATTERNS = (
+    ("cuda_oom", re.compile(r"cuda\s+out\s+of\s+memory|outofmemoryerror|cublas_status_alloc_failed|hip\s+out\s+of\s+memory", re.I),
+     "GPU ran out of VRAM (CUDA OOM). Lower Resolution / Megapixels or duration before resuming."),
+    ("missing_model", re.compile(r"checkpoint\s+not\s+found|file\s*not\s*found.*(?:\.safetensors|\.ckpt|\.pt|\.pth|\.bin|\.gguf)|does\s+not\s+match\s+comfyui'?s\s+registered\s+choices|missing\s+workflow\s+dependencies|model\s+.*not\s+found", re.I),
+     "Required model weight is missing or not registered in ComfyUI."),
+    ("missing_node", re.compile(r"missing\s+package\s+node\s+classes|class_type.*does\s+not\s+exist|cannot\s+execute\s+because\s+a\s+node\s+is\s+missing|modulenotfounderror|importerror", re.I),
+     "Required ComfyUI custom node or Python dependency is missing on the server."),
+    ("environment_drift", re.compile(r"pre-production\s+environment\s+check\s+failed|fingerprint\s+changed|install\s+and\s+verify\s+this\s+workflow\s+package", re.I),
+     "Remote ComfyUI environment does not match the verified Workflow Package."),
+    ("workflow_integrity", re.compile(r"strict\s+workflow\s+integrity\s+violation|worker\s+override\s+references\s+missing|cannot\s+overwrite\s+wired\s+link", re.I),
+     "Workflow graph integrity guard blocked an invalid node binding."),
+    ("comfy_restarted", re.compile(r"comfyui\s+no\s+longer\s+lists\s+this\s+ticket|prompt\s+has\s+no\s+completed\s+execution\s+history", re.I),
+     "ComfyUI restarted or cleared its queue/history while the prompt was in flight."),
+)
+
+_CONNECTION_ERROR_PATTERNS = (
+    ("connection_lost", re.compile(r"connection\s+(?:lost|unavailable|reset|refused|closed)|timed\s+out|timeouterror|urlerror|ssh\s+tunnel|waiting\s+for\s+connection|reconnecting|http\s*(?:502|503|504)", re.I),
+     "Transient network or SSH tunnel interruption; reconcile before resubmitting."),
+)
+
+
+def classify_error(message, *, history=None, comfy_log="", remote_log=""):
+    """Classify an execution error into system_wide, connection, or shot_specific without auto-mutating code/models."""
+    parts = [str(message or "")]
+    if isinstance(history, dict):
+        for name, meta in (history.get("status") or {}).get("messages", []):
+            if name == "execution_error" and isinstance(meta, dict):
+                parts.append(str(meta.get("node_type") or ""))
+                parts.append(str(meta.get("exception_type") or ""))
+                parts.append(str(meta.get("exception_message") or ""))
+    combined = "\n".join(p for p in parts if p).strip()
+    evidence_pool = "\n".join(x for x in (combined, str(comfy_log or "")[-2000:], str(remote_log or "")[-1000:]) if x)
+
+    for code, pattern, summary in _SYSTEM_ERROR_PATTERNS:
+        m = pattern.search(evidence_pool)
+        if m:
+            return {
+                "category": "system_wide",
+                "code": code,
+                "summary": summary,
+                "shouldHalt": True,
+                "evidence": redact(combined or m.group(0))[:500],
+            }
+    for code, pattern, summary in _CONNECTION_ERROR_PATTERNS:
+        m = pattern.search(combined)
+        if m:
+            return {
+                "category": "connection",
+                "code": code,
+                "summary": summary,
+                "shouldHalt": False,
+                "evidence": redact(combined)[:500],
+            }
+    return {
+        "category": "shot_specific",
+        "code": "shot_error",
+        "summary": redact(combined)[:300] or "Shot execution failed.",
+        "shouldHalt": False,
+        "evidence": redact(combined)[:500],
+    }
+
+
+class WorkerLogStore:
+    """Thread-safe local AXDAR Studio / Worker event log with redacted persistence."""
+
+    def __init__(self, log_path=None, max_lines=400):
+        self.log_path = Path(log_path) if log_path else None
+        self.max_lines = max(50, int(max_lines))
+        self._lock = threading.RLock()
+        self._lines = []
+        if self.log_path and self.log_path.is_file():
+            try:
+                existing = self.log_path.read_text("utf-8", errors="replace").splitlines()
+                self._lines = existing[-self.max_lines:]
+            except OSError:
+                self._lines = []
+
+    def record(self, level, message):
+        clean = redact(str(message or "")).replace("\r", " ").strip()
+        if not clean:
+            return
+        line = f"[{time.strftime('%H:%M:%S')}] [{str(level).upper()}] {clean}"
+        with self._lock:
+            self._lines.append(line)
+            if len(self._lines) > self.max_lines:
+                self._lines = self._lines[-self.max_lines:]
+            if self.log_path is not None:
+                try:
+                    self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with self.log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(line + "\n")
+                except OSError:
+                    pass
+
+    def tail(self, limit=200):
+        with self._lock:
+            return list(self._lines[-max(1, int(limit)):])
+
+
+def collect_three_logs(ctx, *, include_remote_ssh=False):
+    """Aggregate ComfyUI Log, Remote Host (Vast/SSH) Log, and AXDAR Studio Log + latest error classification."""
+    comfy_lines = []
+    remote_lines = []
+    studio_lines = []
+
+    # 1) AXDAR Studio / Worker log
+    wlogs = ctx.get("worker_logs")
+    if wlogs is not None:
+        studio_lines = wlogs.tail(200)
+
+    # 2) ComfyUI log via existing /internal/logs/raw endpoint
+    conn = ctx.get("connection")
+    url = conn.snapshot().get("url") if conn is not None else None
+    if url:
+        try:
+            raw = ctx["json_api"](url, "/internal/logs/raw")
+            entries = raw.get("entries", []) if isinstance(raw, dict) else []
+            for row in entries[-200:]:
+                if isinstance(row, dict) and isinstance(row.get("m"), str):
+                    ts = str(row.get("t") or "")
+                    msg = redact(row["m"]).rstrip()
+                    if msg:
+                        comfy_lines.append(f"{ts} {msg}".strip())
+        except Exception as exc:
+            comfy_lines.append(f"[ComfyUI log unavailable: {redact(str(exc))}]")
+    else:
+        comfy_lines.append("[ComfyUI is not connected.]")
+
+    # 3) Remote Host (Vast/SSH) log — designed with provider field for future RunPod support
+    if conn is not None and hasattr(conn, "recent_logs"):
+        remote_lines.extend(conn.recent_logs(120))
+    if include_remote_ssh and conn is not None and ctx.get("ssh_ops") is not None:
+        try:
+            target = conn.ssh_target()
+            out = ctx["ssh_ops"].ssh(
+                target,
+                "supervisorctl status 2>/dev/null; echo '---'; tail -n 60 /var/log/portal/comfyui.log /workspace/comfyui.log 2>/dev/null || true",
+                timeout=10,
+            ).decode("utf-8", errors="replace")
+            for line in redact(out).splitlines()[-80:]:
+                if line.strip():
+                    remote_lines.append(line)
+        except Exception as exc:
+            remote_lines.append(f"[Remote SSH log check skipped: {redact(str(exc))}]")
+    if not remote_lines:
+        remote_lines.append("[No Vast/SSH events recorded yet.]")
+
+    session = ctx.get("session") or {}
+    classification = session.get("errorClassification")
+    if not classification and session.get("error"):
+        classification = classify_error(
+            session["error"],
+            comfy_log="\n".join(comfy_lines[-40:]),
+            remote_log="\n".join(remote_lines[-40:]),
+        )
+    return {
+        "provider": "vast",
+        "comfyui": "\n".join(comfy_lines),
+        "remote": "\n".join(remote_lines),
+        "studio": "\n".join(studio_lines),
+        "classification": classification,
+    }

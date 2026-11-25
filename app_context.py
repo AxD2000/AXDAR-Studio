@@ -89,6 +89,7 @@ class AppContainer:
             self.DATA / "production" / "worker-settings.json",
             self.BASE / "workflow-profiles" / "worker-mappings",
         )
+        self.worker_logs = worker_runtime.WorkerLogStore(self.DATA / "production" / "worker.log")
         self.direct_session = DirectSession(self)
         self.status_cache = worker_runtime.StatusIndexCache(self.DATA)
 
