@@ -1201,6 +1201,335 @@ class CompatibilityAndReadinessTests(unittest.TestCase):
             sync_mock.assert_not_called()
 
 
+class RcaFixAUnifiedFingerprintAndNodeResolutionTests(unittest.TestCase):
+    """RCA Fix A: Unified fingerprint across install/scan/sync-nodes/verify-env, CNR/case node discovery, ambiguity & timeout."""
+
+    def test_bootstrap_fingerprint_matches_across_install_scan_sync_and_verify_with_cnr_node_dirs(self):
+        import time
+        workflow_api = {
+            "119": {"class_type": "VAELoader", "inputs": {"vae_name": "video_vae.safetensors"}},
+            "141": {"class_type": "DenoMiniMaxH3ReferenceToVideo", "inputs": {"prompt": ""}},
+            "144": {"class_type": "VHS_VideoCombine", "inputs": {"frame_rate": 24, "format": "video/h264-mp4", "images": ["141", 0]}},
+            "184": {"class_type": "PathchSageAttentionKJ", "inputs": {}},
+            "186": {"class_type": "MinimaxH3LatentUpscaler3D", "inputs": {}},
+            "192": {"class_type": "SolAttnMiniMax", "inputs": {}},
+        }
+        manifest = {
+            "schema_version": 1,
+            "package_id": "minimax-speed-x6-v10",
+            "version": "0.1.0-rc4",
+            "entrypoint": "install.sh",
+            "workflow_api": "workflow_api.json",
+            "inputs": {"prompt": {"node": "141", "field": "prompt"}},
+            "fixedSeconds": 5,
+            "output_node": "144",
+        }
+        nodes_lock = [
+            {"name": "comfyui-deno-custom-nodes", "repo": "Deno2026/comfyui-deno-custom-nodes", "url": "https://github.com/Deno2026/comfyui-deno-custom-nodes.git", "revision": "d" * 40},
+            {"name": "ComfyUI-KJNodes", "repo": "kijai/ComfyUI-KJNodes", "url": "https://github.com/kijai/ComfyUI-KJNodes.git", "revision": "1" * 40},
+            {"name": "ComfyUI-VideoHelperSuite", "repo": "Kosinkadink/ComfyUI-VideoHelperSuite", "url": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git", "revision": "4" * 40},
+            {"name": "Comfyui_Minimax_h3_latent_Upscaler", "repo": "LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler", "url": "https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler.git", "revision": "5" * 40},
+        ]
+        models_lock = [
+            {"repo": "Comfy-Org/MiniMax-H3", "revision": "4b53a35", "remote": "vae/video_vae.safetensors", "local": "vae/video_vae.safetensors"},
+            {"repo": "Comfy-Org/MiniMax-H3", "revision": "4b53a35", "remote": "vae/audio_vae.safetensors", "local": "vae/audio_vae.safetensors"},
+        ]
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("manifest.json", json.dumps(manifest))
+            zf.writestr("workflow_api.json", json.dumps(workflow_api))
+            zf.writestr("nodes.lock.json", json.dumps([
+                {"name": n["name"], "url": n["url"], "ref": n["revision"]} for n in nodes_lock
+            ]))
+            zf.writestr("models.lock.json", json.dumps(models_lock))
+            zf.writestr("install.sh", "#!/usr/bin/env bash\nexit 0\n")
+        raw_zip = buf.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "ComfyUI"
+            (root / "main.py").parent.mkdir(parents=True)
+            (root / "main.py").write_text("# comfy", encoding="utf-8")
+            # Simulate Linux CNR custom node folder names (lowercase / stripped 'comfyui-' prefix) + 1 git clone
+            deno_dir = root / "custom_nodes" / "deno-custom-nodes"
+            deno_dir.mkdir(parents=True)
+            (deno_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS={}\n", encoding="utf-8")
+            (deno_dir / "pyproject.toml").write_text(
+                '[project]\nname = "deno-custom-nodes"\nversion = "0.8.2"\n'
+                '[project.urls]\nRepository = "https://github.com/Deno2026/comfyui-deno-custom-nodes"\n',
+                encoding="utf-8",
+            )
+            kj_dir = root / "custom_nodes" / "comfyui-kjnodes"
+            kj_dir.mkdir(parents=True)
+            (kj_dir / "pyproject.toml").write_text(
+                '[project]\nname = "comfyui-kjnodes"\nversion = "1.2.9"\n'
+                '[project.urls]\nRepository = "https://github.com/kijai/ComfyUI-KJNodes"\n',
+                encoding="utf-8",
+            )
+            vhs_dir = root / "custom_nodes" / "comfyui-videohelpersuite"
+            vhs_dir.mkdir(parents=True)
+            (vhs_dir / "pyproject.toml").write_text(
+                '[project]\nname = "comfyui-videohelpersuite"\nversion = "1.7.0"\n'
+                '[project.urls]\nRepository = "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"\n',
+                encoding="utf-8",
+            )
+            upscaler_dir = root / "custom_nodes" / "Comfyui_Minimax_h3_latent_Upscaler"
+            upscaler_dir.mkdir(parents=True)
+            (root / "custom_nodes" / "sol_attn_minimax_pr117").mkdir(parents=True)
+            (root / "models" / "vae").mkdir(parents=True)
+            (root / "models" / "vae" / "video_vae.safetensors").write_bytes(b"video-vae-bytes")
+            (root / "models" / "vae" / "audio_vae.safetensors").write_bytes(b"audio-vae-bytes")
+
+            base_fp = "fb7c04ad625adcf0e5a7e1c3c5bd7156b66ef16122ac54e38b68883bca75bc27"
+            fake_env = {
+                "comfyuiRoot": str(root), "comfyuiRevision": "a277b5bf" + "0" * 32, "comfyuiGitClean": True,
+                "pythonVersion": "3.12.16", "torchVersion": "2.10.0+cu130", "cudaVersion": "13.0",
+                "gpuName": "NVIDIA GeForce RTX 3090", "gpuArch": "8.6", "vramGb": 23.56,
+                "diskFreeBytes": 97 * 10**9, "environmentFingerprint": base_fp,
+            }
+            info_obj = {n["class_type"]: {"input": {"required": {}}} for n in workflow_api.values()}
+            recorded_timeouts = []
+
+            def fake_urlopen(url, timeout=10):
+                recorded_timeouts.append(timeout)
+                class Resp:
+                    def __init__(self, obj):
+                        self.b = json.dumps(obj).encode("utf-8")
+                    def __enter__(self):
+                        return io.BytesIO(self.b)
+                    def __exit__(self, *a):
+                        pass
+                if str(url).endswith("/queue"):
+                    return Resp({"queue_running": [], "queue_pending": []})
+                return Resp(info_obj)
+
+            def fake_git_head(p):
+                return "5" * 40 if Path(p) == upscaler_dir else None
+
+            base_spec = {
+                "packaged": True, "packageKind": "bootstrap", "port": 8188, "timeout": 60,
+                "manifest": manifest, "graph": workflow_api, "nodes": nodes_lock, "models": models_lock,
+            }
+
+            with patch.object(remote, "root_path", return_value=root), \
+                 patch.object(remote, "urlopen", side_effect=fake_urlopen), \
+                 patch.object(remote, "probe_environment", side_effect=lambda *a, **k: dict(fake_env)), \
+                 patch.object(provision, "git_head", side_effect=fake_git_head), \
+                 patch.object(remote, "_supervisor_has_comfyui", return_value=False), \
+                 patch.object(remote, "_stream_bootstrap_command", return_value=0), \
+                 patch.object(remote.workflow_comfy_manager.ComfyManagerClient, "version", return_value=None):
+
+                # 1) Install mode
+                inst_dir = Path(tmp) / "run-install"
+                inst_dir.mkdir()
+                (inst_dir / "package.zip").write_bytes(raw_zip)
+                rc_install = remote.execute(inst_dir, dict(base_spec, mode="install"))
+                rep_install = production.read(inst_dir / "stage.json")["report"]
+
+                # 2) Scan mode (with reversed model/node spec order to prove ordering invariance!)
+                scan_dir = Path(tmp) / "run-scan"
+                scan_dir.mkdir()
+                (scan_dir / "package.zip").write_bytes(raw_zip)
+                rc_scan = remote.execute(
+                    scan_dir,
+                    dict(base_spec, mode="scan", nodes=list(reversed(nodes_lock)), models=list(reversed(models_lock))),
+                )
+                rep_scan = production.read(scan_dir / "stage.json")["report"]
+
+                # 3) Sync-nodes mode (previously overwrote composite fp with raw base_fp!)
+                sync_dir = Path(tmp) / "run-sync"
+                sync_dir.mkdir()
+                rc_sync = remote.execute(sync_dir, dict(base_spec, mode="sync-nodes"))
+                rep_sync = production.read(sync_dir / "stage.json")["report"]
+
+                # 4) Live pre-production verify-env
+                live_rep = remote.verify_live_environment(base_spec)
+
+            self.assertEqual((rc_install, rc_scan, rc_sync), (0, 0, 0))
+            fp_install = rep_install["environmentFingerprint"]
+            self.assertNotEqual(fp_install, base_fp)
+            self.assertEqual(fp_install, rep_scan["environmentFingerprint"])
+            self.assertEqual(fp_install, rep_sync["environmentFingerprint"])
+            self.assertEqual(fp_install, live_rep["environmentFingerprint"])
+            # All 4 custom node repos MUST be resolved as Installed (never Missing!)
+            self.assertTrue(all(r["status"] == "Installed" for r in live_rep["nodeRepos"]), live_rep["nodeRepos"])
+            by_repo = {r["repo"]: r["actualRevision"] for r in live_rep["nodeRepos"]}
+            self.assertTrue(by_repo["Deno2026/comfyui-deno-custom-nodes"].startswith("cnr:0.8.2:"))
+            self.assertTrue(by_repo["kijai/ComfyUI-KJNodes"].startswith("cnr:1.2.9:"))
+            self.assertTrue(by_repo["Kosinkadink/ComfyUI-VideoHelperSuite"].startswith("cnr:1.7.0:"))
+            self.assertEqual(by_repo["LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler"], "5" * 40)
+            # API timeout raised to 30s in both execute() and verify_live_environment()
+            self.assertTrue(all(t == 30 for t in recorded_timeouts), recorded_timeouts)
+
+            # 5) Legacy raw base_fp recovery via Scan/Sync WITHOUT reinstalling package or re-downloading models
+            store = wprof.WorkflowStore(Path(tmp) / "profiles")
+            wf = store.import_package("RC4.zip", raw_zip)
+            target = {"id": 62565863, "host": "h", "port": 22, "comfy_port": 8188}
+            conn = Mock()
+            conn.target.return_value = target
+            conn.ssh_target.return_value = target
+            conn.snapshot.return_value = {"instance": 62565863}
+            ssh_ops = Mock()
+            ctx = {"BASE": ROOT, "DATA": Path(tmp) / "data", "LOCK": threading.RLock(), "connection": conn, "running": False}
+            mgr = workflow_manager.WorkflowManager(ctx, ssh_ops=ssh_ops)
+            # Seed legacy base-only fingerprint that previously caused environment_drift
+            mgr.record_environment_verification(
+                wf["version"], "62565863", "installed",
+                {"compatible": True, "incompatibilities": [], "environmentFingerprint": base_fp, "environment": fake_env},
+            )
+            ssh_ops.ssh.side_effect = [b"", json.dumps(live_rep).encode()]
+            with self.assertRaisesRegex(ValueError, "fingerprint changed"):
+                mgr.verify_live_environment(wf["version"], target, wf)
+            # Re-verifying via sync-nodes/scan adopts fp_install cleanly without reinstalling -> verify_live_environment now passes!
+            rec = mgr.records["62565863"] = {
+                "id": "a" * 32, "version": wf["version"], "instance": "62565863",
+                "status": "running", "dispatched": True, "started": time.time(), "timeout": 60,
+            }
+            mgr.save(rec)
+            snap = {"started": True, "status": "installed", "exitCode": 0, "finished": time.time(), "report": rep_sync}
+            ssh_ops.ssh.side_effect = [json.dumps(snap).encode()]
+            with patch.object(workflow_manager.time, "sleep"):
+                mgr.reconcile(rec)
+            ssh_ops.ssh.side_effect = [b"", json.dumps(live_rep).encode()]
+            self.assertEqual(mgr.verify_live_environment(wf["version"], target, wf), fp_install)
+
+            # 6) Missing model on sync-nodes MUST NOT adopt 'installed' status (returns exit code 2 -> needs attention)
+            (root / "models" / "vae" / "audio_vae.safetensors").unlink()
+            with patch.object(remote, "root_path", return_value=root), \
+                 patch.object(remote, "urlopen", side_effect=fake_urlopen), \
+                 patch.object(remote, "probe_environment", side_effect=lambda *a, **k: dict(fake_env)), \
+                 patch.object(provision, "git_head", side_effect=fake_git_head), \
+                 patch.object(remote.workflow_comfy_manager.ComfyManagerClient, "version", return_value=None):
+                bad_sync_dir = Path(tmp) / "run-bad-sync"
+                bad_sync_dir.mkdir()
+                rc_bad = remote.execute(bad_sync_dir, dict(base_spec, mode="sync-nodes"))
+            self.assertEqual(rc_bad, 2)
+
+    def test_standard_declarative_fingerprint_matches_across_install_scan_sync_and_verify(self):
+        payload = b"declarative-model-bytes"
+        manifest, wf_graph, nodes, models, _mapping = make_generic_t2v_package(model_payload=payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            comfy_root = Path(tmp) / "ComfyUI"
+            (comfy_root / "main.py").parent.mkdir(parents=True)
+            (comfy_root / "main.py").write_text("# comfy", encoding="utf-8")
+            # Create custom node dirs in lowercase (simulating Linux case-variant directory names)
+            created_dirs = {}
+            for s in nodes:
+                low_name = s["repo"].split("/")[1].lower()
+                d = comfy_root / "custom_nodes" / low_name
+                d.mkdir(parents=True)
+                created_dirs[d] = s["revision"]
+            model_dest = comfy_root / "models" / "checkpoints" / "alt_video_v2.safetensors"
+            model_dest.parent.mkdir(parents=True)
+            model_dest.write_bytes(payload)
+
+            fake_env = {
+                "comfyuiRoot": str(comfy_root), "comfyuiRevision": manifest["comfyui"]["revision"],
+                "comfyuiGitClean": True, "pythonVersion": "3.12.4", "torchVersion": "2.6.0+cu124",
+                "cudaVersion": "12.4", "gpuName": "RTX 4090", "gpuArch": "8.9", "vramGb": 24.0,
+                "diskFreeBytes": 500 * 1024**3, "environmentFingerprint": "b" * 64,
+            }
+            obj_info = {
+                "AltCheckpointLoader": {"input": {"required": {"ckpt_name": [["alt_video_v2.safetensors"]]}}},
+                "CLIPTextEncode": {"input": {"required": {"text": ["STRING"]}}},
+                "LoadImage": {"input": {"required": {"image": [["sample.png"]]}}},
+                "AltVideoSampler": {"input": {"required": {"frame_count": ["INT"]}}},
+                "VHS_VideoCombine": {"input": {"required": {"frame_rate": ["INT"]}}},
+            }
+
+            def fake_urlopen(url, timeout=10):
+                class Resp:
+                    def __init__(self, obj):
+                        self.b = json.dumps(obj).encode("utf-8")
+                    def __enter__(self):
+                        return io.BytesIO(self.b)
+                    def __exit__(self, *a):
+                        pass
+                return Resp({"queue_running": [], "queue_pending": []} if str(url).endswith("/queue") else obj_info)
+
+            def fake_git_head(p):
+                p = Path(p)
+                if p == comfy_root:
+                    return manifest["comfyui"]["revision"]
+                return created_dirs.get(p)
+
+            spec = {
+                "packaged": True, "packageKind": "declarative", "version": "c" * 64,
+                "manifest": manifest, "nodes": nodes, "models": models, "graph": wf_graph,
+                "port": 8188, "timeout": 60,
+            }
+            with patch.object(remote, "root_path", return_value=comfy_root), \
+                 patch.object(remote, "urlopen", side_effect=fake_urlopen), \
+                 patch.object(remote, "probe_environment", side_effect=lambda *a, **k: dict(fake_env)), \
+                 patch.object(provision, "git_head", side_effect=fake_git_head), \
+                 patch.object(provision, "install_package_nodes", return_value=[]), \
+                 patch.object(remote.workflow_comfy_manager.ComfyManagerClient, "version", return_value=None):
+
+                d_inst = Path(tmp) / "inst"
+                d_inst.mkdir()
+                rc_i = remote.execute(d_inst, dict(spec, mode="install"))
+                fp_i = production.read(d_inst / "stage.json")["report"]["environmentFingerprint"]
+
+                d_scan = Path(tmp) / "scan"
+                d_scan.mkdir()
+                rc_s = remote.execute(d_scan, dict(spec, mode="scan", nodes=list(reversed(nodes))))
+                fp_s = production.read(d_scan / "stage.json")["report"]["environmentFingerprint"]
+
+                d_sync = Path(tmp) / "sync"
+                d_sync.mkdir()
+                rc_y = remote.execute(d_sync, dict(spec, mode="sync-nodes"))
+                fp_y = production.read(d_sync / "stage.json")["report"]["environmentFingerprint"]
+
+                live = remote.verify_live_environment(spec)
+
+            self.assertEqual((rc_i, rc_s, rc_y), (0, 0, 0))
+            self.assertNotEqual(fp_i, "b" * 64)
+            self.assertEqual(fp_i, fp_s)
+            self.assertEqual(fp_i, fp_y)
+            self.assertEqual(fp_i, live["environmentFingerprint"])
+
+    def test_custom_node_resolver_rejects_ambiguous_and_conflicting_repos_and_deploys_fresh_scripts(self):
+        import shutil
+        import vast_ssh_ops
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "ComfyUI"
+            cn = root / "custom_nodes"
+            # 1) Ambiguous directories: both canonical 'comfyui-deno-custom-nodes' and CNR 'deno-custom-nodes' exist
+            d1 = cn / "comfyui-deno-custom-nodes"
+            d2 = cn / "deno-custom-nodes"
+            d1.mkdir(parents=True)
+            d2.mkdir(parents=True)
+            (d1 / "__init__.py").write_text("", encoding="utf-8")
+            (d2 / "__init__.py").write_text("", encoding="utf-8")
+            spec = {"name": "comfyui-deno-custom-nodes", "repo": "Deno2026/comfyui-deno-custom-nodes"}
+            amb = remote.resolve_custom_node_dir(root, spec)
+            self.assertEqual(amb["status"], "ambiguous")
+            self.assertIn("Ambiguous custom node directories", amb["error"])
+
+            # 2) Conflicting repository owner at exact folder name MUST be rejected
+            shutil.rmtree(d2)
+            (d1 / "pyproject.toml").write_text(
+                '[project]\nname = "comfyui-deno-custom-nodes"\nversion = "1.0.0"\n'
+                '[project.urls]\nRepository = "https://github.com/evil-fork/comfyui-deno-custom-nodes"\n',
+                encoding="utf-8",
+            )
+            conf = remote.resolve_custom_node_dir(root, spec)
+            self.assertEqual(conf["status"], "conflict")
+            self.assertIn("evil-fork/comfyui-deno-custom-nodes", conf["error"])
+
+            # 3) Remote deployment freshness: vast_ssh_ops.deploy_files re-uploads workflow_install_remote.py whenever local SHA changes
+            target = {"id": 1, "host": "example.com", "port": 22}
+            remote_path = "/workspace/axdar-studio/installations/preflight/workflow_install_remote.py"
+            local_script = ROOT / "workflow_install_remote.py"
+            current_sha = vast_ssh_ops._digest(local_script)
+            uploaded = []
+            # Simulate remote server holding a stale copy (sha256sum -c fails and prints remote_path)
+            with patch.object(vast_ssh_ops, "ssh", return_value=(remote_path + "\n").encode("utf-8")) as ssh_mock, \
+                 patch.object(vast_ssh_ops, "put", side_effect=lambda t, dst, src: uploaded.append((dst, vast_ssh_ops._digest(src)))):
+                vast_ssh_ops.deploy_files(target, {remote_path: local_script})
+            self.assertIn(current_sha.encode("utf-8"), ssh_mock.call_args.kwargs["data"])
+            self.assertEqual(uploaded, [(remote_path, current_sha)])
+
+
 @unittest.skipUnless(
     (LOCAL_COMFY_PORTABLE / "ComfyUI" / "main.py").is_file() and (LOCAL_COMFY_PORTABLE / "python_embeded" / "python.exe").is_file(),
     "Local ComfyUI_windows_portable installation required for real host preflight validation.",

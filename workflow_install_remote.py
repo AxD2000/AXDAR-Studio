@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 import zipfile
 from pathlib import Path
 from urllib.request import urlopen
@@ -17,6 +18,8 @@ import production
 import provision
 import workflow_comfy_manager
 import workflow_packages
+
+LOCAL_API_TIMEOUT_SECONDS = 30
 
 PHASES = (
     "Vast connection",
@@ -124,13 +127,313 @@ def probe_environment(root, api=None):
     return env
 
 
-def compute_verified_fingerprint(env, result):
+def _canonical_node_slug(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", str(name or "").strip().lower()).strip("-")
+    for prefix in ("comfyui-",):
+        if slug.startswith(prefix) and len(slug) - len(prefix) >= 4:
+            return slug[len(prefix):]
+    return slug
+
+
+def _git_origin_repo(path):
+    path = Path(path)
+    if not (path / ".git").exists():
+        return ""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(path), "config", "--get", "remote.origin.url"],
+            stderr=subprocess.DEVNULL, text=True, timeout=10,
+        ).strip()
+        return workflow_comfy_manager._normalize_repo(out)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _read_nodepack_metadata(path):
+    """Read local package identity & version from pyproject.toml or CNR tracking files without network calls."""
+    path = Path(path)
+    meta = {"name": "", "version": "", "repo": ""}
+    pyproject = path / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            data = tomllib.loads(pyproject.read_text("utf-8", errors="replace"))
+            proj = data.get("project") if isinstance(data.get("project"), dict) else {}
+            meta["name"] = str(proj.get("name") or "").strip()
+            meta["version"] = str(proj.get("version") or "").strip()
+            urls = proj.get("urls") if isinstance(proj.get("urls"), dict) else {}
+            for k in ("Repository", "repository", "Homepage", "homepage", "Source", "source"):
+                val = str(urls.get(k) or "").strip()
+                norm = workflow_comfy_manager._normalize_repo(val)
+                if "/" in norm and "github.com" in val.lower():
+                    meta["repo"] = norm
+                    break
+        except Exception:
+            pass
+    for tracking_name in ("cm-info.json", ".cnr.json"):
+        tf = path / tracking_name
+        if tf.is_file():
+            try:
+                tdata = json.loads(tf.read_text("utf-8", errors="replace"))
+                if isinstance(tdata, dict):
+                    if not meta["version"] and tdata.get("version"):
+                        meta["version"] = str(tdata["version"]).strip()
+                    if not meta["repo"]:
+                        cand_repo = workflow_comfy_manager._normalize_repo(tdata.get("repository") or tdata.get("aux_id") or "")
+                        if "/" in cand_repo:
+                            meta["repo"] = cand_repo
+            except Exception:
+                pass
+    return meta
+
+
+def _directory_content_digest(path):
+    """Deterministic SHA-256 digest over non-cache custom node source files."""
+    path = Path(path)
+    h = hashlib.sha256()
+    if not path.is_dir():
+        return h.hexdigest()
+    files = []
+    for sub in path.rglob("*"):
+        if not sub.is_file():
+            continue
+        rel_parts = sub.relative_to(path).parts
+        if any(part in (".git", "__pycache__") or part.startswith(".pytest") for part in rel_parts):
+            continue
+        if sub.suffix.lower() in (".pyc", ".pyo"):
+            continue
+        files.append("/".join(rel_parts))
+    for rel in sorted(files):
+        fp = path / rel
+        h.update(rel.encode("utf-8") + b"\0")
+        try:
+            st = fp.stat()
+            if st.st_size <= 2 * 1024 * 1024:
+                h.update(fp.read_bytes())
+            else:
+                h.update(str(st.st_size).encode("ascii"))
+        except OSError:
+            pass
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _has_valid_nodepack_payload(cand, info=None):
+    cand = Path(cand)
+    if (cand / "__init__.py").is_file() or (cand / "pyproject.toml").is_file() or (cand / ".git").exists():
+        return True
+    if any(p.is_file() for p in cand.glob("*.py")):
+        return True
+    if isinstance(info, dict):
+        mod_prefix = f"custom_nodes.{cand.name}"
+        if any(isinstance(v, dict) and str(v.get("python_module") or "").startswith(mod_prefix) for v in info.values()):
+            return True
+    return False
+
+
+def resolve_custom_node_dir(root, spec, info=None):
+    """Deterministically locate a custom node directory, verify repo identity & version, and reject ambiguous matches."""
+    custom_nodes = Path(root) / "custom_nodes"
+    spec_repo = workflow_comfy_manager._normalize_repo(spec.get("repo") or spec.get("url") or "")
+    has_owner = "/" in spec_repo
+    spec_basename = workflow_comfy_manager._repo_basename(spec_repo)
+    raw_name = str(spec.get("name") or spec_basename).strip()
+    label = spec.get("repo") or raw_name or "custom-node"
+    exact_names_lower = {n.lower() for n in (raw_name, spec_basename) if n}
+    canonical_slug = _canonical_node_slug(raw_name or spec_basename)
+
+    if not custom_nodes.is_dir():
+        return {"status": "missing", "path": None, "gitHead": None, "version": None, "matches": [], "error": ""}
+
+    candidates = sorted(
+        (d for d in custom_nodes.iterdir() if d.is_dir() and not d.name.startswith((".", "__"))),
+        key=lambda p: p.name,
+    )
+    matches = []
+    conflicts = []
+    for cand in candidates:
+        git_rev = provision.git_head(cand)
+        git_repo = _git_origin_repo(cand)
+        meta = _read_nodepack_metadata(cand)
+        declared_repos = {r for r in (git_repo, meta.get("repo") or "") if r and "/" in r}
+        name_low = cand.name.lower()
+
+        if has_owner and declared_repos and spec_repo not in declared_repos:
+            if name_low in exact_names_lower:
+                conflicts.append(
+                    f"Conflicting custom node repository at {cand.name!r}: found {sorted(declared_repos)[0]}, expected {spec_repo}."
+                )
+            continue
+
+        matched_by_repo = bool(has_owner and spec_repo in declared_repos)
+        matched_by_name = name_low in exact_names_lower
+        matched_by_slug = bool(
+            not matched_by_repo
+            and not matched_by_name
+            and canonical_slug
+            and _canonical_node_slug(cand.name) == canonical_slug
+            and _has_valid_nodepack_payload(cand, info)
+        )
+        if matched_by_repo or matched_by_name or matched_by_slug:
+            matches.append({
+                "path": cand,
+                "git_head": git_rev,
+                "meta": meta,
+                "declared_repos": declared_repos,
+            })
+
+    if len(matches) > 1:
+        names = [m["path"].name for m in matches]
+        return {
+            "status": "ambiguous",
+            "path": None,
+            "gitHead": None,
+            "version": None,
+            "matches": names,
+            "error": f"Ambiguous custom node directories for {label}: {names}. Remove duplicate installations.",
+        }
+    if not matches:
+        if conflicts:
+            return {
+                "status": "conflict",
+                "path": None,
+                "gitHead": None,
+                "version": None,
+                "matches": [],
+                "error": conflicts[0],
+            }
+        return {"status": "missing", "path": None, "gitHead": None, "version": None, "matches": [], "error": ""}
+
+    chosen = matches[0]
+    git_rev = chosen["git_head"]
+    if git_rev:
+        version_token = git_rev
+    else:
+        digest_hex = _directory_content_digest(chosen["path"])
+        pkg_ver = chosen["meta"].get("version") or ""
+        version_token = f"cnr:{pkg_ver}:{digest_hex[:12]}" if pkg_ver else f"dir:{digest_hex[:16]}"
+    return {
+        "status": "found",
+        "path": chosen["path"],
+        "gitHead": git_rev,
+        "version": version_token,
+        "matches": [chosen["path"].name],
+        "error": "",
+    }
+
+
+def compute_verified_fingerprint(env, result, *, package_kind=None):
+    """Single deterministic package fingerprint across install, scan, sync-nodes, and verify-env."""
+    base_fp = env["environmentFingerprint"]
+    kind = package_kind or result.get("packageKind") or "declarative"
+    nodes_map = {
+        str(r["repo"]): r.get("actualRevision")
+        for r in sorted(result.get("nodeRepos") or [], key=lambda item: str(item.get("repo") or ""))
+    }
+    if kind == "bootstrap":
+        installed_models = sorted(
+            str(m["name"])
+            for m in (result.get("models") or [])
+            if m.get("status") == "Installed"
+        )
+        return _canonical_hash({
+            "base": base_fp,
+            "packageKind": "bootstrap",
+            "nodes": nodes_map,
+            "models": installed_models,
+        })
+    models_map = {
+        str(m["name"]): (m.get("source") or {}).get("sha256")
+        for m in sorted(result.get("models") or [], key=lambda item: str(item.get("name") or ""))
+        if m.get("status") == "Installed"
+    }
     return _canonical_hash({
-        "base": env["environmentFingerprint"],
-        "nodes": {r["repo"]: r["actualRevision"] for r in result.get("nodeRepos", [])},
-        "models": {m["name"]: m["source"]["sha256"] for m in result.get("models", []) if m["status"] == "Installed"},
+        "base": base_fp,
+        "nodes": nodes_map,
+        "models": models_map,
         "attention": (result.get("attention") or {}).get("status"),
     })
+
+
+def _attach_verified_fingerprint(env, result, *, package_kind=None):
+    fp = compute_verified_fingerprint(env, result, package_kind=package_kind)
+    result["environment"] = dict(env, environmentFingerprint=fp)
+    result["environmentFingerprint"] = fp
+    return fp
+
+
+def _inspect_bootstrap_state(root, graph, info, node_specs, model_specs):
+    """Unified read-only inspection of bootstrap package classes, custom node dirs/versions, and models."""
+    root = Path(root)
+    missing_classes = sorted({n["class_type"] for n in graph.values()} - info.keys())
+    models_root = root / "models"
+    incompatibilities = []
+
+    model_rows = []
+    for m in model_specs:
+        rel = m.get("local") or workflow_packages.expected_comfy_model_relpath(m)
+        dest = models_root / rel
+        expected_bytes = int(m.get("bytes") or 0)
+        err = None
+        if dest.is_file():
+            st_size = dest.stat().st_size
+            if st_size <= 0:
+                m_status = "Incompatible"
+                err = f"Model file {rel} is empty (0 bytes)."
+                incompatibilities.append(err)
+            elif expected_bytes > 0 and st_size != expected_bytes:
+                m_status = "Incompatible"
+                err = f"Model file {rel} size mismatch (expected {expected_bytes} B, found {st_size} B)."
+                incompatibilities.append(err)
+            else:
+                m_status = "Installed"
+        else:
+            m_status = "Missing"
+        model_rows.append({
+            "name": rel,
+            "folder": m.get("folder", ""),
+            "status": m_status,
+            "verified": bool(m.get("sha256") or m_status == "Installed"),
+            "error": err,
+            "source": {k: m.get(k) for k in ("repo", "revision", "file", "sha256", "bytes")},
+        })
+
+    node_rows = []
+    for n in node_specs:
+        repo_key = n.get("repo") or n.get("name", "")
+        res = resolve_custom_node_dir(root, n, info=info)
+        unregistered = [c for c in (n.get("classes") or []) if c not in info]
+        if res["status"] == "ambiguous":
+            n_status = "Ambiguous"
+            actual_rev = None
+            incompatibilities.append(res["error"])
+        elif res["status"] == "conflict":
+            n_status = "Incompatible"
+            actual_rev = None
+            incompatibilities.append(res["error"])
+        elif res["status"] == "found":
+            actual_rev = res["version"]
+            n_status = "Installed" if not unregistered else "Needs restart"
+        else:
+            n_status = "Missing"
+            actual_rev = None
+        node_rows.append({
+            "repo": repo_key,
+            "revision": n.get("revision") or "",
+            "actualRevision": actual_rev,
+            "status": n_status,
+        })
+
+    compatible = not incompatibilities
+    all_nodes_ok = not missing_classes and all(r["status"] == "Installed" for r in node_rows)
+    all_models_ok = all(m["status"] == "Installed" for m in model_rows)
+    return {
+        "nodes": missing_classes,
+        "nodeRepos": node_rows,
+        "models": model_rows,
+        "compatible": compatible,
+        "incompatibilities": incompatibilities,
+        "available": compatible and all_nodes_ok and all_models_ok,
+    }
 
 
 def check_package_compatibility(env, manifest, root, node_specs, model_specs, *, allow_comfyui_align=False):
@@ -182,14 +485,16 @@ def check_package_compatibility(env, manifest, root, node_specs, model_specs, *,
             f"GPU compute capability {env.get('gpuArch') or 'unknown'} is not in package supported list {allowed_caps}."
         )
 
-    # Check existing custom node repositories for conflicting revisions (never silently reuse wrong commits).
+    # Check existing custom node repositories for conflicting revisions or ambiguous directories.
     for spec in node_specs:
-        dest = root / "custom_nodes" / spec["repo"].split("/")[1]
-        if dest.exists():
-            actual = provision.git_head(dest)
+        res = resolve_custom_node_dir(root, spec)
+        if res["status"] in ("ambiguous", "conflict"):
+            incompatibilities.append(res["error"])
+        elif res["status"] == "found":
+            actual = res["gitHead"]
             if actual != spec["revision"]:
                 incompatibilities.append(
-                    f"Conflicting custom node on host: {spec['repo']} is at {actual or 'untracked'}, package pins {spec['revision']}."
+                    f"Conflicting custom node on host: {spec['repo']} is at {actual or res['version'] or 'untracked'}, package pins {spec['revision']}."
                 )
 
     # Check existing model files at target paths and total disk space needed for missing models.
@@ -252,16 +557,24 @@ def scan_package(graph, info, root, manifest, node_specs, model_specs, env=None,
     missing_classes = sorted({n["class_type"] for n in graph.values()} - info.keys())
     node_statuses = []
     for spec in node_specs:
-        dest = root / "custom_nodes" / spec["repo"].split("/")[1]
-        actual_rev = provision.git_head(dest) if dest.exists() else None
+        res = resolve_custom_node_dir(root, spec, info=info)
         unregistered = [c for c in spec["classes"] if c not in info]
-        if dest.exists() and actual_rev != spec["revision"]:
+        if res["status"] == "ambiguous":
+            actual_rev = None
+            st = "Ambiguous"
+        elif res["status"] == "conflict":
+            actual_rev = None
             st = "Incompatible"
-        elif dest.exists() and not unregistered:
-            st = "Installed"
-        elif dest.exists() and unregistered:
-            st = "Needs restart"
+        elif res["status"] == "found":
+            actual_rev = res["gitHead"]
+            if actual_rev != spec["revision"]:
+                st = "Incompatible"
+            elif not unregistered:
+                st = "Installed"
+            else:
+                st = "Needs restart"
         else:
+            actual_rev = None
             st = "Missing"
         node_statuses.append({
             "repo": spec["repo"],
@@ -538,29 +851,10 @@ def _execute_bootstrap(folder, config, api, idle, stage, report_fn, metrics_fn=N
 
     stage(PHASES[1], "Running", "Probing remote ComfyUI environment")
     env_info = probe_environment(root, api)
-    missing_classes = sorted({n["class_type"] for n in graph.values()} - info.keys())
-    models_root = root / "models"
-    model_rows = []
-    for m in model_specs:
-        rel = m.get("local") or workflow_packages.expected_comfy_model_relpath(m)
-        on_disk = (models_root / rel).is_file()
-        model_rows.append({
-            "name": rel,
-            "folder": m.get("folder", ""),
-            "status": "Installed" if on_disk else "Missing",
-            "verified": bool(m.get("sha256")),
-            "source": {k: m.get(k) for k in ("repo", "revision", "file", "sha256", "bytes")},
-        })
-    node_rows = []
-    for n in node_specs:
-        name = n.get("name") or str(n.get("repo", "")).split("/")[-1]
-        dest = root / "custom_nodes" / name
-        node_rows.append({
-            "repo": n.get("repo") or name,
-            "revision": n.get("revision") or "",
-            "actualRevision": provision.git_head(dest) if dest.exists() else None,
-            "status": "Installed" if dest.exists() else "Missing",
-        })
+    inspected = _inspect_bootstrap_state(root, graph, info, node_specs, model_specs)
+    missing_classes = inspected["nodes"]
+    node_rows = inspected["nodeRepos"]
+    model_rows = inspected["models"]
     progress_state["nodesCompleted"] = sum(1 for r in node_rows if r["status"] == "Installed")
     progress_state["modelsCompleted"] = sum(1 for m in model_rows if m["status"] == "Installed")
     push_metrics()
@@ -571,17 +865,23 @@ def _execute_bootstrap(folder, config, api, idle, stage, report_fn, metrics_fn=N
         "nodes": missing_classes,
         "nodeRepos": node_rows,
         "models": model_rows,
-        "compatible": True,
-        "incompatibilities": [],
+        "compatible": inspected["compatible"],
+        "incompatibilities": inspected["incompatibilities"],
         "environment": env_info,
         "environmentFingerprint": env_info["environmentFingerprint"],
     }
     report_fn(result)
+    if not inspected["compatible"] and config["mode"] == "scan":
+        stage(PHASES[1], "Failed", " · ".join(inspected["incompatibilities"]))
+        return 3
     stage(PHASES[1], "Completed", f"Environment {env_info['environmentFingerprint'][:12]} ready")
     stage(PHASES[2], "Completed", f"{len(missing_classes)} missing classes · {models_total} locked models")
 
     if config["mode"] == "scan":
-        available = not missing_classes and all(m["status"] == "Installed" for m in model_rows)
+        available = inspected["available"]
+        if available:
+            _attach_verified_fingerprint(env_info, result, package_kind="bootstrap")
+            report_fn(result)
         stage(PHASES[4], "Completed", "Checked bootstrap package dependencies")
         stage(PHASES[6], "Completed" if available else "Failed",
               "All package dependencies present" if available else "Run installation to execute package installer")
@@ -675,77 +975,74 @@ def _execute_bootstrap(folder, config, api, idle, stage, report_fn, metrics_fn=N
 
     stage(PHASES[6], "Running", "Verifying workflow nodes against ComfyUI /object_info")
     final_env = probe_environment(root, api)
-    missing_after = sorted({n["class_type"] for n in graph.values()} - info.keys())
-    final_models = [
-        {
-            "name": m.get("local") or workflow_packages.expected_comfy_model_relpath(m),
-            "folder": m.get("folder", ""),
-            "status": "Installed" if (models_root / (m.get("local") or workflow_packages.expected_comfy_model_relpath(m))).is_file() else "Missing",
-            "verified": True,
-            "source": {k: m.get(k) for k in ("repo", "revision", "file", "sha256", "bytes")},
-        }
-        for m in model_specs
-    ]
-    final_nodes = [
-        {
-            "repo": n.get("repo") or n.get("name", ""),
-            "revision": n.get("revision") or "",
-            "actualRevision": provision.git_head(root / "custom_nodes" / (n.get("name") or str(n.get("repo", "")).split("/")[-1])),
-            "status": "Installed" if (root / "custom_nodes" / (n.get("name") or str(n.get("repo", "")).split("/")[-1])).exists() else "Missing",
-        }
-        for n in node_specs
-    ]
+    post_check = _inspect_bootstrap_state(root, graph, info, node_specs, model_specs)
+    missing_after = post_check["nodes"]
+    final_nodes = post_check["nodeRepos"]
+    final_models = post_check["models"]
     progress_state["nodesCompleted"] = sum(1 for r in final_nodes if r["status"] == "Installed")
     progress_state["modelsCompleted"] = sum(1 for m in final_models if m["status"] == "Installed")
     progress_state["downloadSpeedMiBs"] = 0.0
     progress_state["filePercent"] = 100.0 if not missing_after else progress_state["filePercent"]
     push_metrics()
-    fp = _canonical_hash({
-        "base": final_env["environmentFingerprint"],
-        "packageKind": "bootstrap",
-        "nodes": {r["repo"]: r["actualRevision"] for r in final_nodes},
-        "models": [m["name"] for m in final_models if m["status"] == "Installed"],
-    })
-    final_env["environmentFingerprint"] = fp
     final_result = {
         "packaged": True,
         "packageKind": "bootstrap",
         "nodes": missing_after,
         "nodeRepos": final_nodes,
         "models": final_models,
-        "compatible": True,
-        "incompatibilities": [],
+        "compatible": post_check["compatible"],
+        "incompatibilities": post_check["incompatibilities"],
         "environment": final_env,
-        "environmentFingerprint": fp,
+        "environmentFingerprint": final_env["environmentFingerprint"],
     }
+    if post_check["available"]:
+        _attach_verified_fingerprint(final_env, final_result, package_kind="bootstrap")
     report_fn(final_result)
     models_ok = all(m["status"] == "Installed" for m in final_models)
-    if models_ok:
+    if models_ok and post_check["compatible"]:
         sync = _run_post_install_manager_sync(
             root=root, graph=graph, api=api, idle=idle, port=config["port"],
             manifest=manifest, node_specs=node_specs, stage=stage,
             result_dict=final_result, report_fn=report_fn,
         )
-        if sync.get("restarted") or sync.get("finalStatus") in ("passed", "failed"):
-            missing_after = list(sync.get("remainingMissingClasses", missing_after))
-            final_result["nodes"] = missing_after
+        if sync.get("restarted") or sync.get("installedNodepacks") or sync.get("updatedNodepacks") or sync.get("finalStatus") in ("passed", "failed"):
             if sync.get("restarted"):
                 final_env = probe_environment(root, api)
-                fp = _canonical_hash({
-                    "base": final_env["environmentFingerprint"],
-                    "packageKind": "bootstrap",
-                    "nodes": {r["repo"]: r["actualRevision"] for r in final_nodes},
-                    "models": [m["name"] for m in final_models if m["status"] == "Installed"],
-                })
-                final_env["environmentFingerprint"] = fp
-                final_result["environment"] = final_env
-                final_result["environmentFingerprint"] = fp
+            info = api("/object_info")
+            post_check = _inspect_bootstrap_state(root, graph, info, node_specs, model_specs)
+            missing_after = list(sync.get("remainingMissingClasses") or post_check["nodes"])
+            final_nodes = post_check["nodeRepos"]
+            final_models = post_check["models"]
+            progress_state["nodesCompleted"] = sum(1 for r in final_nodes if r["status"] == "Installed")
+            progress_state["modelsCompleted"] = sum(1 for m in final_models if m["status"] == "Installed")
+            push_metrics()
+            final_result.update(
+                nodes=missing_after,
+                nodeRepos=final_nodes,
+                models=final_models,
+                compatible=post_check["compatible"],
+                incompatibilities=post_check["incompatibilities"],
+                environment=final_env,
+                environmentFingerprint=final_env["environmentFingerprint"],
+                managerSync=sync,
+            )
+            sync_failed = sync.get("finalStatus") == "failed"
+            if post_check["available"] and not missing_after and not sync_failed:
+                _attach_verified_fingerprint(final_env, final_result, package_kind="bootstrap")
             report_fn(final_result)
-        sync_failed = sync.get("finalStatus") == "failed"
+        else:
+            sync_failed = False
     else:
         sync_failed = False
 
-    available = not missing_after and models_ok and not sync_failed
+    if not post_check["compatible"]:
+        stage(PHASES[6], "Failed", " · ".join(post_check["incompatibilities"]))
+        return 3
+    all_nodes_ok = not missing_after and all(r["status"] == "Installed" for r in final_nodes)
+    available = all_nodes_ok and models_ok and not sync_failed
+    if available:
+        _attach_verified_fingerprint(final_env, final_result, package_kind="bootstrap")
+        report_fn(final_result)
     stage(
         PHASES[6],
         "Completed" if available else "Failed",
@@ -796,15 +1093,37 @@ def _run_post_install_manager_sync(*, root, graph, api, idle, port, manifest, no
     return sync
 
 
+def _apply_attention_fallback_policy(manifest, result):
+    att_cfg = ((manifest or {}).get("runtime") or {}).get("attention") or {}
+    if (att_cfg.get("backend") == "sageattention"
+            and att_cfg.get("allowSdpaFallback") is True
+            and (result.get("attention") or {}).get("status") == "Missing"):
+        result["attention"]["status"] = "Fallback (SDPA — authorized by manifest)"
+        result["sageAttention"] = "Fallback (SDPA — authorized by manifest)"
+
+
 def _execute_sync_nodes(folder, config, api, idle, stage, report_fn):
     """Independently retryable ComfyUI-Manager custom-node sync (preserves installed package & models)."""
     root = root_path()
     api("/object_info")
     stage(PHASES[0], "Completed", str(root))
     env = probe_environment(root, api)
+    packaged = bool(config.get("packaged"))
+    manifest = config.get("manifest")
+    is_bootstrap = bool(config.get("packageKind") == "bootstrap" or (isinstance(manifest, dict) and manifest.get("entrypoint")))
+    pkg_kind = "bootstrap" if is_bootstrap else (config.get("packageKind") or "declarative")
+    node_specs = list(config.get("nodes") or ())
+    model_specs = list(config.get("models") or ())
+    if packaged and (folder / "package.zip").is_file() and (not node_specs and not model_specs and not manifest):
+        unpacked = _unpack_remote_package(folder)
+        if unpacked is not None:
+            manifest = manifest or unpacked.get("manifest")
+            node_specs = node_specs or list(unpacked.get("nodes") or ())
+            model_specs = model_specs or list(unpacked.get("models") or ())
+
     result = {
-        "packaged": bool(config.get("packaged")),
-        "packageKind": config.get("packageKind", "declarative"),
+        "packaged": packaged,
+        "packageKind": pkg_kind,
         "nodes": [],
         "compatible": True,
         "incompatibilities": [],
@@ -817,19 +1136,79 @@ def _execute_sync_nodes(folder, config, api, idle, stage, report_fn):
         api=api,
         idle=idle,
         port=config["port"],
-        manifest=config.get("manifest"),
-        node_specs=config.get("nodes") or (),
+        manifest=manifest,
+        node_specs=node_specs,
         stage=stage,
         result_dict=result,
         report_fn=report_fn,
     )
-    result["nodes"] = list(sync.get("remainingMissingClasses") or [])
     if sync.get("restarted"):
         env = probe_environment(root, api)
-        result["environment"] = env
-        result["environmentFingerprint"] = env["environmentFingerprint"]
+    sync_ok = sync.get("finalStatus") in ("passed", "skipped")
+
+    if packaged:
+        info = api("/object_info")
+        if is_bootstrap:
+            post_check = _inspect_bootstrap_state(root, config["graph"], info, node_specs, model_specs)
+            missing_classes = sorted(set(post_check["nodes"]) | set(sync.get("remainingMissingClasses") or ()))
+            result.update(
+                packaged=True,
+                packageKind="bootstrap",
+                nodes=missing_classes,
+                nodeRepos=post_check["nodeRepos"],
+                models=post_check["models"],
+                compatible=post_check["compatible"],
+                incompatibilities=post_check["incompatibilities"],
+                environment=env,
+                environmentFingerprint=env["environmentFingerprint"],
+                managerSync=sync,
+            )
+            full_ok = sync_ok and post_check["available"] and not missing_classes
+            if full_ok:
+                _attach_verified_fingerprint(env, result, package_kind="bootstrap")
+            report_fn(result)
+            if not post_check["compatible"]:
+                stage(PHASES[6], "Failed", " · ".join(post_check["incompatibilities"]))
+                return 3
+            stage(
+                PHASES[6],
+                "Completed" if full_ok else "Failed",
+                "Custom node manager sync and package dependencies verified."
+                if full_ok else "Package dependencies or custom node sync remain incomplete.",
+            )
+            return 0 if full_ok else 2
+
+        scanned = scan_package(
+            config["graph"], info, root, manifest, node_specs, model_specs,
+            env=env, verify_hashes=False,
+        )
+        _apply_attention_fallback_policy(manifest, scanned)
+        missing_classes = sorted(set(scanned["nodes"]) | set(sync.get("remainingMissingClasses") or ()))
+        scanned["nodes"] = missing_classes
+        scanned["managerSync"] = sync
+        att_ok = scanned["attention"]["status"] in ("Installed", "SDPA", "Not required", "Fallback (SDPA — authorized by manifest)")
+        all_nodes_ok = not missing_classes and all(r["status"] == "Installed" for r in scanned["nodeRepos"])
+        all_models_ok = all(m["status"] == "Installed" for m in scanned["models"])
+        full_ok = sync_ok and scanned["compatible"] and all_nodes_ok and all_models_ok and att_ok
+        if full_ok:
+            _attach_verified_fingerprint(env, scanned, package_kind="declarative")
+        report_fn(scanned)
+        if not scanned["compatible"]:
+            stage(PHASES[6], "Failed", " · ".join(scanned["incompatibilities"]))
+            return 3
+        stage(
+            PHASES[6],
+            "Completed" if full_ok else "Failed",
+            "Custom node manager sync and package dependencies verified."
+            if full_ok else "Package dependencies or custom node sync remain incomplete.",
+        )
+        return 0 if full_ok else 2
+
+    result["nodes"] = list(sync.get("remainingMissingClasses") or [])
+    result["environment"] = env
+    result["environmentFingerprint"] = env["environmentFingerprint"]
     report_fn(result)
-    ok = sync.get("finalStatus") in ("passed", "skipped") and not result["nodes"]
+    ok = sync_ok and not result["nodes"]
     stage(
         PHASES[6],
         "Completed" if ok else "Failed",
@@ -900,10 +1279,14 @@ def _execute_packaged(folder, config, api, idle, stage, report_fn, metrics_fn=No
     stage(PHASES[2], "Completed", f"{len(result['nodes'])} missing classes · {len(model_specs)} locked models")
     if config["mode"] == "scan":
         stage(PHASES[4], "Completed", "Checked locked package nodes, models, and environment compatibility")
-        att_ok = result["attention"]["status"] in ("Installed", "SDPA", "Not required")
+        _apply_attention_fallback_policy(manifest, result)
+        att_ok = result["attention"]["status"] in ("Installed", "SDPA", "Not required", "Fallback (SDPA — authorized by manifest)")
         all_models_ok = all(m["status"] == "Installed" for m in result["models"])
         all_nodes_ok = not result["nodes"] and all(r["status"] == "Installed" for r in result["nodeRepos"])
-        available = all_nodes_ok and all_models_ok and att_ok
+        available = result["compatible"] and all_nodes_ok and all_models_ok and att_ok
+        if available:
+            _attach_verified_fingerprint(env, result, package_kind="declarative")
+        report_fn(result)
         stage(PHASES[6], "Completed" if available else "Failed",
               "All package dependencies verified on this environment" if available else "Package dependencies need installation")
         return 0 if available else 2
@@ -1026,17 +1409,15 @@ def _execute_packaged(folder, config, api, idle, stage, report_fn, metrics_fn=No
     stage(PHASES[6], "Running", "Running final package verification")
     final_env = probe_environment(root, api)
     result = scan_package(graph, api("/object_info"), root, manifest, node_specs, model_specs, env=final_env, verify_hashes=True)
-    if sage_fallback_used and att_cfg.get("allowSdpaFallback") is True and result["attention"]["status"] == "Missing":
-        result["attention"]["status"] = "Fallback (SDPA — authorized by manifest)"
-        result["sageAttention"] = "Fallback (SDPA — authorized by manifest)"
-    # Compute full post-install environment fingerprint including verified node commits & model hashes
-    result["environmentFingerprint"] = compute_verified_fingerprint(final_env, result)
-    result["environment"]["environmentFingerprint"] = result["environmentFingerprint"]
-    report_fn(result)
-
+    if sage_fallback_used:
+        _apply_attention_fallback_policy(manifest, result)
     att_ok = result["attention"]["status"] in ("Installed", "SDPA", "Not required", "Fallback (SDPA — authorized by manifest)")
     all_nodes_ok = not result["nodes"] and all(r["status"] == "Installed" for r in result["nodeRepos"])
     all_models_ok = all(m["status"] == "Installed" for m in result["models"])
+    if result["compatible"] and all_nodes_ok and all_models_ok and att_ok:
+        _attach_verified_fingerprint(final_env, result, package_kind="declarative")
+    report_fn(result)
+
     sync_failed = False
     if result["compatible"] and all_models_ok and att_ok:
         sync = _run_post_install_manager_sync(
@@ -1044,20 +1425,30 @@ def _execute_packaged(folder, config, api, idle, stage, report_fn, metrics_fn=No
             manifest=manifest, node_specs=node_specs, stage=stage,
             result_dict=result, report_fn=report_fn,
         )
-        if sync.get("restarted"):
-            final_env = probe_environment(root, api)
+        if sync.get("restarted") or sync.get("installedNodepacks") or sync.get("updatedNodepacks"):
+            if sync.get("restarted"):
+                final_env = probe_environment(root, api)
             result = scan_package(graph, api("/object_info"), root, manifest, node_specs, model_specs, env=final_env, verify_hashes=True)
-            if sage_fallback_used and att_cfg.get("allowSdpaFallback") is True and result["attention"]["status"] == "Missing":
-                result["attention"]["status"] = "Fallback (SDPA — authorized by manifest)"
-                result["sageAttention"] = "Fallback (SDPA — authorized by manifest)"
-            result["environmentFingerprint"] = compute_verified_fingerprint(final_env, result)
-            result["environment"]["environmentFingerprint"] = result["environmentFingerprint"]
+            if sage_fallback_used:
+                _apply_attention_fallback_policy(manifest, result)
             result["managerSync"] = sync
-            report_fn(result)
+            att_ok = result["attention"]["status"] in ("Installed", "SDPA", "Not required", "Fallback (SDPA — authorized by manifest)")
             all_nodes_ok = not result["nodes"] and all(r["status"] == "Installed" for r in result["nodeRepos"])
-        sync_failed = sync.get("finalStatus") == "failed"
+            all_models_ok = all(m["status"] == "Installed" for m in result["models"])
+            sync_failed = sync.get("finalStatus") == "failed"
+            if result["compatible"] and all_nodes_ok and all_models_ok and att_ok and not sync_failed:
+                _attach_verified_fingerprint(final_env, result, package_kind="declarative")
+            report_fn(result)
+        else:
+            sync_failed = sync.get("finalStatus") == "failed"
 
+    if not result["compatible"]:
+        stage(PHASES[6], "Failed", " · ".join(result["incompatibilities"]))
+        return 3
     available = result["compatible"] and all_nodes_ok and all_models_ok and att_ok and not sync_failed
+    if available:
+        _attach_verified_fingerprint(final_env, result, package_kind="declarative")
+        report_fn(result)
     stage(
         PHASES[6],
         "Completed" if available else "Failed",
@@ -1074,7 +1465,7 @@ def execute(folder, config):
     base = f"http://127.0.0.1:{port}"
 
     def api(path):
-        with urlopen(base + path, timeout=10) as response:
+        with urlopen(base + path, timeout=LOCAL_API_TIMEOUT_SECONDS) as response:
             return json.load(response)
 
     def idle():
@@ -1234,7 +1625,7 @@ def verify_live_environment(config):
     base = f"http://127.0.0.1:{port}"
 
     def api(path):
-        with urlopen(base + path, timeout=10) as response:
+        with urlopen(base + path, timeout=LOCAL_API_TIMEOUT_SECONDS) as response:
             return json.load(response)
 
     root = root_path()
@@ -1242,52 +1633,29 @@ def verify_live_environment(config):
     env = probe_environment(root, api)
     manifest = config["manifest"]
     if config.get("packageKind") == "bootstrap" or (isinstance(manifest, dict) and manifest.get("entrypoint")):
-        missing_classes = sorted({n["class_type"] for n in config["graph"].values()} - info.keys())
-        models_root = root / "models"
-        model_rows = [
-            {
-                "name": m.get("local") or workflow_packages.expected_comfy_model_relpath(m),
-                "status": "Installed" if (models_root / (m.get("local") or workflow_packages.expected_comfy_model_relpath(m))).is_file() else "Missing",
-            }
-            for m in (config.get("models") or [])
-        ]
-        node_rows = [
-            {
-                "repo": n.get("repo") or n.get("name", ""),
-                "actualRevision": provision.git_head(root / "custom_nodes" / (n.get("name") or str(n.get("repo", "")).split("/")[-1])),
-                "status": "Installed" if (root / "custom_nodes" / (n.get("name") or str(n.get("repo", "")).split("/")[-1])).exists() else "Missing",
-            }
-            for n in (config.get("nodes") or [])
-        ]
-        fp = _canonical_hash({
-            "base": env["environmentFingerprint"],
-            "packageKind": "bootstrap",
-            "nodes": {r["repo"]: r["actualRevision"] for r in node_rows},
-            "models": [m["name"] for m in model_rows if m["status"] == "Installed"],
-        })
-        env["environmentFingerprint"] = fp
-        return {
+        inspected = _inspect_bootstrap_state(
+            root, config["graph"], info,
+            config.get("nodes") or [], config.get("models") or [],
+        )
+        result = {
             "packaged": True,
             "packageKind": "bootstrap",
-            "compatible": True,
-            "incompatibilities": [],
-            "nodes": missing_classes,
-            "nodeRepos": node_rows,
-            "models": model_rows,
+            "compatible": inspected["compatible"],
+            "incompatibilities": inspected["incompatibilities"],
+            "nodes": inspected["nodes"],
+            "nodeRepos": inspected["nodeRepos"],
+            "models": inspected["models"],
             "environment": env,
-            "environmentFingerprint": fp,
+            "environmentFingerprint": env["environmentFingerprint"],
         }
+        _attach_verified_fingerprint(env, result, package_kind="bootstrap")
+        return result
     result = scan_package(
         config["graph"], info, root, manifest, config["nodes"], config["models"],
         env=env, verify_hashes=False,
     )
-    att_cfg = manifest["runtime"]["attention"]
-    if (att_cfg["backend"] == "sageattention" and att_cfg.get("allowSdpaFallback") is True
-            and result["attention"]["status"] == "Missing"):
-        result["attention"]["status"] = "Fallback (SDPA — authorized by manifest)"
-        result["sageAttention"] = "Fallback (SDPA — authorized by manifest)"
-    result["environmentFingerprint"] = compute_verified_fingerprint(env, result)
-    result["environment"]["environmentFingerprint"] = result["environmentFingerprint"]
+    _apply_attention_fallback_policy(manifest, result)
+    _attach_verified_fingerprint(env, result, package_kind="declarative")
     return result
 
 
