@@ -843,5 +843,126 @@ class RcaFix2UncertainClassificationTests(unittest.TestCase):
             self.assertFalse(view["errorClassification"]["allowRetry"])
 
 
+class RcaFix3InstallationGateTests(unittest.TestCase):
+    def test_installation_gate_blocks_failed_and_mismatched_packages_and_allows_first_test_after_install(self):
+        import threading
+        from unittest.mock import Mock
+        import direct_session
+        import workflow_manager
+
+        version = "b" * 64
+        wf = {"version": version, "name": "TestPkg", "packaged": True, "executable": True, "output": "141"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "episodes"
+            (data / "production").mkdir(parents=True)
+            conn = Mock()
+            conn.target.return_value = {"id": 62561233, "host": "h", "port": 22}
+            conn.snapshot.return_value = {"instance": 62561233, "state": "Ready", "url": "http://127.0.0.1:18188"}
+            ctx = {"BASE": root, "DATA": data, "LOCK": threading.RLock(), "connection": conn, "running": False}
+            wm = workflow_manager.WorkflowManager(ctx)
+
+            # 1) Never installed on this instance -> blocked even though connection is Ready
+            g0 = wm.installation_gate(version, wf, instance="62561233")
+            self.assertFalse(g0["ready"])
+            self.assertEqual(g0["status"], "not_installed")
+
+            # 2) Failed installation on instance 62561233 (like nvcc compute_120f failure + ComfyUI restarted to Ready)
+            wm.records["62561233"] = {
+                "id": "a" * 32, "version": version, "instance": "62561233", "status": "failed",
+                "started": 1.0, "mode": "install",
+                "stages": {"Final verification": {"status": "Failed", "message": "nvcc does not advertise compute_120f"}},
+            }
+            g_fail = wm.installation_gate(version, wf, instance="62561233")
+            self.assertFalse(g_fail["ready"])
+            self.assertEqual(g_fail["status"], "failed")
+            self.assertIn("nvcc does not advertise compute_120f", g_fail["reason"])
+
+            # DirectSession.control('regenerate') MUST reject before starting any session!
+            ds_ctx = {
+                "DATA": data, "LOCK": threading.RLock(), "running": False,
+                "workflow_manager": wm, "active_workflow": wf, "connection": conn,
+            }
+            ds = direct_session.DirectSession(ds_ctx)
+            with self.assertRaisesRegex(ValueError, "nvcc does not advertise compute_120f"):
+                ds.control({"action": "regenerate", "episode": str(uuid.uuid4()), "shot": str(uuid.uuid4())})
+            self.assertEqual(ds.plan, {})
+
+            # 3) Successful installation on instance 62561233 (productionReadiness still 'not_verified') -> ALLOWED for first test!
+            wm.records["62561233"]["status"] = "installed"
+            wm.record_environment_verification(
+                version, "62561233", "installed",
+                {"compatible": True, "incompatibilities": [], "environmentFingerprint": "f" * 64},
+            )
+            g_ok = wm.installation_gate(version, wf, instance="62561233")
+            self.assertTrue(g_ok["ready"])
+            self.assertEqual(g_ok["status"], "installed")
+            self.assertEqual(g_ok["productionReadiness"], "not_verified")
+
+            # 4) Switching to a DIFFERENT rented instance 99999999 -> BLOCKED!
+            g_other = wm.installation_gate(version, wf, instance="99999999")
+            self.assertFalse(g_other["ready"])
+            self.assertEqual(g_other["status"], "not_installed")
+
+            # 5) Re-install fails after a prior success -> recording 'failed' invalidates prior readiness and blocks!
+            wm.record_environment_verification(version, "62561233", "failed", {})
+            wm.records["62561233"]["status"] = "failed"
+            g_after_fail = wm.installation_gate(version, wf, instance="62561233")
+            self.assertFalse(g_after_fail["ready"])
+            self.assertFalse(wm.is_production_ready(version, "62561233"))
+
+    def test_http_start_and_worker_start_block_when_package_installation_failed_despite_ready_connection(self):
+        import runpy
+        import threading
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+        from unittest.mock import Mock, patch
+
+        ctx = runpy.run_path("studio.pyw")
+        app = ctx["app"]
+        server = ctx["StudioServer"](("127.0.0.1", 0), ctx["Handler"])
+        app.PORT = server.server_port
+        url = f"http://127.0.0.1:{server.server_port}"
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            version = "c" * 64
+            wf = {"version": version, "name": "BrokenPkg", "packaged": True, "executable": True, "output": "141"}
+            conn = Mock()
+            conn.snapshot.return_value = {"state": "Ready", "url": "http://127.0.0.1:18188", "instance": 777}
+            conn.target.return_value = {"id": 777, "host": "h", "port": 22}
+            wm = Mock()
+            wm.busy.return_value = False
+            wm.installation_gate.return_value = {
+                "ready": False, "status": "failed",
+                "reason": "Workflow Package installation failed on instance #777 (nvcc does not advertise compute_120f).",
+                "instance": "777",
+            }
+            with patch.multiple(app, active_workflow=wf, workflow_error="", connection=conn, workflow_manager=wm, running=False):
+                # /status exposes workflowInstall gate state to Worker UI
+                with urlopen(url + "/status") as resp:
+                    status = json.load(resp)
+                self.assertFalse(status["workflowInstall"]["ready"])
+                self.assertEqual(status["workflowInstall"]["status"], "failed")
+
+                # Both /start and /worker {action:'start'} reject with HTTP 400 before starting any session
+                for route, payload in (("/start", {"episode": "ep1"}), ("/worker", {"action": "start", "episode": "ep1"})):
+                    req = Request(
+                        url + route,
+                        data=json.dumps(payload).encode(),
+                        headers={"Content-Type": "application/json", "X-Studio": app.TOKEN},
+                    )
+                    with self.assertRaises(HTTPError) as err:
+                        urlopen(req)
+                    self.assertEqual(err.exception.code, 400)
+                    body = json.loads(err.exception.read().decode())
+                    self.assertIn("nvcc does not advertise compute_120f", body["error"])
+                    err.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            t.join()
+
+
 if __name__ == "__main__":
     unittest.main()

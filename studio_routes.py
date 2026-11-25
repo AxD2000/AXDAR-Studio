@@ -63,12 +63,16 @@ def _get_status(handler, app):
         conn_snap, app.session, result,
         (worker_state or {}).get("settings") if worker_state else {},
     )
+    wf_install = None
+    if app.active_workflow and hasattr(app.workflow_manager, "installation_gate"):
+        wf_install = app.workflow_manager.installation_gate(app.active_workflow.get("version"), app.active_workflow)
     return handler.send(dict(
         running=app.running,
         session=app.session,
         results=result,
         workflow=app.active_workflow["name"] if app.active_workflow else "Workflow blocked",
         workflowError=app.workflow_error,
+        workflowInstall=wf_install,
         connection=conn_snap,
         credentials=vast_credentials.credentials_status(),
         worker=worker_state,
@@ -328,6 +332,12 @@ def _post_production(handler, app, obj):
             raise ValueError("الجلسة تعمل حالياً")
         connected = app.connection.snapshot().get("url")
         target = app.connection.target() if connected else None
+        if app.active_workflow.get("packaged") and target is not None and hasattr(app.workflow_manager, "installation_gate"):
+            gate = app.workflow_manager.installation_gate(
+                app.active_workflow.get("version"), app.active_workflow, instance=app.identity(target),
+            )
+            if not gate.get("ready"):
+                raise ValueError(gate.get("reason") or "Install and verify this Workflow Package on the connected instance before starting production.")
         url = (connected or obj.get("url", "")).strip().rstrip("/")
         if urlsplit(url).scheme not in ("http", "https") or not urlsplit(url).hostname:
             raise ValueError("أدخل رابط ComfyUI")

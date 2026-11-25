@@ -151,8 +151,10 @@ class WorkflowManager:
             latest = dict(prof.get("latestByInstance") or {})
             latest[str(instance)] = key
             # Preserve legacy 'instances' pointer for backward-compatible readers
+            # (never overwrite the last successful dependency scan with a failed/empty install report)
             instances = dict(prof.get("instances") or {})
-            instances[str(instance)] = {"status": status, "report": report, "finished": finished or time.time()}
+            if report and status not in ("failed", "cancelled", "timed out"):
+                instances[str(instance)] = {"status": status, "report": report, "finished": finished or time.time()}
             self.save_profile(version, environments=envs, latestByInstance=latest, instances=instances)
             return envs[key]
 
@@ -207,6 +209,79 @@ class WorkflowManager:
     def is_production_ready(self, version, instance=None, env_fingerprint=None):
         entry = self.environment_state(version, instance=instance, env_fingerprint=env_fingerprint)
         return bool(entry and entry.get("productionReadiness") == "verified")
+
+    def installation_gate(self, version, wf, instance=None):
+        """Single source of truth gating production start & regenerate on package installation state."""
+        if not wf:
+            return {"ready": False, "status": "no_workflow", "reason": "Select a valid Workflow Package first.", "instance": None}
+        if not wf.get("packaged"):
+            return {"ready": True, "status": "not_packaged", "reason": "", "instance": str(instance) if instance not in (None, "") else None}
+        inst = str(instance) if instance not in (None, "") else self.selected_instance()
+        if not inst:
+            return {
+                "ready": False,
+                "status": "disconnected",
+                "reason": "Connect a Vast instance and install this Workflow Package before starting production.",
+                "instance": None,
+            }
+        with self.lock:
+            rec = self.records.get(inst)
+        if rec and rec.get("status") not in TERMINAL:
+            return {
+                "ready": False,
+                "status": str(rec.get("status") or "installing"),
+                "reason": "A workflow scan or installation is currently running on this instance.",
+                "instance": inst,
+            }
+        if rec and rec.get("version") == version and rec.get("status") in ("failed", "cancelled", "timed out", "incompatible", "needs attention"):
+            detail = ""
+            stages = rec.get("stages") or {}
+            for stage_name in ("Final verification", "Custom node installation", "Model verification", "Environment preflight"):
+                st = stages.get(stage_name) or {}
+                if st.get("status") == "Failed" and st.get("message"):
+                    detail = st["message"]
+                    break
+            if not detail:
+                detail = rec.get("message") or ""
+            suffix = f" ({detail})" if detail else ""
+            return {
+                "ready": False,
+                "status": str(rec["status"]),
+                "reason": f"Workflow Package installation {rec['status']} on instance #{inst}{suffix}. Fix and install the package before starting production.",
+                "instance": inst,
+            }
+        env_state = self.environment_state(version, instance=inst)
+        if not env_state:
+            return {
+                "ready": False,
+                "status": "not_installed",
+                "reason": f"Install and verify this Workflow Package on instance #{inst} before starting production.",
+                "instance": inst,
+            }
+        if env_state.get("compatible") is False or env_state.get("installationStatus") == "incompatible":
+            reasons = " · ".join(env_state.get("incompatibilities") or ["Environment incompatible with this package."])
+            return {
+                "ready": False,
+                "status": "incompatible",
+                "reason": f"Workflow Package is incompatible with instance #{inst}: {reasons}",
+                "instance": inst,
+            }
+        inst_status = str(env_state.get("installationStatus") or "not_installed")
+        if inst_status not in ("installed", "ready"):
+            return {
+                "ready": False,
+                "status": inst_status,
+                "reason": f"Workflow Package is not installed on instance #{inst} (status: {inst_status}). Install it before starting production.",
+                "instance": inst,
+            }
+        # Installed & compatible on this exact instance -> allow production (including first production test before readiness is verified).
+        return {
+            "ready": True,
+            "status": inst_status,
+            "productionReadiness": env_state.get("productionReadiness", "not_verified"),
+            "reason": "",
+            "instance": inst,
+        }
 
     def verify_live_environment(self, version, target, wf):
         """Re-probe live host environment before production and enforce exact fingerprint match."""
@@ -497,9 +572,11 @@ class WorkflowManager:
                     with self.lock:
                         message = "Remote installer stopped before recording a result." if state["status"] == "failed" and state.get("exitCode") is None else ""
                         self.save(record, message=message, **state)
-                        if state["status"] in ("installed", "ready", "incompatible", "needs attention") and state.get("report"):
+                        if state["status"] in ("installed", "ready", "incompatible", "needs attention", "failed", "cancelled", "timed out") and (
+                            state.get("report") or state["status"] in ("failed", "cancelled", "timed out")
+                        ):
                             self.record_environment_verification(
-                                record["version"], instance, state["status"], state["report"], record.get("finished"),
+                                record["version"], instance, state["status"], state.get("report") or {}, record.get("finished"),
                             )
             except (ValueError, OSError, TimeoutError, subprocess.SubprocessError) as exc:
                 message = (

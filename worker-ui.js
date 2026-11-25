@@ -35,14 +35,16 @@ function workerControlsHtml(){
     const session = state.session?.episode===ep.id ? state.session : {};
     const cfg = workerSettings();
     const approved = ep.shots.filter(s=>s.approved && !s.skipped).length;
-    const canStart = Boolean(approved && currentProfile()?.executable && state.connection?.state==='Ready' && !state.running && !state.workflowError);
+    const installGate = state.workflowInstall;
+    const installBlocked = Boolean(installGate && installGate.ready === false);
+    const canStart = Boolean(!installBlocked && approved && currentProfile()?.executable && state.connection?.state==='Ready' && !state.running && !state.workflowError);
     const activeQueue = Boolean(session.episode && !['Finished','Stopped'].includes(session.phase));
     const canPause = Boolean(state.running);
-    const canResume = Boolean(!state.running && activeQueue && ['Paused','Needs attention'].includes(session.phase) && state.connection?.state==='Ready');
+    const canResume = Boolean(!installBlocked && !state.running && activeQueue && ['Paused','Needs attention'].includes(session.phase) && state.connection?.state==='Ready');
     const canStop = Boolean(state.running || activeQueue);
     const canSkip = Boolean(state.running || activeQueue);
     const targetRegenShot = ep.shots.find(s=>s.id===session.current) || selectedShot() || ep.shots.find(s=>s.approved);
-    const canRegen = Boolean(!state.running && state.connection?.state==='Ready' && currentProfile()?.executable && targetRegenShot?.approved);
+    const canRegen = Boolean(!installBlocked && !state.running && state.connection?.state==='Ready' && currentProfile()?.executable && targetRegenShot?.approved);
 
     let completedCount=0, failedCount=0, skippedCount=0, generatingCount=0;
     for(const shot of ep.shots){
@@ -65,6 +67,7 @@ function workerControlsHtml(){
         ' · Workflow: <strong>'+esc(state.workflow||'')+'</strong> · Status: <strong>'+esc(session.phase||'Idle')+'</strong>'+
         (state.running&&session.requestedAction?' ('+esc(session.requestedAction)+'…)':'')+'</p>'+
         (state.workflowError?'<p class="danger">'+esc(state.workflowError)+'</p>':'')+
+        (installBlocked?'<p class="danger"><strong>[INSTALL GATE]</strong> '+esc(installGate.reason||'Install and verify the active Workflow Package on this instance before starting production.')+'</p>':'')+
         (session.pauseReason?'<p class="status">'+esc(session.pauseReason)+'</p>':'')+
         (session.exportDestination?'<p class="status">Exported '+esc(session.exportedCount||0)+' take(s) to: <code>'+esc(session.exportDestination)+'</code></p>':'')+
         (session.error?'<p class="danger">'+esc(localize(session.error))+'</p>':'')+
@@ -252,7 +255,8 @@ function renderWorkerLogsModal(){
 }
 
 function workerTakesHtml(){
-    const canRegen = !state.running && state.connection?.state==='Ready' && Boolean(currentProfile()?.executable);
+    const installBlocked = Boolean(state.workflowInstall && state.workflowInstall.ready === false);
+    const canRegen = !installBlocked && !state.running && state.connection?.state==='Ready' && Boolean(currentProfile()?.executable);
     if(!ep.shots.length) return '<section class="panel"><h2>Shots &amp; Takes</h2><p class="muted">Import a story and approve shots first.</p></section>';
     const rows = ep.shots.map((shot, idx)=>{
         const takes = versions(shot);

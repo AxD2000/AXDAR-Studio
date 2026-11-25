@@ -128,6 +128,11 @@ class DirectSession:
             connection=ctx["connection"]
             connected=connection.snapshot().get("url")
             target=connection.target() if connected else None
+            wm=ctx.get("workflow_manager")
+            if wf.get("packaged") and target is not None and wm is not None and hasattr(wm,"installation_gate"):
+                gate=wm.installation_gate(wf.get("version"),wf,instance=identity(target))
+                if not gate.get("ready"):
+                    raise ValueError(gate.get("reason") or "Install and verify this Workflow Package on the connected instance before regenerating.")
             url=(connected or "").strip().rstrip("/")
             if not url:
                 raise ValueError("Connect to ComfyUI before regenerating a shot.")
