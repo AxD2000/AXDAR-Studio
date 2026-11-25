@@ -473,5 +473,57 @@ class Phase4ErrorClassifierAndLogsTests(unittest.TestCase):
             self.assertIn("Auto-retrying shot EP01S01", bundle["studio"])
 
 
+class Phase5FinancialMonitorTests(unittest.TestCase):
+    def test_financial_monitor_cold_start_exclusion_rolling_average_and_manual_ssh_mode(self):
+        # 1) After Shot #1 (120s cold start), uses Shot #1 with coldStartOnly=True
+        conn = {"rate": 1.20, "uptime": 14.5}  # $1.20/hr = $0.02/min
+        session = {"episode": "ep1", "started": 1000.0, "submitted": 10, "completed": 1, "failed": 0, "skipped": 0}
+        res1 = [{"episode": "ep1", "status": "done", "started": 1005.0, "renderSeconds": 120.0}]
+        fin1 = worker_runtime.compute_financial_summary(conn, session, res1, now=1120.0)
+        self.assertEqual(fin1["hourlyRate"], 1.2)
+        self.assertEqual(fin1["minuteRate"], 0.02)
+        self.assertEqual(fin1["rateBadge"], "Actual · Vast.ai")
+        self.assertEqual(fin1["instanceUptimeMins"], 14.5)
+        self.assertTrue(fin1["coldStartOnly"])
+        self.assertEqual(fin1["avgShotSeconds"], 120.0)
+        self.assertEqual(fin1["remainingShots"], 9)
+        self.assertAlmostEqual(fin1["currentSessionCost"], 0.04, places=4)
+        self.assertAlmostEqual(fin1["estimatedRemainingCost"], 9 * 2.0 * 0.02, places=4)
+        self.assertAlmostEqual(fin1["estimatedTotalCost"], 0.04 + 0.36, places=4)
+
+        # 2) After Shots #2 (60s) & #3 (60s), excludes Shot #1 cold start -> steady avg = 60s
+        session2 = dict(session, completed=3)
+        res3 = res1 + [
+            {"episode": "ep1", "status": "done", "started": 1125.0, "renderSeconds": 60.0},
+            {"episode": "ep1", "status": "done", "started": 1190.0, "renderSeconds": 60.0},
+        ]
+        fin3 = worker_runtime.compute_financial_summary(conn, session2, res3, now=1240.0)
+        self.assertFalse(fin3["coldStartOnly"])
+        self.assertEqual(fin3["avgShotSeconds"], 60.0)
+        self.assertEqual(fin3["remainingShots"], 7)
+        self.assertAlmostEqual(fin3["estimatedRemainingSeconds"], 420.0, places=1)
+        self.assertAlmostEqual(fin3["estimatedRemainingCost"], 7 * 1.0 * 0.02, places=4)
+
+        # 3) Manual SSH without Vast rate -> Unavailable, then with manualHourlyRate -> Manual
+        fin_none = worker_runtime.compute_financial_summary({}, session2, res3, {}, now=1240.0)
+        self.assertIsNone(fin_none["hourlyRate"])
+        self.assertEqual(fin_none["rateBadge"], "Unavailable")
+        fin_manual = worker_runtime.compute_financial_summary({}, session2, res3, {"manualHourlyRate": 0.60}, now=1240.0)
+        self.assertEqual(fin_manual["hourlyRate"], 0.6)
+        self.assertEqual(fin_manual["rateBadge"], "Manual")
+        self.assertAlmostEqual(fin_manual["minuteRate"], 0.01, places=5)
+
+    def test_connection_snapshot_exposes_vast_rate_and_uptime(self):
+        import vast_connection
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = vast_connection.Connection(Path(tmp) / "conn.json", lambda: [], lambda *a, **k: b"")
+            conn.endpoint = {"id": 42, "gpu": "RTX 5090", "rate": 0.85, "uptime": 22.0}
+            conn.state = "Ready"
+            conn.url = "http://127.0.0.1:9999"
+            snap = conn.snapshot()
+            self.assertEqual(snap["rate"], 0.85)
+            self.assertEqual(snap["uptime"], 22.0)
+
+
 if __name__ == "__main__":
     unittest.main()

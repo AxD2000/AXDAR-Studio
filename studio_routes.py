@@ -57,15 +57,22 @@ def _get_status(handler, app):
     cache = getattr(app, "status_cache", None)
     result = cache.list_results(app.DATA) if cache is not None else worker_runtime.StatusIndexCache(app.DATA).list_results()
     worker_cfg = getattr(app, "worker_config", None)
+    conn_snap = app.connection.snapshot()
+    worker_state = worker_cfg.public_state() if worker_cfg is not None else None
+    financial = worker_runtime.compute_financial_summary(
+        conn_snap, app.session, result,
+        (worker_state or {}).get("settings") if worker_state else {},
+    )
     return handler.send(dict(
         running=app.running,
         session=app.session,
         results=result,
         workflow=app.active_workflow["name"] if app.active_workflow else "Workflow blocked",
         workflowError=app.workflow_error,
-        connection=app.connection.snapshot(),
+        connection=conn_snap,
         credentials=vast_credentials.credentials_status(),
-        worker=worker_cfg.public_state() if worker_cfg is not None else None,
+        worker=worker_state,
+        financial=financial,
         restartSupported=True,
     ))
 

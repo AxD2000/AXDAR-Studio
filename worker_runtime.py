@@ -408,3 +408,102 @@ def collect_three_logs(ctx, *, include_remote_ssh=False):
         "studio": "\n".join(studio_lines),
         "classification": classification,
     }
+
+
+def compute_financial_summary(connection_snapshot, session, results, settings=None, *, now=None):
+    """Compute Financial Monitor data clearly separating Actual (Vast.ai) from Estimated (Local) figures."""
+    conn = connection_snapshot if isinstance(connection_snapshot, dict) else {}
+    sess = session if isinstance(session, dict) else {}
+    cfg = settings if isinstance(settings, dict) else {}
+    now_ts = float(now if now is not None else time.time())
+
+    # 1) Actual Vast.ai rate vs optional manual fallback
+    vast_rate = conn.get("rate")
+    if vast_rate is None:
+        vast_rate = sess.get("rate")
+    hourly_rate = None
+    rate_badge = "Unavailable"
+    rate_source_label = "No Vast Rate (Manual SSH)"
+    if isinstance(vast_rate, (int, float)) and not isinstance(vast_rate, bool) and vast_rate >= 0:
+        hourly_rate = float(vast_rate)
+        rate_badge = "Actual · Vast.ai"
+        rate_source_label = "Vast.ai Actual Rate · Local Cost Estimates"
+    elif isinstance(cfg.get("manualHourlyRate"), (int, float)) and not isinstance(cfg.get("manualHourlyRate"), bool):
+        hourly_rate = float(cfg["manualHourlyRate"])
+        rate_badge = "Manual"
+        rate_source_label = "Manual Rate · Local Cost Estimates"
+
+    minute_rate = (hourly_rate / 60.0) if hourly_rate is not None else None
+    uptime_mins = conn.get("uptime") if isinstance(conn.get("uptime"), (int, float)) else None
+
+    # 2) Session elapsed time & local session rental cost estimate
+    started = sess.get("started")
+    finished = sess.get("finished")
+    elapsed_sec = 0.0
+    if isinstance(started, (int, float)) and started > 0:
+        end_ref = float(finished) if isinstance(finished, (int, float)) and finished >= started else now_ts
+        elapsed_sec = max(0.0, end_ref - float(started))
+    current_session_cost = (elapsed_sec / 3600.0) * hourly_rate if hourly_rate is not None else None
+
+    # 3) Shot counts & cold-start-adjusted average generation time
+    total_shots = int(sess.get("submitted") or 0)
+    completed_shots = int(sess.get("completed") or 0)
+    failed_shots = int(sess.get("failed") or 0)
+    skipped_shots = int(sess.get("skipped") or 0)
+    remaining_shots = max(0, total_shots - completed_shots - failed_shots - skipped_shots)
+
+    episode_id = sess.get("episode")
+    done_rows = [
+        r for r in (results or [])
+        if r.get("status") == "done"
+        and isinstance(r.get("renderSeconds"), (int, float)) and r["renderSeconds"] > 0
+        and (not episode_id or r.get("episode") == episode_id)
+        and (not started or not isinstance(r.get("started"), (int, float)) or r["started"] >= started - 5)
+    ]
+    done_rows.sort(key=lambda r: float(r.get("started") or 0))
+    durations = [float(r["renderSeconds"]) for r in done_rows]
+
+    cold_start_only = False
+    if not durations:
+        avg_shot_sec = None
+    elif len(durations) == 1:
+        avg_shot_sec = durations[0]
+        cold_start_only = True
+    else:
+        # Exclude Shot #1 cold-start (model loading/warmup) once 2+ shots have completed
+        steady = durations[1:]
+        avg_shot_sec = sum(steady) / len(steady)
+
+    est_remaining_sec = (remaining_shots * avg_shot_sec) if avg_shot_sec is not None else None
+    est_remaining_cost = (
+        (est_remaining_sec / 60.0) * minute_rate
+        if (est_remaining_sec is not None and minute_rate is not None)
+        else None
+    )
+    if current_session_cost is not None and est_remaining_cost is not None:
+        est_total_cost = current_session_cost + est_remaining_cost
+    elif total_shots > 0 and avg_shot_sec is not None and minute_rate is not None:
+        est_total_cost = total_shots * (avg_shot_sec / 60.0) * minute_rate
+    else:
+        est_total_cost = current_session_cost
+
+    return {
+        "hourlyRate": round(hourly_rate, 4) if hourly_rate is not None else None,
+        "minuteRate": round(minute_rate, 5) if minute_rate is not None else None,
+        "rateBadge": rate_badge,
+        "rateSourceLabel": rate_source_label,
+        "instanceUptimeMins": round(float(uptime_mins), 1) if uptime_mins is not None else None,
+        "sessionElapsedSeconds": round(elapsed_sec, 1),
+        "currentSessionCost": round(current_session_cost, 4) if current_session_cost is not None else None,
+        "totalShots": total_shots,
+        "completedShots": completed_shots,
+        "failedShots": failed_shots,
+        "skippedShots": skipped_shots,
+        "remainingShots": remaining_shots,
+        "avgShotSeconds": round(avg_shot_sec, 2) if avg_shot_sec is not None else None,
+        "coldStartOnly": cold_start_only,
+        "estimatedRemainingSeconds": round(est_remaining_sec, 1) if est_remaining_sec is not None else None,
+        "estimatedRemainingCost": round(est_remaining_cost, 4) if est_remaining_cost is not None else None,
+        "estimatedTotalCost": round(est_total_cost, 4) if est_total_cost is not None else None,
+        "isEstimate": True,
+    }

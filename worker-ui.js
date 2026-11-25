@@ -114,6 +114,7 @@ function workerSettingsHtml(){
         '<label>Max Shot Retries (0–5)<input type="number" min="0" max="5" data-wk-setting="maxRetries" value="'+esc(cfg.maxRetries??1)+'"></label>'+
         '<label>Circuit Breaker (Consecutive Fails)<input type="number" min="1" max="10" data-wk-setting="consecutiveFailureLimit" value="'+esc(cfg.consecutiveFailureLimit??2)+'"></label>'+
         '<label>Session Limit Minutes (0 = Unlimited)<input type="number" min="0" max="1440" data-wk-setting="sessionMinutes" value="'+esc(cfg.sessionMinutes??0)+'" '+(locked?'disabled':'')+'></label>'+
+        '<label>Manual Hourly Rate ($/hr · SSH fallback)<input type="number" step="any" min="0" max="500" data-wk-setting="manualHourlyRate" value="'+esc(cfg.manualHourlyRate??'')+'" placeholder="Auto from Vast API"></label>'+
         '<label>Seed Mode<select data-wk-setting="seedMode" '+(locked?'disabled':'')+'>'+
         option('random','Randomize per Take',cfg.seedMode||'random')+
         option('fixed','Fixed Seed',cfg.seedMode||'random')+
@@ -141,6 +142,7 @@ function workerFinancialHtml(){
         '<div class="wm-stat"><small>Avg Time / Shot'+(f.coldStartOnly?' (Cold Start)':'')+'</small><strong>'+fmtMin(f.avgShotSeconds)+'</strong></div>'+
         '<div class="wm-stat"><small>Est. Remaining Time</small><strong>'+fmtMin(f.estimatedRemainingSeconds)+'</strong></div>'+
         '<div class="wm-stat"><small>Est. Total Cost</small><strong>'+fmtUsd(f.estimatedTotalCost)+'</strong></div>'+
+        (f.instanceUptimeMins!=null?'<div class="wm-stat"><small>Instance Uptime (Actual · Vast.ai)</small><strong>'+Number(f.instanceUptimeMins).toFixed(1)+' min</strong></div>':'')+
         '</div>'+
         '<p class="muted"><strong>Notice:</strong> Stopping Worker or closing AXDAR Studio does NOT stop your Vast.ai instance or billing.</p>'+
         '</section>';

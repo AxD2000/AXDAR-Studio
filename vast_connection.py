@@ -114,6 +114,8 @@ class Connection:
             return dict(self.settings, state=self.state, error=self.error,
                         indicators=dict(self.indicators),
                         gpu=(self.endpoint or {}).get('gpu'),
+                        rate=(self.endpoint or {}).get('rate'),
+                        uptime=(self.endpoint or {}).get('uptime'),
                         url=self.url if self.state == 'Ready' else None)
 
     def _indicate(self, **values):
